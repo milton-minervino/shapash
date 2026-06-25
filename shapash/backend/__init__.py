@@ -3,6 +3,9 @@ import sys
 
 from .base_backend import BaseBackend
 from .lime_backend import LimeBackend
+from .nlp_backend import NlpBackend, NlpContributions, NlpRawExplanation
+from .nlp_lime_backend import NlpLimeBackend
+from .nlp_shap_backend import NlpShapBackend
 from .shap_backend import ShapBackend
 
 
