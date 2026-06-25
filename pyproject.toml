@@ -59,6 +59,15 @@ report = [
     "phik>=0.12.4",
     "pyarrow>=17.0.0",
 ]
+
+nlp = [
+    "torch>=2.12.1",
+    "transformers>=5.12.1",
+    "datasets>5.0.0",
+    "sentence-transformers>=5.6.0",
+    "pacmap>=0.9.1"
+]
+
 xgboost = ["xgboost>=2.1.0"]
 catboost = ["catboost>=1.2.8"]
 lightgbm = ["lightgbm>=4.4.0"]
