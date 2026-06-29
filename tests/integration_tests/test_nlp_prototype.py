@@ -416,9 +416,9 @@ class TestNlpWebApp(unittest.TestCase):
     def test_dataset_table_populated(self):
         table = self._find_component(self.webapp.app.layout, "dataset-table")
         self.assertIsNotNone(table, "dataset-table not found in layout")
-        self.assertEqual(len(table.data), 3)
-        self.assertIn("text", table.data[0])
-        self.assertIn("prediction", table.data[0])
+        self.assertEqual(len(table.rowData), 3)
+        self.assertIn("text", table.rowData[0])
+        self.assertIn("prediction", table.rowData[0])
 
     def test_raises_without_compile(self):
         xpl = _make_explainer(compiled=False)
@@ -452,17 +452,17 @@ class TestNlpWebApp(unittest.TestCase):
 
     def test_dataset_table_no_ground_truth_by_default(self):
         table = self._find_component(self.webapp.app.layout, "dataset-table")
-        col_ids = [c["id"] for c in table.columns]
-        self.assertNotIn("ground_truth", col_ids)
+        col_fields = [c["field"] for c in table.columnDefs]
+        self.assertNotIn("ground_truth", col_fields)
 
     def test_dataset_table_with_y_true(self):
         xpl = _make_explainer(compiled=True)
         xpl.y_true = pd.Series(["sadness", "joy", "sadness"], index=pd.RangeIndex(3), name="ground_truth")
         webapp = NlpWebApp(xpl)
         table = self._find_component(webapp.app.layout, "dataset-table")
-        col_ids = [c["id"] for c in table.columns]
-        self.assertIn("ground_truth", col_ids)
-        self.assertEqual(table.data[0]["ground_truth"], "sadness")
+        col_fields = [c["field"] for c in table.columnDefs]
+        self.assertIn("ground_truth", col_fields)
+        self.assertEqual(table.rowData[0]["ground_truth"], "sadness")
 
     def test_scatter_store_always_present(self):
         ids = self._collect_ids(self.webapp.app.layout)
@@ -709,12 +709,11 @@ class TestNlpExplainerWithLimeBackend(unittest.TestCase):
     def test_compile_sets_contributions(self):
         backend = _make_lime_backend()
         xpl = NlpExplainer(_fake_classifier, label_names=LABEL_NAMES, backend=backend)
-        fake_preds = pd.Series(
-            ["joy"] * len(_SAMPLE_TEXTS),
+        fake_pred_df = pd.DataFrame(
+            {"prediction": ["joy"] * len(_SAMPLE_TEXTS)},
             index=pd.RangeIndex(len(_SAMPLE_TEXTS)),
-            name="prediction",
         )
-        with patch.object(xpl, "_predict_labels", return_value=fake_preds):
+        with patch.object(xpl, "_predict", return_value=fake_pred_df):
             xpl.compile(_SAMPLE_TEXTS)
         self.assertIsInstance(xpl.contributions, NlpContributions)
         self.assertEqual(len(xpl.contributions), len(_SAMPLE_TEXTS))
@@ -723,12 +722,11 @@ class TestNlpExplainerWithLimeBackend(unittest.TestCase):
     def test_compile_caching_skips_rerun(self):
         backend = _make_lime_backend()
         xpl = NlpExplainer(_fake_classifier, label_names=LABEL_NAMES, backend=backend)
-        fake_preds = pd.Series(
-            ["joy"] * len(_SAMPLE_TEXTS),
+        fake_pred_df = pd.DataFrame(
+            {"prediction": ["joy"] * len(_SAMPLE_TEXTS)},
             index=pd.RangeIndex(len(_SAMPLE_TEXTS)),
-            name="prediction",
         )
-        with patch.object(xpl, "_predict_labels", return_value=fake_preds):
+        with patch.object(xpl, "_predict", return_value=fake_pred_df):
             xpl.compile(_SAMPLE_TEXTS)
             hash_after_first = xpl._data_hash
             xpl.compile(_SAMPLE_TEXTS)  # same data — must hit in-memory cache
