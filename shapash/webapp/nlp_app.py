@@ -25,6 +25,8 @@ from shapash.plots.plot_waterfall import plot_waterfall
 from shapash.plots.plot_word_importance import plot_word_importance
 
 _CARD_STYLE = {"border": "1px solid #dee2e6", "borderRadius": "4px", "padding": "12px", "height": "100%"}
+# Single source of truth so the graph container and the Plotly figure agree.
+_WORD_IMPORTANCE_HEIGHT = 390
 _SPECIAL_RE = re.compile(r"^\[.*\]$|^##|^\s*$")
 _HIDDEN = {"display": "none"}
 _VISIBLE = {"display": "block"}
@@ -45,20 +47,26 @@ _PALETTE = [
 class NlpWebApp:
     """Minimal Dash webapp driven by an ``NlpExplainer``.
 
-    Renders four panels:
-    - **Controls bar** — top-K slider, positive/negative sign filter, corpus
-      word multi-select for manual stopword exclusion.
+    The layout follows an "overview → filter → detail" funnel:
+
+    Top row — global "where to look" panels that filter the table below:
     - **Global word importance** — mean SHAP contribution per unique word for
       the selected class (updates on any control change or scatter selection).
-    - **Dataset table** — text samples with predicted (and optional ground-truth)
-      labels; click a row to populate the local contribution panels.  Filtered
-      to the scatter selection when one is active.
-    - **Local contributions** — inline sentence highlight as the primary view.
-      An optional waterfall chart (toggle with a radio button) groups tokens
-      below a configurable contribution threshold into a single "other" bar.
+      Its own controls (top-K slider, positive/negative sign filter, corpus
+      word multi-select for manual stopword exclusion) live inside this panel.
     - **Sample scatter** *(optional)* — 2-D projection of the text embeddings,
       coloured by prediction or ground-truth label.  Draw a box or lasso to
       filter the table and word importance to the selected subset.
+
+    Hub — full-width:
+    - **Dataset table** — text samples with predicted (and optional ground-truth)
+      labels; click a row to populate the local contribution panel.  Filtered
+      to the scatter selection and/or a clicked word importance bar.
+
+    Detail-on-demand — full-width:
+    - **Local contributions** — inline sentence highlight as the primary view.
+      An optional waterfall chart (toggle with a radio button) groups tokens
+      below a configurable contribution threshold into a single "other" bar.
 
     Parameters
     ----------
@@ -199,16 +207,226 @@ class NlpWebApp:
                         config={
                             "displayModeBar": True,
                             "modeBarButtonsToRemove": ["autoScale2d", "resetScale2d"],
+                            "responsive": True,
                         },
-                        style={"height": "340px"},
+                        # Grow to fill the card's remaining height so the scatter
+                        # matches the taller word-importance panel beside it.
+                        style={"flex": "1 1 auto", "minHeight": "340px"},
                     ),
                 ],
-                style=_CARD_STYLE,
+                # Flex column so the graph above can stretch to the card height.
+                style={**_CARD_STYLE, "display": "flex", "flexDirection": "column"},
             )
+
+        # ── Global Word Importance panel — controls now live inside it ──
+        # (Top-K / Sign / Exclude only affect this panel, so they are
+        # co-located here rather than in a misleading full-width top bar.)
+        word_importance_panel = html.Div(
+            [
+                html.H6("Global Word Importance", className="fw-bold mb-2"),
+                dbc.Row(
+                    [
+                        dbc.Col(
+                            [
+                                html.Label("Top-K words", className="fw-bold small mb-1"),
+                                dcc.Slider(
+                                    id="topk-slider",
+                                    min=1,
+                                    max=50,
+                                    step=1,
+                                    value=20,
+                                    marks={1: "1", 10: "10", 20: "20", 30: "30", 50: "50"},
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                ),
+                            ],
+                            width=7,
+                        ),
+                        dbc.Col(
+                            [
+                                html.Label("Contributions", className="fw-bold small mb-1"),
+                                dcc.RadioItems(
+                                    id="sign-filter",
+                                    options=[
+                                        {"label": " All", "value": "all"},
+                                        {"label": " Positive", "value": "positive"},
+                                        {"label": " Negative", "value": "negative"},
+                                    ],
+                                    value="all",
+                                    inline=True,
+                                    inputStyle={"marginRight": "4px"},
+                                    labelStyle={"marginRight": "12px"},
+                                ),
+                            ],
+                            width=5,
+                        ),
+                    ],
+                    className="align-items-center mb-2",
+                ),
+                html.Div(
+                    [
+                        html.Label("Exclude words", className="fw-bold small mb-1"),
+                        dcc.Dropdown(
+                            id="word-filter",
+                            options=[{"label": w, "value": w} for w in all_words],
+                            value=[],
+                            multi=True,
+                            placeholder="Select words to exclude…",
+                            style={"fontSize": "0.9em"},
+                        ),
+                    ],
+                    className="mb-2",
+                ),
+                dcc.Graph(
+                    id="global-importance-graph",
+                    config={"displayModeBar": False},
+                    style={"height": f"{_WORD_IMPORTANCE_HEIGHT}px"},
+                ),
+            ],
+            style=_CARD_STYLE,
+        )
+
+        # ── Text Samples panel (full-width hub) ───────────────────────
+        text_samples_panel = html.Div(
+            [
+                dbc.Row(
+                    [
+                        dbc.Col(
+                            html.H6(
+                                "Text Samples — click a row to inspect",
+                                className="fw-bold mb-0",
+                                id="table-title",
+                            ),
+                            width="auto",
+                            className="align-self-center",
+                        ),
+                        dbc.Col(
+                            dbc.Button(
+                                "× clear word filter",
+                                id="word-filter-clear-btn",
+                                n_clicks=0,
+                                color="link",
+                                size="sm",
+                                className="text-muted p-0",
+                                style={"display": "none", "fontSize": "0.8em"},
+                            ),
+                            width="auto",
+                            className="align-self-center",
+                        ),
+                    ],
+                    className="align-items-center mb-2",
+                ),
+                dag.AgGrid(
+                    id="dataset-table",
+                    rowData=self._full_table_records,
+                    columnDefs=column_defs,
+                    defaultColDef={"resizable": True, "sortable": True},
+                    dashGridOptions={
+                        "rowSelection": "single",
+                        "tooltipShowDelay": 300,
+                        "rowHeight": 38,
+                    },
+                    selectedRows=[self._full_table_records[0]],
+                    # Taller table + larger type to emphasise this hub panel.
+                    style={"height": "460px", "--ag-font-size": "15px", "--ag-header-font-size": "14px"},
+                    className="ag-theme-alpine",
+                ),
+            ],
+            style=_CARD_STYLE,
+        )
+
+        # ── Token Contributions panel (full-width detail-on-demand) ───
+        token_contributions_panel = html.Div(
+            [
+                html.H6(
+                    id="sentence-highlight-title",
+                    children="Token Contributions",
+                    className="fw-bold",
+                ),
+                # Min-height + vertical centring so short samples still give the
+                # panel presence instead of collapsing to a thin strip.
+                html.Div(
+                    id="sentence-highlight",
+                    style={
+                        "minHeight": "150px",
+                        "display": "flex",
+                        "flexDirection": "column",
+                        "justifyContent": "center",
+                    },
+                ),
+                html.Hr(style={"margin": "14px 0 10px"}),
+                dbc.Row(
+                    [
+                        dbc.Col(
+                            dcc.RadioItems(
+                                id="show-waterfall",
+                                options=[
+                                    {"label": " Show waterfall", "value": "show"},
+                                    {"label": " Hide", "value": "hide"},
+                                ],
+                                value="hide",
+                                inline=True,
+                                inputStyle={"marginRight": "4px"},
+                                labelStyle={"marginRight": "16px"},
+                            ),
+                            width="auto",
+                            className="align-self-center",
+                        ),
+                        dbc.Col(
+                            html.Div(
+                                id="waterfall-threshold-wrapper",
+                                children=[
+                                    html.Label(
+                                        "Group tokens below (% of max contribution)",
+                                        className="small fw-bold mb-0 me-2",
+                                    ),
+                                    dcc.Slider(
+                                        id="waterfall-threshold",
+                                        min=0,
+                                        max=50,
+                                        step=1,
+                                        value=10,
+                                        marks={0: "0%", 10: "10%", 25: "25%", 50: "50%"},
+                                        tooltip={
+                                            "placement": "bottom",
+                                            "always_visible": False,
+                                        },
+                                    ),
+                                ],
+                                style=_HIDDEN,
+                            ),
+                            width=True,
+                        ),
+                    ],
+                    className="align-items-center mb-2",
+                ),
+                html.Div(
+                    id="waterfall-container",
+                    children=[
+                        dcc.Graph(
+                            id="waterfall-graph",
+                            config={"displayModeBar": False},
+                        ),
+                    ],
+                    style=_HIDDEN,
+                ),
+            ],
+            style=_CARD_STYLE,
+        )
+
+        # ── Top row: two global "where to look" panels side by side ───
+        # Word importance shares the row with the sample-space scatter when a
+        # projection is provided; otherwise it spans the full width.
+        if scatter_col_content is not None:
+            top_row_cols = [
+                dbc.Col(word_importance_panel, width=6),
+                dbc.Col(scatter_col_content, width=6),
+            ]
+        else:
+            top_row_cols = [dbc.Col(word_importance_panel, width=12)]
 
         self.app.layout = dbc.Container(
             [
-                # ── Header ──────────────────────────────────────────────────
+                # ── Header (Class selector is the only truly global control) ──
                 dbc.Row(
                     [
                         dbc.Col(html.H3("Shapash — NLP Explainer", className="mb-0"), width=8),
@@ -225,206 +443,14 @@ class NlpWebApp:
                             width=4,
                         ),
                     ],
-                    className="mb-2 mt-3 align-items-center",
+                    className="mb-3 mt-3 align-items-center",
                 ),
-                # ── Controls row ─────────────────────────────────────────────
-                dbc.Row(
-                    [
-                        dbc.Col(
-                            [
-                                html.Label("Top-K words", className="fw-bold small mb-1"),
-                                dcc.Slider(
-                                    id="topk-slider",
-                                    min=1,
-                                    max=50,
-                                    step=1,
-                                    value=20,
-                                    marks={1: "1", 10: "10", 20: "20", 30: "30", 50: "50"},
-                                    tooltip={"placement": "bottom", "always_visible": False},
-                                ),
-                            ],
-                            width=4,
-                        ),
-                        dbc.Col(
-                            [
-                                html.Label("Contributions", className="fw-bold small mb-1"),
-                                dcc.RadioItems(
-                                    id="sign-filter",
-                                    options=[
-                                        {"label": " All", "value": "all"},
-                                        {"label": " Positive", "value": "positive"},
-                                        {"label": " Negative", "value": "negative"},
-                                    ],
-                                    value="all",
-                                    inline=True,
-                                    inputStyle={"marginRight": "4px"},
-                                    labelStyle={"marginRight": "14px"},
-                                ),
-                            ],
-                            width=3,
-                        ),
-                        dbc.Col(
-                            [
-                                html.Label("Exclude words", className="fw-bold small mb-1"),
-                                dcc.Dropdown(
-                                    id="word-filter",
-                                    options=[{"label": w, "value": w} for w in all_words],
-                                    value=[],
-                                    multi=True,
-                                    placeholder="Select words to exclude…",
-                                    style={"fontSize": "0.9em"},
-                                ),
-                            ],
-                            width=5,
-                        ),
-                    ],
-                    className="mb-3 p-2 bg-light rounded",
-                ),
-                # ── Main row ────────────────────────────────────────────────
-                dbc.Row(
-                    [
-                        dbc.Col(
-                            html.Div(
-                                [
-                                    html.H6("Global Word Importance", className="fw-bold"),
-                                    dcc.Graph(
-                                        id="global-importance-graph",
-                                        config={"displayModeBar": False},
-                                        style={"height": "420px"},
-                                    ),
-                                ],
-                                style=_CARD_STYLE,
-                            ),
-                            width=5,
-                        ),
-                        dbc.Col(
-                            html.Div(
-                                [
-                                    dbc.Row(
-                                        [
-                                            dbc.Col(
-                                                html.H6(
-                                                    "Text Samples — click a row to inspect",
-                                                    className="fw-bold mb-0",
-                                                    id="table-title",
-                                                ),
-                                                width="auto",
-                                                className="align-self-center",
-                                            ),
-                                            dbc.Col(
-                                                dbc.Button(
-                                                    "× clear word filter",
-                                                    id="word-filter-clear-btn",
-                                                    n_clicks=0,
-                                                    color="link",
-                                                    size="sm",
-                                                    className="text-muted p-0",
-                                                    style={"display": "none", "fontSize": "0.8em"},
-                                                ),
-                                                width="auto",
-                                                className="align-self-center",
-                                            ),
-                                        ],
-                                        className="align-items-center mb-2",
-                                    ),
-                                    dag.AgGrid(
-                                        id="dataset-table",
-                                        rowData=self._full_table_records,
-                                        columnDefs=column_defs,
-                                        defaultColDef={"resizable": True, "sortable": True},
-                                        dashGridOptions={
-                                            "rowSelection": "single",
-                                            "tooltipShowDelay": 300,
-                                        },
-                                        selectedRows=[self._full_table_records[0]],
-                                        style={"height": "400px"},
-                                        className="ag-theme-alpine",
-                                    ),
-                                ],
-                                style=_CARD_STYLE,
-                            ),
-                            width=7,
-                        ),
-                    ],
-                    className="mb-3",
-                ),
-                # ── Local contributions (+ optional scatter on the left) ──────
-                dbc.Row(
-                    [
-                        *([dbc.Col(scatter_col_content, width=4)] if scatter_col_content is not None else []),
-                        dbc.Col(
-                            html.Div(
-                                [
-                                    html.H6(
-                                        id="sentence-highlight-title",
-                                        children="Token Contributions",
-                                        className="fw-bold",
-                                    ),
-                                    html.Div(id="sentence-highlight"),
-                                    html.Hr(style={"margin": "14px 0 10px"}),
-                                    dbc.Row(
-                                        [
-                                            dbc.Col(
-                                                dcc.RadioItems(
-                                                    id="show-waterfall",
-                                                    options=[
-                                                        {"label": " Show waterfall", "value": "show"},
-                                                        {"label": " Hide", "value": "hide"},
-                                                    ],
-                                                    value="hide",
-                                                    inline=True,
-                                                    inputStyle={"marginRight": "4px"},
-                                                    labelStyle={"marginRight": "16px"},
-                                                ),
-                                                width="auto",
-                                                className="align-self-center",
-                                            ),
-                                            dbc.Col(
-                                                html.Div(
-                                                    id="waterfall-threshold-wrapper",
-                                                    children=[
-                                                        html.Label(
-                                                            "Group tokens below (% of max contribution)",
-                                                            className="small fw-bold mb-0 me-2",
-                                                        ),
-                                                        dcc.Slider(
-                                                            id="waterfall-threshold",
-                                                            min=0,
-                                                            max=50,
-                                                            step=1,
-                                                            value=10,
-                                                            marks={0: "0%", 10: "10%", 25: "25%", 50: "50%"},
-                                                            tooltip={
-                                                                "placement": "bottom",
-                                                                "always_visible": False,
-                                                            },
-                                                        ),
-                                                    ],
-                                                    style=_HIDDEN,
-                                                ),
-                                                width=True,
-                                            ),
-                                        ],
-                                        className="align-items-center mb-2",
-                                    ),
-                                    html.Div(
-                                        id="waterfall-container",
-                                        children=[
-                                            dcc.Graph(
-                                                id="waterfall-graph",
-                                                config={"displayModeBar": False},
-                                            ),
-                                        ],
-                                        style=_HIDDEN,
-                                    ),
-                                ],
-                                style=_CARD_STYLE,
-                            ),
-                            width=8 if scatter_col_content is not None else 12,
-                        ),
-                    ],
-                    className="mb-3",
-                ),
+                # ── Overview / controls row (filters the funnel below) ────────
+                dbc.Row(top_row_cols, className="mb-3"),
+                # ── Hub: full-width text samples table ───────────────────────
+                dbc.Row(dbc.Col(text_samples_panel, width=12), className="mb-3"),
+                # ── Detail-on-demand: full-width token contributions ─────────
+                dbc.Row(dbc.Col(token_contributions_panel, width=12), className="mb-3"),
                 # ── Hidden stores (always present) ───────────────────────────
                 dcc.Store(id="scatter-selected-indices", data=None),
                 dcc.Store(id="word-click-filter", data=None),
@@ -467,7 +493,7 @@ class NlpWebApp:
                 word_imp,
                 title=f"Word importance — {label_name}{suffix}",
                 width=None,
-                height=390,
+                height=_WORD_IMPORTANCE_HEIGHT,
             )
 
         # ── Sentence highlight ───────────────────────────────────────────
@@ -574,7 +600,7 @@ class NlpWebApp:
                 filtered = [r for r in recs if word_lower in r["text"].lower()]
                 recs = filtered or recs
             title = (
-                f'Text Samples — filtered by "{word_filter}" (click bar again to clear)'
+                f'Text Samples — filtered by "{word_filter}"'
                 if word_filter
                 else "Text Samples — click a row to inspect"
             )
@@ -700,7 +726,8 @@ class NlpWebApp:
             plot_bgcolor="#f9f9f9",
             paper_bgcolor="white",
             margin=dict(l=10, r=10, t=10, b=10),
-            height=360,
+            # No fixed height — the responsive Graph stretches it to fill the card.
+            autosize=True,
             legend=dict(itemsizing="constant", orientation="v", title_text=""),
             showlegend=True,
         )
