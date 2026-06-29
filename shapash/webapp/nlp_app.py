@@ -102,6 +102,14 @@ class NlpWebApp:
         }
         if getattr(self.explainer, "y_true", None) is not None:
             records["ground_truth"] = self.explainer.y_true.tolist()
+
+        # Single "Probability" column — confidence of the predicted class.
+        # max(axis=1) works for both binary and multiclass since the predicted
+        # label is always the argmax, regardless of how columns are named.
+        y_prob: pd.DataFrame | None = getattr(self.explainer, "y_prob", None)
+        if y_prob is not None:
+            records["probability"] = [f"{v:.1%}" for v in y_prob.max(axis=1).tolist()]
+
         table_df = pd.DataFrame(records)
 
         # Full records cached for scatter-driven re-filtering in callbacks
@@ -110,6 +118,23 @@ class NlpWebApp:
         table_columns = [{"name": "Text", "id": "text"}, {"name": "Prediction", "id": "prediction"}]
         if "ground_truth" in table_df.columns:
             table_columns.append({"name": "Ground Truth", "id": "ground_truth"})
+        if y_prob is not None:
+            table_columns.append({"name": "Probability", "id": "probability"})
+
+        # ── Table column widths — computed to accommodate optional columns ─────
+        has_gt = "ground_truth" in table_df.columns
+        has_prob = y_prob is not None
+        _pred_w, _gt_w, _prob_w = 12, 12, 10
+        other_pct = _pred_w + (_gt_w if has_gt else 0) + (_prob_w if has_prob else 0)
+        text_pct = max(30, 100 - other_pct)
+        style_cell_conditional: list[dict] = [
+            {"if": {"column_id": "text"}, "width": f"{text_pct}%"},
+            {"if": {"column_id": "prediction"}, "width": f"{_pred_w}%"},
+        ]
+        if has_gt:
+            style_cell_conditional.append({"if": {"column_id": "ground_truth"}, "width": f"{_gt_w}%"})
+        if has_prob:
+            style_cell_conditional.append({"if": {"column_id": "probability"}, "width": f"{_prob_w}%"})
 
         # ── Corpus word list for the exclusion multi-select ────────────
         all_words = sorted(
@@ -290,11 +315,7 @@ class NlpWebApp:
                                             "maxWidth": "0",
                                             "padding": "6px 12px",
                                         },
-                                        style_cell_conditional=[
-                                            {"if": {"column_id": "text"}, "width": "65%"},
-                                            {"if": {"column_id": "prediction"}, "width": "17%"},
-                                            {"if": {"column_id": "ground_truth"}, "width": "18%"},
-                                        ],
+                                        style_cell_conditional=style_cell_conditional,
                                         style_header={"fontWeight": "bold", "backgroundColor": "#f8f9fa"},
                                         style_data_conditional=[
                                             {

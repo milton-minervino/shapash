@@ -90,6 +90,7 @@ class NlpExplainer:
         self.contributions: NlpContributions | None = None
         self.texts: pd.Series | None = None
         self.y_pred: pd.Series | None = None
+        self.y_prob: pd.DataFrame | None = None
         self.y_true: pd.Series | None = None
         self._data_hash: str | None = None
 
@@ -133,14 +134,19 @@ class NlpExplainer:
                     cached = pickle.load(f)  # noqa: S301
                 self.contributions = cached["contributions"]
                 self.y_pred = cached["y_pred"]
+                self.y_prob = cached.get("y_prob")
             else:
                 explain_data = self.backend.run_explainer(text_list)
                 self.contributions = self.backend.get_local_contributions(text_list, explain_data)
-                self.y_pred = self._predict_labels(text_list)
+                pred_df = self._predict(text_list)
+                self.y_pred = pred_df["prediction"]
+                self.y_prob = pred_df.drop(columns=["prediction"])
                 if cache_path is not None:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     with cache_path.open("wb") as f:
-                        pickle.dump({"contributions": self.contributions, "y_pred": self.y_pred}, f)
+                        pickle.dump(
+                            {"contributions": self.contributions, "y_pred": self.y_pred, "y_prob": self.y_prob}, f
+                        )
 
             self.contributions.label_names = self.label_names
             self.contributions.index = self.texts.index
@@ -211,8 +217,13 @@ class NlpExplainer:
     # Private
     # ------------------------------------------------------------------
 
-    def _predict_labels(self, text_list: list[str]) -> pd.Series:
-        """Run the pipeline once to obtain predicted class labels.
+    def _predict(self, text_list: list[str]) -> pd.DataFrame:
+        """Run the pipeline and return a unified DataFrame of predictions and probabilities.
+
+        The first column is always ``"prediction"`` (the argmax label).
+        Subsequent columns hold class probabilities: one per class when the
+        pipeline returns all scores (``return_all_scores=True``), or a single
+        ``"probability"`` column (the winning class confidence) otherwise.
 
         Handles both ``return_all_scores=True`` (list of lists of dicts) and
         single-prediction (list of dicts) pipeline output formats.
@@ -220,6 +231,16 @@ class NlpExplainer:
         raw = self.model(text_list)
         if raw and isinstance(raw[0], list):
             labels = [max(preds, key=lambda p: p["score"])["label"] for preds in raw]
+            col_labels = [d["label"] for d in raw[0]]
+            if self.label_names and len(self.label_names) == len(col_labels):
+                col_labels = self.label_names
+            probs = [[d["score"] for d in preds] for preds in raw]
+            result = pd.DataFrame(probs, index=self.texts.index, columns=col_labels)
         else:
             labels = [p["label"] for p in raw]
-        return pd.Series(labels, index=self.texts.index, name="prediction")
+            result = pd.DataFrame(
+                {"probability": [p["score"] for p in raw]},
+                index=self.texts.index,
+            )
+        result.insert(0, "prediction", pd.Series(labels, index=self.texts.index))
+        return result
