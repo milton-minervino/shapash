@@ -1,0 +1,8 @@
+services:
+  shapash-nlp:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    image: shapash-nlp
+    ports:
+      - "8050:8050"
