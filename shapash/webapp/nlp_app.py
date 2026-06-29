@@ -300,7 +300,33 @@ class NlpWebApp:
                         dbc.Col(
                             html.Div(
                                 [
-                                    html.H6("Text Samples — click a row to inspect", className="fw-bold"),
+                                    dbc.Row(
+                                        [
+                                            dbc.Col(
+                                                html.H6(
+                                                    "Text Samples — click a row to inspect",
+                                                    className="fw-bold mb-0",
+                                                    id="table-title",
+                                                ),
+                                                width="auto",
+                                                className="align-self-center",
+                                            ),
+                                            dbc.Col(
+                                                dbc.Button(
+                                                    "× clear word filter",
+                                                    id="word-filter-clear-btn",
+                                                    n_clicks=0,
+                                                    color="link",
+                                                    size="sm",
+                                                    className="text-muted p-0",
+                                                    style={"display": "none", "fontSize": "0.8em"},
+                                                ),
+                                                width="auto",
+                                                className="align-self-center",
+                                            ),
+                                        ],
+                                        className="align-items-center mb-2",
+                                    ),
                                     dag.AgGrid(
                                         id="dataset-table",
                                         rowData=self._full_table_records,
@@ -399,8 +425,9 @@ class NlpWebApp:
                     ],
                     className="mb-3",
                 ),
-                # ── Hidden store: scatter selection (always present) ──────────
+                # ── Hidden stores (always present) ───────────────────────────
                 dcc.Store(id="scatter-selected-indices", data=None),
+                dcc.Store(id="word-click-filter", data=None),
             ],
             fluid=True,
         )
@@ -501,6 +528,58 @@ class NlpWebApp:
                 title=f"Token contributions — {label_name}",
             )
 
+        # ── Word-bar click → filter table ────────────────────────────────
+        @self.app.callback(
+            Output("word-click-filter", "data"),
+            Input("global-importance-graph", "clickData"),
+            Input("word-filter-clear-btn", "n_clicks"),
+        )
+        def update_word_click_filter(click_data, _clear_clicks):
+            trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+            if "word-filter-clear-btn" in trigger:
+                return None
+            if not click_data or not click_data.get("points"):
+                raise PreventUpdate
+            return click_data["points"][0]["y"]
+
+        @self.app.callback(
+            Output("word-filter-clear-btn", "style"),
+            Input("word-click-filter", "data"),
+        )
+        def toggle_word_clear_button(word_filter):
+            if word_filter:
+                return {"display": "inline", "fontSize": "0.8em"}
+            return {"display": "none", "fontSize": "0.8em"}
+
+        # ── Unified table filter (scatter + word-bar click) ───────────────
+        @self.app.callback(
+            [
+                Output("dataset-table", "rowData"),
+                Output("dataset-table", "selectedRows"),
+                Output("table-title", "children"),
+            ],
+            [
+                Input("scatter-selected-indices", "data"),
+                Input("word-click-filter", "data"),
+            ],
+        )
+        def filter_table(selected_indices, word_filter):
+            if selected_indices is None:
+                recs = full_records
+            else:
+                idx_set = set(selected_indices)
+                recs = [r for r in full_records if r["_orig_idx"] in idx_set] or full_records
+            if word_filter:
+                word_lower = word_filter.lower()
+                filtered = [r for r in recs if word_lower in r["text"].lower()]
+                recs = filtered or recs
+            title = (
+                f'Text Samples — filtered by "{word_filter}" (click bar again to clear)'
+                if word_filter
+                else "Text Samples — click a row to inspect"
+            )
+            return recs, [recs[0]], title
+
         # ── Scatter-specific callbacks (registered only when xy provided) ──
         if self._scatter_xy is not None:
 
@@ -537,21 +616,6 @@ class NlpWebApp:
                 visible = {"display": "inline", "fontSize": "0.8em"}
                 hidden = {"display": "none", "fontSize": "0.8em"}
                 return visible if selected_indices else hidden
-
-            @self.app.callback(
-                [
-                    Output("dataset-table", "rowData"),
-                    Output("dataset-table", "selectedRows"),
-                ],
-                Input("scatter-selected-indices", "data"),
-            )
-            def filter_table(selected_indices):
-                if selected_indices is None:
-                    recs = full_records
-                else:
-                    idx_set = set(selected_indices)
-                    recs = [r for r in full_records if r["_orig_idx"] in idx_set] or full_records
-                return recs, [recs[0]]
 
     # ------------------------------------------------------------------
     # Public
