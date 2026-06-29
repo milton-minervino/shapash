@@ -12,11 +12,12 @@ from __future__ import annotations
 import re
 
 import dash
+import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
 import numpy as np
 import pandas as pd
 import plotly.graph_objs as go
-from dash import Input, Output, callback_context, dash_table, dcc, html
+from dash import Input, Output, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
 
 from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
@@ -108,33 +109,33 @@ class NlpWebApp:
         # label is always the argmax, regardless of how columns are named.
         y_prob: pd.DataFrame | None = getattr(self.explainer, "y_prob", None)
         if y_prob is not None:
-            records["probability"] = [f"{v:.1%}" for v in y_prob.max(axis=1).tolist()]
+            records["probability"] = y_prob.max(axis=1).tolist()
 
         table_df = pd.DataFrame(records)
 
         # Full records cached for scatter-driven re-filtering in callbacks
         self._full_table_records: list[dict] = table_df.to_dict("records")
 
-        table_columns = [{"name": "Text", "id": "text"}, {"name": "Prediction", "id": "prediction"}]
-        if "ground_truth" in table_df.columns:
-            table_columns.append({"name": "Ground Truth", "id": "ground_truth"})
-        if y_prob is not None:
-            table_columns.append({"name": "Probability", "id": "probability"})
-
-        # ── Table column widths — computed to accommodate optional columns ─────
         has_gt = "ground_truth" in table_df.columns
         has_prob = y_prob is not None
-        _pred_w, _gt_w, _prob_w = 12, 12, 10
-        other_pct = _pred_w + (_gt_w if has_gt else 0) + (_prob_w if has_prob else 0)
-        text_pct = max(30, 100 - other_pct)
-        style_cell_conditional: list[dict] = [
-            {"if": {"column_id": "text"}, "width": f"{text_pct}%"},
-            {"if": {"column_id": "prediction"}, "width": f"{_pred_w}%"},
+        column_defs: list[dict] = [
+            {"field": "text", "headerName": "Text", "flex": 3, "tooltipField": "text", "filter": "agTextColumnFilter"},
+            {"field": "prediction", "headerName": "Prediction", "flex": 1, "filter": "agTextColumnFilter"},
         ]
         if has_gt:
-            style_cell_conditional.append({"if": {"column_id": "ground_truth"}, "width": f"{_gt_w}%"})
+            column_defs.append(
+                {"field": "ground_truth", "headerName": "Ground Truth", "flex": 1, "filter": "agTextColumnFilter"}
+            )
         if has_prob:
-            style_cell_conditional.append({"if": {"column_id": "probability"}, "width": f"{_prob_w}%"})
+            column_defs.append(
+                {
+                    "field": "probability",
+                    "headerName": "Probability",
+                    "flex": 1,
+                    "filter": "agNumberColumnFilter",
+                    "valueFormatter": {"function": "params.value != null ? params.value.toFixed(3) : ''"},
+                }
+            )
 
         # ── Corpus word list for the exclusion multi-select ────────────
         all_words = sorted(
@@ -300,35 +301,18 @@ class NlpWebApp:
                             html.Div(
                                 [
                                     html.H6("Text Samples — click a row to inspect", className="fw-bold"),
-                                    dash_table.DataTable(
+                                    dag.AgGrid(
                                         id="dataset-table",
-                                        data=self._full_table_records,
-                                        columns=table_columns,
-                                        row_selectable="single",
-                                        selected_rows=[0],
-                                        page_action="none",
-                                        style_table={"maxHeight": "400px", "overflowY": "auto"},
-                                        style_cell={
-                                            "textAlign": "left",
-                                            "overflow": "hidden",
-                                            "textOverflow": "ellipsis",
-                                            "maxWidth": "0",
-                                            "padding": "6px 12px",
+                                        rowData=self._full_table_records,
+                                        columnDefs=column_defs,
+                                        defaultColDef={"resizable": True, "sortable": True},
+                                        dashGridOptions={
+                                            "rowSelection": "single",
+                                            "tooltipShowDelay": 300,
                                         },
-                                        style_cell_conditional=style_cell_conditional,
-                                        style_header={"fontWeight": "bold", "backgroundColor": "#f8f9fa"},
-                                        style_data_conditional=[
-                                            {
-                                                "if": {"state": "selected"},
-                                                "backgroundColor": "#e8f4f8",
-                                                "border": "1px solid #1f77b4",
-                                            },
-                                        ],
-                                        tooltip_data=[
-                                            {"text": {"value": r["text"], "type": "markdown"}}
-                                            for r in self._full_table_records
-                                        ],
-                                        tooltip_duration=None,
+                                        selectedRows=[self._full_table_records[0]],
+                                        style={"height": "400px"},
+                                        className="ag-theme-alpine",
                                     ),
                                 ],
                                 style=_CARD_STYLE,
@@ -466,15 +450,14 @@ class NlpWebApp:
                 Output("sentence-highlight-title", "children"),
             ],
             [
-                Input("dataset-table", "selected_rows"),
-                Input("dataset-table", "data"),
+                Input("dataset-table", "selectedRows"),
                 Input("class-selector", "value"),
             ],
         )
-        def update_sentence_highlight(selected_rows, table_data, label_idx):
-            if not selected_rows or not table_data or label_idx is None:
+        def update_sentence_highlight(selected_rows, label_idx):
+            if not selected_rows or label_idx is None:
                 raise PreventUpdate
-            pos = int(table_data[selected_rows[0]]["_orig_idx"])
+            pos = int(selected_rows[0]["_orig_idx"])
             label_idx = int(label_idx)
             tokens, vals, base_value, label_name = self._sample_data(pos, label_idx)
             sample_text = self.explainer.texts.iloc[pos]
@@ -498,16 +481,15 @@ class NlpWebApp:
         @self.app.callback(
             Output("waterfall-graph", "figure"),
             [
-                Input("dataset-table", "selected_rows"),
-                Input("dataset-table", "data"),
+                Input("dataset-table", "selectedRows"),
                 Input("class-selector", "value"),
                 Input("waterfall-threshold", "value"),
             ],
         )
-        def update_waterfall(selected_rows, table_data, label_idx, threshold_pct):
-            if not selected_rows or not table_data or label_idx is None:
+        def update_waterfall(selected_rows, label_idx, threshold_pct):
+            if not selected_rows or label_idx is None:
                 raise PreventUpdate
-            pos = int(table_data[selected_rows[0]]["_orig_idx"])
+            pos = int(selected_rows[0]["_orig_idx"])
             label_idx = int(label_idx)
             tokens, vals, base_value, label_name = self._sample_data(pos, label_idx)
             min_pct = (threshold_pct if threshold_pct is not None else 10) / 100.0
@@ -558,9 +540,8 @@ class NlpWebApp:
 
             @self.app.callback(
                 [
-                    Output("dataset-table", "data"),
-                    Output("dataset-table", "selected_rows"),
-                    Output("dataset-table", "tooltip_data"),
+                    Output("dataset-table", "rowData"),
+                    Output("dataset-table", "selectedRows"),
                 ],
                 Input("scatter-selected-indices", "data"),
             )
@@ -570,8 +551,7 @@ class NlpWebApp:
                 else:
                     idx_set = set(selected_indices)
                     recs = [r for r in full_records if r["_orig_idx"] in idx_set] or full_records
-                tooltips = [{"text": {"value": r["text"], "type": "markdown"}} for r in recs]
-                return recs, [0], tooltips
+                return recs, [recs[0]]
 
     # ------------------------------------------------------------------
     # Public
