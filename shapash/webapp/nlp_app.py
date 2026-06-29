@@ -25,8 +25,11 @@ from shapash.plots.plot_waterfall import plot_waterfall
 from shapash.plots.plot_word_importance import plot_word_importance
 
 _CARD_STYLE = {"border": "1px solid #dee2e6", "borderRadius": "4px", "padding": "12px", "height": "100%"}
-# Single source of truth so the graph container and the Plotly figure agree.
-_WORD_IMPORTANCE_HEIGHT = 390
+# min() only shrinks on small screens; returns the natural size on large ones.
+# 800 px CSS (HiDPI laptop): 224 px chart / 240 px table — enough to show token contributions
+# 1080 px CSS (external): 302 px chart / 324 px table — close to original feel
+_WORD_IMPORTANCE_HEIGHT_CSS = "min(390px, 28vh)"
+_TABLE_HEIGHT_CSS = "min(460px, 30vh)"
 _SPECIAL_RE = re.compile(r"^\[.*\]$|^##|^\s*$")
 _HIDDEN = {"display": "none"}
 _VISIBLE = {"display": "block"}
@@ -278,8 +281,8 @@ class NlpWebApp:
                 ),
                 dcc.Graph(
                     id="global-importance-graph",
-                    config={"displayModeBar": False},
-                    style={"height": f"{_WORD_IMPORTANCE_HEIGHT}px"},
+                    config={"displayModeBar": False, "responsive": True},
+                    style={"height": _WORD_IMPORTANCE_HEIGHT_CSS},
                 ),
             ],
             style=_CARD_STYLE,
@@ -326,8 +329,11 @@ class NlpWebApp:
                         "rowHeight": 38,
                     },
                     selectedRows=[self._full_table_records[0]],
-                    # Taller table + larger type to emphasise this hub panel.
-                    style={"height": "460px", "--ag-font-size": "15px", "--ag-header-font-size": "14px"},
+                    style={
+                        "height": _TABLE_HEIGHT_CSS,
+                        "--ag-font-size": "15px",
+                        "--ag-header-font-size": "14px",
+                    },
                     className="ag-theme-alpine",
                 ),
             ],
@@ -489,12 +495,14 @@ class NlpWebApp:
             )
             label_name = (contrib.label_names or [])[int(label_idx)] if contrib.label_names else str(label_idx)
             suffix = f" ({len(selected_indices)} samples)" if selected_indices is not None else ""
-            return plot_word_importance(
+            fig = plot_word_importance(
                 word_imp,
                 title=f"Word importance — {label_name}{suffix}",
                 width=None,
-                height=_WORD_IMPORTANCE_HEIGHT,
+                height=None,
             )
+            fig.layout.height = None  # let the CSS container height take over
+            return fig
 
         # ── Sentence highlight ───────────────────────────────────────────
         @self.app.callback(
@@ -513,10 +521,8 @@ class NlpWebApp:
             pos = int(selected_rows[0]["_orig_idx"])
             label_idx = int(label_idx)
             tokens, vals, base_value, label_name = self._sample_data(pos, label_idx)
-            sample_text = self.explainer.texts.iloc[pos]
-            preview = (sample_text[:60] + "…") if len(sample_text) > 60 else sample_text
             highlight = plot_sentence_highlight(tokens=tokens, values=vals, base_value=base_value)
-            title = f'Token Contributions — {label_name} | "{preview}"'
+            title = f"Token Contributions — {label_name}"
             return highlight, title
 
         # ── Waterfall show/hide ──────────────────────────────────────────
@@ -647,9 +653,9 @@ class NlpWebApp:
     # Public
     # ------------------------------------------------------------------
 
-    def run(self, port: int = 8050, debug: bool = False) -> None:
+    def run(self, port: int = 8050, debug: bool = False, host: str = "127.0.0.1") -> None:
         """Launch the Dash development server."""
-        self.app.run(port=port, debug=debug)
+        self.app.run(port=port, debug=debug, host=host)
 
     # ------------------------------------------------------------------
     # Helpers

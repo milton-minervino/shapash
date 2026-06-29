@@ -192,7 +192,62 @@ class NlpExplainer:
 
         return plot_token_highlight(tokens=tokens, values=values, title=title, max_tokens=max_tokens)
 
-    def run_app(self, port: int = 8050, debug: bool = False, scatter_xy=None) -> None:
+    def save_snapshot(self, path: str | Path, scatter_xy=None) -> None:
+        """Persist compiled results (no model or backend) for offline serving.
+
+        The saved file contains only the data required by ``NlpWebApp`` —
+        texts, contributions, predictions and the optional 2-D projection.
+        It can be loaded back with :meth:`from_snapshot` without installing
+        torch, transformers, or any other heavy inference dependency.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination ``.pkl`` file.
+        scatter_xy : np.ndarray, optional
+            Pre-computed 2-D projection to bundle with the snapshot (same
+            array you would pass to ``run_app``).
+        """
+        if self.contributions is None:
+            raise RuntimeError("Call compile() before save_snapshot().")
+        state = {
+            "texts": self.texts,
+            "contributions": self.contributions,
+            "y_pred": self.y_pred,
+            "y_prob": self.y_prob,
+            "y_true": self.y_true,
+            "label_names": self.label_names,
+            "scatter_xy": scatter_xy,
+        }
+        with Path(path).open("wb") as f:
+            pickle.dump(state, f)
+
+    @classmethod
+    def from_snapshot(cls, path: str | Path) -> tuple[NlpExplainer, object]:
+        """Restore a snapshot saved by :meth:`save_snapshot`.
+
+        Returns
+        -------
+        explainer : NlpExplainer
+            Ready-to-serve instance (``model`` and ``backend`` are ``None``).
+        scatter_xy : np.ndarray or None
+            The projection array bundled at save time, or ``None``.
+        """
+        with Path(path).open("rb") as f:
+            state = pickle.load(f)  # noqa: S301
+        xpl = cls.__new__(cls)
+        xpl.model = None
+        xpl.backend = None
+        xpl.label_names = state.get("label_names")
+        xpl.texts = state["texts"]
+        xpl.contributions = state["contributions"]
+        xpl.y_pred = state["y_pred"]
+        xpl.y_prob = state.get("y_prob")
+        xpl.y_true = state.get("y_true")
+        xpl._data_hash = None
+        return xpl, state.get("scatter_xy")
+
+    def run_app(self, port: int = 8050, debug: bool = False, host: str = "127.0.0.1", scatter_xy=None) -> None:
         """Launch the NLP explanation webapp.
 
         Parameters
@@ -211,7 +266,7 @@ class NlpExplainer:
         """
         if self.contributions is None:
             raise RuntimeError("Call compile() before run_app().")
-        NlpWebApp(self, scatter_xy=scatter_xy).run(port=port, debug=debug)
+        NlpWebApp(self, scatter_xy=scatter_xy).run(port=port, debug=debug, host=host)
 
     # ------------------------------------------------------------------
     # Private
