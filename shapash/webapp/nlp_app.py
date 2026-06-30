@@ -165,6 +165,7 @@ class NlpWebApp:
             color_options = [{"label": "Prediction", "value": "prediction"}]
             if getattr(self.explainer, "y_true", None) is not None:
                 color_options.append({"label": "Ground Truth", "value": "ground_truth"})
+            color_options.append({"label": "Word contribution", "value": "word_contribution"})
 
             scatter_col_content = html.Div(
                 [
@@ -186,6 +187,19 @@ class NlpWebApp:
                                 width="auto",
                             ),
                             dbc.Col(
+                                dcc.Dropdown(
+                                    id="scatter-word-select",
+                                    options=[{"label": w, "value": w} for w in all_words],
+                                    value=[],
+                                    multi=True,
+                                    clearable=True,
+                                    placeholder="Select words…",
+                                    style={"display": "none", "minWidth": "180px", "fontSize": "0.9em"},
+                                ),
+                                width="auto",
+                                className="align-self-center",
+                            ),
+                            dbc.Col(
                                 dbc.Button(
                                     "× clear",
                                     id="scatter-clear-btn",
@@ -202,7 +216,7 @@ class NlpWebApp:
                         className="align-items-center mb-2",
                     ),
                     html.Small(
-                        "Click a point or box/lasso to filter — click again or × clear to reset.",
+                        "Box/lasso or click to filter. Click a word bar to color by its SHAP contribution.",
                         className="text-muted d-block mb-2",
                     ),
                     dcc.Graph(
@@ -634,10 +648,40 @@ class NlpWebApp:
 
             @self.app.callback(
                 Output("scatter-plot", "figure"),
+                [
+                    Input("color-by", "value"),
+                    Input("scatter-word-select", "value"),
+                    Input("class-selector", "value"),
+                ],
+            )
+            def update_scatter_color(color_by, words, label_idx):
+                return self._build_scatter_fig(
+                    color_by or "prediction", words=words or [], label_idx=int(label_idx or 0)
+                )
+
+            @self.app.callback(
+                Output("color-by", "value"),
+                Input("scatter-word-select", "value"),
+            )
+            def sync_color_by(words):
+                if not words:
+                    raise PreventUpdate
+                return "word_contribution"
+
+            @self.app.callback(
+                Output("scatter-word-select", "value"),
+                Input("word-click-filter", "data"),
+            )
+            def sync_word_select_from_bar(word_filter):
+                return [word_filter] if word_filter else []
+
+            @self.app.callback(
+                Output("scatter-word-select", "style"),
                 Input("color-by", "value"),
             )
-            def update_scatter_color(color_by):
-                return self._build_scatter_fig(color_by or "prediction")
+            def toggle_word_select(color_by):
+                base = {"minWidth": "180px", "fontSize": "0.9em"}
+                return base if color_by == "word_contribution" else {**base, "display": "none"}
 
             @self.app.callback(
                 Output("scatter-selected-indices", "data"),
@@ -700,16 +744,95 @@ class NlpWebApp:
         label_name = (contrib.label_names or [])[label_idx] if contrib.label_names else str(label_idx)
         return tokens, vals, base_value, label_name
 
-    def _build_scatter_fig(self, color_by: str) -> go.Figure:
-        """2-D scatter coloured by prediction or ground-truth label.
+    def _word_contributions(self, word: str, label_idx: int) -> np.ndarray:
+        """Per-sample sum of SHAP contributions for all tokens matching *word*."""
+        contrib = self.explainer.contributions
+        n = len(self.explainer.texts)
+        result = np.zeros(n)
+        word_lower = word.lower()
+        for i in range(n):
+            tokens = contrib.token_strings[i]
+            vals = contrib.values[i]
+            if vals.ndim == 2:
+                vals = vals[:, label_idx]
+            for j, tok in enumerate(tokens):
+                if tok.strip().lower() == word_lower:
+                    result[i] += vals[j]
+        return result
 
-        One trace per class so the legend works correctly and Plotly's
-        box/lasso select dims unselected points across all traces.
-        ``customdata`` stores the original sample index so ``selectedData``
-        callbacks can recover it regardless of which trace a point is in.
+    def _build_scatter_fig(self, color_by: str, words: list[str] | None = None, label_idx: int = 0) -> go.Figure:
+        """2-D scatter coloured by prediction, ground-truth label, or word SHAP contribution.
+
+        One trace per class for label-based coloring so the legend works correctly
+        and Plotly's box/lasso select dims unselected points across all traces.
+        Word-contribution mode uses a single diverging-colorscale trace.
+        ``customdata`` always stores the original sample index.
         """
         n = len(self.explainer.texts)
         contrib = self.explainer.contributions
+        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in self.explainer.texts]
+        xy = self._scatter_xy
+
+        if color_by == "word_contribution" and words:
+            contributions = sum(self._word_contributions(w, label_idx) for w in words)
+            max_abs = float(np.abs(contributions).max()) or 1.0
+            present_mask = np.where(contributions != 0.0)[0]
+            absent_mask = np.where(contributions == 0.0)[0]
+            colorbar_title = " + ".join(f'"{w}"' for w in words) if len(words) <= 3 else f"{len(words)} words"
+
+            fig = go.Figure()
+            # Gray context layer — only absent points so hover doesn't overlap
+            if len(absent_mask) > 0:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=xy[absent_mask, 0].tolist(),
+                        y=xy[absent_mask, 1].tolist(),
+                        mode="markers",
+                        marker=dict(color="#b0b0b0", size=5, opacity=0.35),
+                        customdata=absent_mask.reshape(-1, 1).tolist(),
+                        text=[texts_short[j] for j in absent_mask],
+                        hovertemplate="%{text}<extra>absent</extra>",
+                        showlegend=False,
+                    )
+                )
+            # Colored overlay — only samples where at least one word contributes
+            if len(present_mask) > 0:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=xy[present_mask, 0].tolist(),
+                        y=xy[present_mask, 1].tolist(),
+                        mode="markers",
+                        marker=dict(
+                            color=contributions[present_mask].tolist(),
+                            colorscale="RdBu",
+                            cmin=-max_abs,
+                            cmax=max_abs,
+                            size=9,
+                            opacity=0.9,
+                            colorbar=dict(
+                                title=dict(text=colorbar_title, side="right"),
+                                thickness=12,
+                                tickformat=".2f",
+                            ),
+                        ),
+                        customdata=present_mask.reshape(-1, 1).tolist(),
+                        text=[texts_short[j] for j in present_mask],
+                        hovertemplate="<b>SHAP: %{marker.color:.3f}</b><br>%{text}<extra></extra>",
+                        showlegend=False,
+                    )
+                )
+            fig.update_layout(
+                dragmode="select",
+                uirevision="scatter",
+                xaxis=dict(showticklabels=False, showgrid=True, gridcolor="#e5e5e5", zeroline=False, title=""),
+                yaxis=dict(showticklabels=False, showgrid=True, gridcolor="#e5e5e5", zeroline=False, title=""),
+                plot_bgcolor="#f9f9f9",
+                paper_bgcolor="white",
+                margin=dict(l=10, r=10, t=10, b=10),
+                autosize=True,
+                showlegend=False,
+            )
+            return fig
 
         if color_by == "ground_truth" and getattr(self.explainer, "y_true", None) is not None:
             labels = [str(label) for label in self.explainer.y_true.tolist()]
@@ -719,8 +842,6 @@ class NlpWebApp:
             labels = [""] * n
 
         label_names = contrib.label_names or sorted(set(labels))
-        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in self.explainer.texts]
-        xy = self._scatter_xy
 
         fig = go.Figure()
         for i, name in enumerate(label_names):
