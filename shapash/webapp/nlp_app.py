@@ -128,6 +128,7 @@ class NlpWebApp:
         self._full_table_records: list[dict] = table_df.to_dict("records")
 
         has_gt = "ground_truth" in table_df.columns
+        self._has_gt = has_gt
         has_prob = y_prob is not None
         column_defs: list[dict] = [
             {"field": "text", "headerName": "Text", "flex": 3, "tooltipField": "text", "filter": "agTextColumnFilter"},
@@ -315,6 +316,17 @@ class NlpWebApp:
                             width="auto",
                             className="align-self-center",
                         ),
+                        dbc.Col(
+                            dbc.Switch(
+                                id="errors-only-switch",
+                                label="Errors only",
+                                value=False,
+                                className="small mb-0",
+                                style={} if has_gt else {"display": "none"},
+                            ),
+                            width="auto",
+                            className="align-self-center ms-2",
+                        ),
                     ],
                     className="align-items-center mb-2",
                 ),
@@ -471,6 +483,7 @@ class NlpWebApp:
     def _register_callbacks(self) -> None:
         contrib = self.explainer.contributions
         full_records = self._full_table_records
+        has_gt = self._has_gt
 
         # ── Global word importance ───────────────────────────────────────
         @self.app.callback(
@@ -583,7 +596,7 @@ class NlpWebApp:
                 return {"display": "inline", "fontSize": "0.8em"}
             return {"display": "none", "fontSize": "0.8em"}
 
-        # ── Unified table filter (scatter + word-bar click) ───────────────
+        # ── Unified table filter (scatter + word-bar click + errors-only) ──
         @self.app.callback(
             [
                 Output("dataset-table", "rowData"),
@@ -593,14 +606,18 @@ class NlpWebApp:
             [
                 Input("scatter-selected-indices", "data"),
                 Input("word-click-filter", "data"),
+                Input("errors-only-switch", "value"),
             ],
         )
-        def filter_table(selected_indices, word_filter):
+        def filter_table(selected_indices, word_filter, errors_only):
             if selected_indices is None:
                 recs = full_records
             else:
                 idx_set = set(selected_indices)
                 recs = [r for r in full_records if r["_orig_idx"] in idx_set] or full_records
+            if errors_only and has_gt:
+                misclassified = [r for r in recs if str(r.get("prediction", "")) != str(r.get("ground_truth", ""))]
+                recs = misclassified or recs
             if word_filter:
                 word_lower = word_filter.lower()
                 filtered = [r for r in recs if word_lower in r["text"].lower()]
