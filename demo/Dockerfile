@@ -14,6 +14,8 @@ WORKDIR /app
 # Heavy ML deps (torch, transformers, datasets, pacmap) are intentionally omitted.
 COPY pyproject.toml README.md MANIFEST.in ./
 COPY shapash/ ./shapash/
+# setuptools-scm can't find .git in the build context; tell it the version explicitly.
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SHAPASH=2.9.0
 RUN pip install --no-cache-dir "." "dash-ag-grid>=35.2.0" "pyarrow>=17.0.0"
 
 # Serve script + pre-computed snapshot (no model required at runtime)
