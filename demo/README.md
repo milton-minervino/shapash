@@ -25,23 +25,15 @@ This writes `demo/explainer_snapshot.pkl`.  The file bundles texts, predictions,
 
 ---
 
-## Step 2 — Build the Docker image
+## Step 2 — Build and run the app
 
 Run from the **repo root** (the build context needs access to the `shapash/` package):
 
 ```bash
-docker compose -f demo/docker-compose.yml build
+docker compose -f demo/docker-compose.yml up --build
 ```
 
-The image installs only the lightweight serving dependencies (Dash, Plotly, pandas …).  No model, no GPU, no heavy ML libraries.
-
----
-
-## Step 3 — Run the app
-
-```bash
-docker compose -f demo/docker-compose.yml up
-```
+The image installs only the lightweight serving dependencies (Dash, Plotly, pandas …).  No model, no GPU, no heavy ML libraries.  Drop `--build` on subsequent runs if nothing has changed.
 
 Then open **http://localhost:8050** in your browser.
 
