@@ -333,7 +333,7 @@ class NlpWebApp:
                         dbc.Col(
                             dbc.Switch(
                                 id="errors-only-switch",
-                                label="Errors only",
+                                label="Model Errors",
                                 value=False,
                                 className="small mb-0",
                                 style={} if has_gt else {"display": "none"},
@@ -389,16 +389,11 @@ class NlpWebApp:
                 dbc.Row(
                     [
                         dbc.Col(
-                            dcc.RadioItems(
+                            dbc.Switch(
                                 id="show-waterfall",
-                                options=[
-                                    {"label": " Show waterfall", "value": "show"},
-                                    {"label": " Hide", "value": "hide"},
-                                ],
-                                value="hide",
-                                inline=True,
-                                inputStyle={"marginRight": "4px"},
-                                labelStyle={"marginRight": "16px"},
+                                label="Show waterfall",
+                                value=False,
+                                # className="small mb-0",
                             ),
                             width="auto",
                             className="align-self-center",
@@ -561,7 +556,7 @@ class NlpWebApp:
             Input("show-waterfall", "value"),
         )
         def toggle_waterfall(show):
-            return (_VISIBLE, _VISIBLE) if show == "show" else (_HIDDEN, _HIDDEN)
+            return (_VISIBLE, _VISIBLE) if show else (_HIDDEN, _HIDDEN)
 
         # ── Waterfall chart ──────────────────────────────────────────────
         @self.app.callback(
