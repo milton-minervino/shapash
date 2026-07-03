@@ -6,3 +6,13 @@ services:
     image: shapash-nlp
     ports:
       - "8050:8050"
+
+  # NLP Explainer Extended (CPU, live model). Heavier image; loads pre-computed caches
+  # (run serve_nlp_ext.py once first to build them — see demo/README.md).
+  shapash-nlp-ext:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.nlp_ext
+    image: shapash-nlp-ext
+    ports:
+      - "8051:8051"
