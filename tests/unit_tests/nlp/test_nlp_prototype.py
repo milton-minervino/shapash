@@ -445,10 +445,9 @@ class TestNlpWebApp(unittest.TestCase):
 
     def test_waterfall_controls_present(self):
         ids = self._collect_ids(self.webapp.app.layout)
-        self.assertIn("show-waterfall", ids)
+        # Waterfall is now a tab (no show/hide switch); the threshold slider + graph live in it.
         self.assertIn("waterfall-threshold", ids)
         self.assertIn("waterfall-graph", ids)
-        self.assertIn("waterfall-container", ids)
 
     def test_dataset_table_no_ground_truth_by_default(self):
         table = self._find_component(self.webapp.app.layout, "dataset-table")
