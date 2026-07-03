@@ -21,8 +21,17 @@ from plotly import graph_objs as go
 
 from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 from shapash.backend.nlp_shap_backend import NlpShapBackend
+from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
+from shapash.compute.generators.hotflip import HotFlipGenerator
+from shapash.model.base import TextModel
+from shapash.model.hf import HFPipelineModel
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.webapp.nlp_app import NlpWebApp
+
+
+def _looks_like_pipeline(model: object) -> bool:
+    """Heuristic: a HuggingFace ``text-classification`` pipeline is callable and has a tokenizer."""
+    return callable(model) and hasattr(model, "tokenizer")
 
 
 def _hash_texts(text_list: list[str]) -> str:
@@ -76,17 +85,42 @@ class NlpExplainer:
         model,
         label_names: list[str] | None = None,
         backend: NlpBackend | None = None,
+        cf_generator: CounterfactualGenerator | None = None,
         explainer_args: dict | None = None,
         explainer_compute_args: dict | None = None,
     ) -> None:
         self.model = model
         self.label_names = label_names
+
+        # Wrap the model in a capability-aware TextModel adapter when possible. A raw HuggingFace
+        # pipeline becomes an HFPipelineModel (predict-only); a TextModel is used as-is; anything
+        # else (e.g. a LIME classifier_fn) leaves _text_model as None and the legacy path is kept.
+        if isinstance(model, TextModel):
+            self._text_model: TextModel | None = model
+            if label_names is None:
+                self.label_names = model.label_names
+        elif _looks_like_pipeline(model):
+            self._text_model = HFPipelineModel(model, label_names)
+        else:
+            self._text_model = None
+
+        # The SHAP/LIME backend consumes a plain callable; a TextModel exposes it via shap_callable.
+        shap_model = self._text_model.shap_callable if self._text_model is not None else model
         self.backend: NlpBackend = backend or NlpShapBackend(
-            model=model,
-            label_names=label_names,
+            model=shap_model,
+            label_names=self.label_names,
             explainer_args=explainer_args or {},
             explainer_compute_args=explainer_compute_args or {},
         )
+
+        # Counterfactual generator: explicit > auto-built (HotFlip) when the model is capable > none.
+        if cf_generator is not None:
+            self.cf_generator: CounterfactualGenerator | None = cf_generator
+        elif self._text_model is not None and HotFlipGenerator.is_compatible(self._text_model):
+            self.cf_generator = HotFlipGenerator(self._text_model)
+        else:
+            self.cf_generator = None
+
         self.contributions: NlpContributions | None = None
         self.texts: pd.Series | None = None
         self.y_pred: pd.Series | None = None
@@ -238,6 +272,8 @@ class NlpExplainer:
         xpl = cls.__new__(cls)
         xpl.model = None
         xpl.backend = None
+        xpl._text_model = None
+        xpl.cf_generator = None
         xpl.label_names = state.get("label_names")
         xpl.texts = state["texts"]
         xpl.contributions = state["contributions"]
@@ -269,8 +305,60 @@ class NlpExplainer:
         NlpWebApp(self, scatter_xy=scatter_xy).run(port=port, debug=debug, host=host)
 
     # ------------------------------------------------------------------
+    # InteractiveEngine — live what-if surface (see explainer/interactive.py)
+    # ------------------------------------------------------------------
+
+    def can_edit(self) -> bool:
+        """Whether edited text can be re-predicted and re-explained live.
+
+        Requires a live model adapter and backend (both are ``None`` after ``from_snapshot``).
+        """
+        return getattr(self, "_text_model", None) is not None and getattr(self, "backend", None) is not None
+
+    def can_counterfactual(self) -> bool:
+        """Whether a counterfactual generator is bound and ready."""
+        return getattr(self, "cf_generator", None) is not None
+
+    def predict(self, text: str) -> tuple[str, dict[str, float]]:
+        """Predict a single text, returning ``(label, {label: probability})``."""
+        text_model = self._require_text_model()
+        probs = text_model.predict([text])[0]
+        names = text_model.label_names or self.label_names or [str(i) for i in range(len(probs))]
+        idx = int(probs.argmax())
+        return names[idx], {name: float(p) for name, p in zip(names, probs, strict=False)}
+
+    def explain_text(self, text: str) -> tuple[NlpContributions, str, dict[str, float]]:
+        """Re-explain one (possibly edited) text: contributions + prediction + probabilities.
+
+        Bypasses the batch hash cache — this is a single, on-demand explanation of new input.
+        """
+        if getattr(self, "backend", None) is None:
+            raise RuntimeError("explain_text() requires a live backend (unavailable on a snapshot).")
+        raw = self.backend.run_explainer([text])
+        contributions = self.backend.get_local_contributions([text], raw)
+        contributions.label_names = self.label_names
+        label, probabilities = self.predict(text)
+        return contributions, label, probabilities
+
+    def generate_counterfactuals(self, text: str, config: dict | None = None) -> list[Counterfactual]:
+        """Generate counterfactuals for ``text`` via the bound generator."""
+        if getattr(self, "cf_generator", None) is None:
+            raise RuntimeError("No counterfactual generator is configured for this explainer.")
+        return self.cf_generator.generate(text, config=config)
+
+    def cf_config_spec(self) -> dict[str, Field]:
+        """Return the generator's tunable config spec (empty when no generator)."""
+        return self.cf_generator.config_spec() if getattr(self, "cf_generator", None) is not None else {}
+
+    # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
+
+    def _require_text_model(self) -> TextModel:
+        text_model = getattr(self, "_text_model", None)
+        if text_model is None:
+            raise RuntimeError("Live prediction requires a TextModel-backed explainer (unavailable on a snapshot).")
+        return text_model
 
     def _predict(self, text_list: list[str]) -> pd.DataFrame:
         """Run the pipeline and return a unified DataFrame of predictions and probabilities.
@@ -283,6 +371,15 @@ class NlpExplainer:
         Handles both ``return_all_scores=True`` (list of lists of dicts) and
         single-prediction (list of dicts) pipeline output formats.
         """
+        text_model = getattr(self, "_text_model", None)
+        if text_model is not None:
+            probs = text_model.predict(text_list)
+            names = text_model.label_names or self.label_names or [str(i) for i in range(probs.shape[1])]
+            result = pd.DataFrame(probs, index=self.texts.index, columns=list(names))
+            labels = [names[int(i)] for i in probs.argmax(axis=1)]
+            result.insert(0, "prediction", pd.Series(labels, index=self.texts.index))
+            return result
+
         raw = self.model(text_list)
         if raw and isinstance(raw[0], list):
             labels = [max(preds, key=lambda p: p["score"])["label"] for preds in raw]
