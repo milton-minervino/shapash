@@ -16,7 +16,7 @@ from pathlib import Path
 
 from shapash.explainer.nlp_explainer import NlpExplainer
 
-snapshot = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("explainer_snapshot.pkl")
+snapshot = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "explainer_snapshot.pkl"
 if not snapshot.exists():
     raise FileNotFoundError(f"Snapshot not found: {snapshot}\nRun demo/test_webapp_nlp.py first to generate it.")
 
