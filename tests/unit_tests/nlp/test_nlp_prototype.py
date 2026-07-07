@@ -19,11 +19,12 @@ from shapash.backend.nlp_backend import NlpBackend, NlpContributions, NlpRawExpl
 from shapash.backend.nlp_lime_backend import NlpLimeBackend
 from shapash.backend.nlp_shap_backend import NlpShapBackend
 from shapash.explainer.nlp_explainer import NlpExplainer
+from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
 from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.plots.plot_waterfall import plot_waterfall
 from shapash.plots.plot_word_importance import plot_word_importance
-from shapash.webapp.nlp_app import NlpWebApp
+from shapash.webapp.nlp_app import NlpWebApp, _cell_from_click, _compose_selection
 
 LABEL_NAMES = ["sadness", "joy", "love", "anger", "fear", "surprise"]
 N_CLASSES = len(LABEL_NAMES)
@@ -343,6 +344,54 @@ class TestPlotWordImportance(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# plot_confusion_matrix
+# ---------------------------------------------------------------------------
+
+
+class TestPlotConfusionMatrix(unittest.TestCase):
+    def setUp(self):
+        # 3-class matrix: rows = true, cols = predicted. Row 2 (index 2) is empty.
+        self.cm = np.array([[5, 2, 0], [1, 4, 0], [0, 0, 0]])
+        self.labels = ["A", "B", "C"]
+
+    def test_returns_heatmap_figure(self):
+        fig = plot_confusion_matrix(self.cm, self.labels)
+        self.assertIsInstance(fig, go.Figure)
+        self.assertIsInstance(fig.data[0], go.Heatmap)
+
+    def test_axes_are_labelled_true_and_predicted(self):
+        fig = plot_confusion_matrix(self.cm, self.labels)
+        self.assertEqual(list(fig.data[0].x), self.labels)
+        self.assertEqual(list(fig.data[0].y), self.labels)
+
+    def test_customdata_encodes_pred_then_true(self):
+        # customdata[true][pred] must be [pred_idx, true_idx] for the click handler.
+        fig = plot_confusion_matrix(self.cm, self.labels)
+        cd = np.asarray(fig.data[0].customdata)
+        self.assertEqual(list(cd[0, 1]), [1, 0])  # true=0, pred=1
+        self.assertEqual(list(cd[1, 2]), [2, 1])  # true=1, pred=2
+
+    def test_counts_shown_as_text(self):
+        fig = plot_confusion_matrix(self.cm, self.labels)
+        self.assertEqual(fig.data[0].text[0][0], "5")
+
+    def test_normalize_true_is_row_recall(self):
+        fig = plot_confusion_matrix(self.cm, self.labels, normalize="true")
+        z = np.asarray(fig.data[0].z)
+        np.testing.assert_allclose(z[0], [5 / 7, 2 / 7, 0.0])
+
+    def test_normalize_true_handles_empty_row_without_nan(self):
+        fig = plot_confusion_matrix(self.cm, self.labels, normalize="true")
+        z = np.asarray(fig.data[0].z)
+        self.assertFalse(np.isnan(z).any())
+        np.testing.assert_array_equal(z[2], [0.0, 0.0, 0.0])
+
+    def test_custom_title(self):
+        fig = plot_confusion_matrix(self.cm, self.labels, title="Errors")
+        self.assertIn("Errors", fig.layout.title.text)
+
+
+# ---------------------------------------------------------------------------
 # NlpExplainer (no real model)
 # ---------------------------------------------------------------------------
 
@@ -485,6 +534,66 @@ class TestNlpWebApp(unittest.TestCase):
         with self.assertRaises(ValueError):
             NlpWebApp(xpl, scatter_xy=np.zeros((5, 2)))  # 5 rows but only 3 samples
 
+    # ── Error Analysis tab (confusion matrix) ─────────────────────────
+
+    def _make_webapp_with_gt(self) -> NlpWebApp:
+        # y_pred is ["joy", "sadness", "joy"]; make sample 0 a sadness→joy error, others correct.
+        xpl = _make_explainer(compiled=True)
+        xpl.y_true = pd.Series(["sadness", "sadness", "joy"], index=pd.RangeIndex(3), name="ground_truth")
+        return NlpWebApp(xpl)
+
+    def test_error_analysis_absent_without_ground_truth(self):
+        ids = self._collect_ids(self.webapp.app.layout)
+        self.assertNotIn("confusion-matrix-graph", ids)
+        self.assertNotIn("error-pred-importance", ids)
+
+    def test_error_cell_store_always_present(self):
+        # The store is created unconditionally so cross-panel callbacks can read it even without gt.
+        self.assertIn("error-cell", self._collect_ids(self.webapp.app.layout))
+
+    def test_error_analysis_present_with_ground_truth(self):
+        ids = self._collect_ids(self._make_webapp_with_gt().app.layout)
+        for cid in ("confusion-matrix-graph", "error-pred-importance", "error-true-importance", "cm-normalize"):
+            self.assertIn(cid, ids)
+
+    def test_confusion_matrix_counts(self):
+        webapp = self._make_webapp_with_gt()
+        cm = webapp._cm
+        # LABEL_NAMES index: sadness=0, joy=1. Rows=true, cols=pred.
+        self.assertEqual(cm[0, 1], 1)  # true sadness predicted joy (the error)
+        self.assertEqual(cm[0, 0], 1)  # true sadness predicted sadness
+        self.assertEqual(cm[1, 1], 1)  # true joy predicted joy
+        self.assertEqual(cm.sum(), 3)
+
+    def test_confusion_matrix_index_arrays(self):
+        webapp = self._make_webapp_with_gt()
+        self.assertEqual(webapp._cm_true_idx.tolist(), [0, 0, 1])  # sadness, sadness, joy
+        self.assertEqual(webapp._cm_pred_idx.tolist(), [1, 0, 1])  # joy, sadness, joy
+
+    def test_confusion_matrix_figure_customdata_orientation(self):
+        webapp = self._make_webapp_with_gt()
+        graph = self._find_component(webapp.app.layout, "confusion-matrix-graph")
+        cd = np.asarray(graph.figure.data[0].customdata)
+        self.assertEqual(list(cd[0, 1]), [1, 0])  # cell (true=0, pred=1) → [pred_idx, true_idx]
+
+    def test_cell_from_click_uses_label_names_when_no_customdata(self):
+        # Heatmap clicks may omit customdata; the x (pred) / y (true) labels must still resolve.
+        name_to_idx = {name: i for i, name in enumerate(LABEL_NAMES)}
+        click = {"points": [{"x": "joy", "y": "sadness"}]}
+        self.assertEqual(_cell_from_click(click, name_to_idx), (1, 0))
+
+    def test_cell_from_click_prefers_customdata(self):
+        name_to_idx = {name: i for i, name in enumerate(LABEL_NAMES)}
+        click = {"points": [{"x": "joy", "y": "sadness", "customdata": [2, 3]}]}
+        self.assertEqual(_cell_from_click(click, name_to_idx), (2, 3))
+
+    def test_cell_from_click_none_on_empty_or_unknown(self):
+        name_to_idx = {name: i for i, name in enumerate(LABEL_NAMES)}
+        self.assertIsNone(_cell_from_click(None, name_to_idx))
+        self.assertIsNone(_cell_from_click({"points": []}, name_to_idx))
+        self.assertIsNone(_cell_from_click({"points": [{"x": "??", "y": "??"}]}, name_to_idx))
+
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -517,6 +626,35 @@ class TestNlpWebApp(unittest.TestCase):
         for child in children:
             ids |= self._collect_ids(child)
         return ids
+
+
+class TestComposeSelection(unittest.TestCase):
+    """The three sample filters (scatter box, confusion cell, errors-only) must intersect."""
+
+    def test_nothing_active_returns_none(self):
+        self.assertIsNone(_compose_selection(None, None, None))
+
+    def test_scatter_only(self):
+        self.assertEqual(_compose_selection([1, 2, 3], None, None), [1, 2, 3])
+
+    def test_cell_only(self):
+        self.assertEqual(_compose_selection(None, [4, 5], None), [4, 5])
+
+    def test_errors_only(self):
+        self.assertEqual(_compose_selection(None, None, {2, 7}), [2, 7])
+
+    def test_scatter_intersect_cell(self):
+        self.assertEqual(_compose_selection([1, 2, 3], [2, 3, 4], None), [2, 3])
+
+    def test_scatter_intersect_errors(self):
+        # This is the box-then-errors case: errors *within* the selected points.
+        self.assertEqual(_compose_selection([1, 2, 3, 4], None, {2, 4, 9}), [2, 4])
+
+    def test_all_three_intersect(self):
+        self.assertEqual(_compose_selection([1, 2, 3, 4], [2, 3, 4], {3, 4}), [3, 4])
+
+    def test_empty_intersection_is_empty_list(self):
+        self.assertEqual(_compose_selection([1, 2], None, {8, 9}), [])
 
 
 # ---------------------------------------------------------------------------
