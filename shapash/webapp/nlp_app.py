@@ -20,6 +20,7 @@ import plotly.graph_objs as go
 from dash import Input, Output, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
 
+from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
 from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
 from shapash.plots.plot_waterfall import plot_waterfall
 from shapash.plots.plot_word_importance import plot_word_importance
@@ -52,6 +53,57 @@ _PALETTE = [
     "#bcbd22",
     "#17becf",
 ]
+
+
+def _compose_selection(
+    selected_indices: list[int] | None,
+    cell_indices: list[int] | None,
+    error_positions: set[int] | None,
+) -> list[int] | None:
+    """Intersect the app's active sample filters into one index list.
+
+    Each argument is an independent filter that may be inactive (``None``): the scatter box/lasso
+    selection, the confusion-matrix cell, and — when the errors-only switch is on — the set of
+    misclassified positions. Active filters intersect; returns ``None`` when none are active.
+    """
+    combined = selected_indices
+    if cell_indices is not None:
+        cell_set = set(cell_indices)
+        combined = list(cell_indices) if combined is None else [i for i in combined if i in cell_set]
+    if error_positions is not None:
+        combined = sorted(error_positions) if combined is None else [i for i in combined if i in error_positions]
+    return combined
+
+
+def _cell_from_click(click_data: dict | None, name_to_idx: dict[str, int]) -> tuple[int, int] | None:
+    """Resolve a confusion-matrix cell click to ``(pred_idx, true_idx)``.
+
+    Heatmap ``clickData`` does not reliably include ``customdata`` the way scatter traces do, so
+    prefer it when present but fall back to mapping the predicted (``x``) and true (``y``) axis label
+    names back to their class indices. Returns ``None`` for an empty or unrecognised click.
+    """
+    if not click_data or not click_data.get("points"):
+        return None
+    point = click_data["points"][0]
+    custom = point.get("customdata")
+    if custom is not None and len(custom) == 2:
+        return int(custom[0]), int(custom[1])
+    if point.get("x") in name_to_idx and point.get("y") in name_to_idx:
+        return name_to_idx[point["x"]], name_to_idx[point["y"]]
+    return None
+
+
+def _empty_word_fig(message: str) -> go.Figure:
+    """Placeholder figure with a centred hint, for the per-cell word charts before a cell is picked."""
+    fig = go.Figure()
+    fig.add_annotation(text=message, showarrow=False, font=dict(color="#888888"), xref="paper", yref="paper")
+    fig.update_layout(
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        plot_bgcolor="white",
+        margin=dict(l=20, r=20, t=20, b=20),
+    )
+    return fig
 
 
 class NlpWebApp:
@@ -260,6 +312,107 @@ class NlpWebApp:
                 ],
                 # Flex column so the graph above can stretch to the panel height.
                 style={"display": "flex", "flexDirection": "column", "height": "100%"},
+            )
+
+        # ── Error Analysis panel (confusion matrix + per-cell word importance) ──
+        # Only meaningful with ground truth. The matrix is a global selection driver like the
+        # scatter: clicking a cell writes ``error-cell`` (see callbacks), which composes with any
+        # scatter selection to filter the table and the main Word Importance tab, and drives the two
+        # per-cell word charts below (words toward the predicted vs. the true class).
+        error_analysis_body = None
+        if has_gt:
+            idx_of = {name: i for i, name in enumerate(label_names)}
+            true_arr = np.array([idx_of.get(str(v), -1) for v in self.explainer.y_true.tolist()])
+            pred_arr = np.array([idx_of.get(str(v), -1) for v in self.explainer.y_pred.tolist()])
+            k = len(label_names)
+            cm = np.zeros((k, k), dtype=int)
+            for t, p in zip(true_arr, pred_arr, strict=True):
+                if t >= 0 and p >= 0:
+                    cm[t, p] += 1
+            self._cm = cm
+            self._cm_true_idx = true_arr
+            self._cm_pred_idx = pred_arr
+
+            error_analysis_body = html.Div(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                html.H6(
+                                    "Confusion Matrix — click a cell to inspect that error group",
+                                    className="fw-bold mb-0",
+                                ),
+                                width="auto",
+                                className="align-self-center",
+                            ),
+                            dbc.Col(
+                                dcc.RadioItems(
+                                    id="cm-normalize",
+                                    options=[
+                                        {"label": " Counts", "value": "count"},
+                                        {"label": " Recall", "value": "recall"},
+                                    ],
+                                    value="count",
+                                    inline=True,
+                                    inputStyle={"marginRight": "4px"},
+                                    labelStyle={"marginRight": "12px"},
+                                ),
+                                width="auto",
+                                className="align-self-center",
+                            ),
+                            dbc.Col(
+                                dbc.Button(
+                                    "× clear cell",
+                                    id="error-cell-clear-btn",
+                                    n_clicks=0,
+                                    color="link",
+                                    size="sm",
+                                    className="text-muted p-0",
+                                    style={"fontSize": "0.8em"},
+                                ),
+                                width="auto",
+                                className="align-self-center ms-auto",
+                            ),
+                        ],
+                        className="align-items-center mb-2",
+                        style={"flex": "0 0 auto"},
+                    ),
+                    dcc.Graph(
+                        id="confusion-matrix-graph",
+                        figure=plot_confusion_matrix(cm, label_names, title="", width=None, height=None),
+                        config={"displayModeBar": False, "responsive": True},
+                        style={"height": "360px", "flex": "0 0 auto"},
+                    ),
+                    html.Small(
+                        id="error-cell-caption",
+                        children="Click a cell to see the words behind those errors.",
+                        className="text-muted d-block my-2",
+                        style={"flex": "0 0 auto"},
+                    ),
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                dcc.Graph(
+                                    id="error-pred-importance",
+                                    config={"displayModeBar": False, "responsive": True},
+                                    style={"height": "320px"},
+                                ),
+                                width=6,
+                            ),
+                            dbc.Col(
+                                dcc.Graph(
+                                    id="error-true-importance",
+                                    config={"displayModeBar": False, "responsive": True},
+                                    style={"height": "320px"},
+                                ),
+                                width=6,
+                            ),
+                        ],
+                        className="g-2",
+                        style={"flex": "0 0 auto"},
+                    ),
+                ],
+                style={"height": "100%", "display": "flex", "flexDirection": "column", "overflowY": "auto"},
             )
 
         # ── Global Word Importance panel — controls live inside it ──
@@ -489,7 +642,11 @@ class NlpWebApp:
         if editor_comp is not None:
             left_tabs.append(("editor", "Data Editor", editor_comp.layout(self._view, self._engine)))
 
+        # Error Analysis sits beside Word Importance: it *is* an aggregated word-importance view
+        # (per confusion-matrix cell), so it belongs with the other global "why" panels on the right.
         upper_right_tabs: list = [("importance", "Word Importance", word_importance_panel)]
+        if error_analysis_body is not None:
+            upper_right_tabs.append(("errors", "Error Analysis", error_analysis_body))
         if cf_comp is not None:
             upper_right_tabs.append(("counterfactual", "Counterfactuals", cf_comp.layout(self._view, self._engine)))
 
@@ -516,6 +673,8 @@ class NlpWebApp:
             dcc.Store(id=_CURRENT_STORE, data=None),
             dcc.Store(id="scatter-selected-indices", data=None),
             dcc.Store(id="word-click-filter", data=None),
+            # Selected confusion-matrix cell: {"pred": idx, "true": idx, "indices": [...]} or None.
+            dcc.Store(id="error-cell", data=None),
         ]
         if self._components:
             stores.append(dcc.Store(id=_APPLY_STORE, data=None))
@@ -611,6 +770,21 @@ class NlpWebApp:
         full_records = self._full_table_records
         has_gt = self._has_gt
 
+        def _compose_indices(selected_indices, error_cell, errors_only=False):
+            """Combine the scatter selection, the confusion-cell selection, and the errors toggle.
+
+            All three are optional filters that intersect: the embedding selection *within* the
+            chosen confusion cell, further restricted to misclassified samples when ``errors_only``
+            is set. Returns a list of original sample indices, or ``None`` when nothing is active.
+            """
+            cell_indices = error_cell.get("indices") if error_cell else None
+            error_positions: set[int] | None = None
+            if errors_only and has_gt:
+                mask = self._error_mask()
+                if mask is not None:
+                    error_positions = set(np.where(mask)[0].tolist())
+            return _compose_selection(selected_indices, cell_indices, error_positions)
+
         # ── Global word importance ───────────────────────────────────────
         @self.app.callback(
             Output("global-importance-graph", "figure"),
@@ -620,20 +794,25 @@ class NlpWebApp:
                 Input("sign-filter", "value"),
                 Input("word-filter", "value"),
                 Input("scatter-selected-indices", "data"),
+                Input("error-cell", "data"),
+                Input("errors-only-switch", "value"),
             ],
         )
-        def update_global_importance(label_idx, topk, sign_filter, exclude_words_list, selected_indices):
+        def update_global_importance(
+            label_idx, topk, sign_filter, exclude_words_list, selected_indices, error_cell, errors_only
+        ):
             if label_idx is None:
                 raise PreventUpdate
+            effective_indices = _compose_indices(selected_indices, error_cell, bool(errors_only))
             word_imp = contrib.word_importance(
                 label_idx=int(label_idx),
                 n_top=int(topk or 20),
                 filter_sign=sign_filter or "all",
                 exclude_words=set(exclude_words_list or []) or None,
-                sample_indices=selected_indices,
+                sample_indices=effective_indices,
             )
             label_name = (contrib.label_names or [])[int(label_idx)] if contrib.label_names else str(label_idx)
-            suffix = f" ({len(selected_indices)} samples)" if selected_indices is not None else ""
+            suffix = f" ({len(effective_indices)} samples)" if effective_indices is not None else ""
             fig = plot_word_importance(
                 word_imp,
                 title=f"Word importance — {label_name}{suffix}",
@@ -755,15 +934,17 @@ class NlpWebApp:
                 Input("scatter-selected-indices", "data"),
                 Input("word-click-filter", "data"),
                 Input("errors-only-switch", "value"),
+                Input("error-cell", "data"),
             ],
         )
-        def filter_table(selected_indices, word_filter, errors_only):
+        def filter_table(selected_indices, word_filter, errors_only, error_cell):
             # word_filter may be a list of words (multi-select in the scatter) or None.
             words = word_filter if isinstance(word_filter, list) else ([word_filter] if word_filter else [])
-            if selected_indices is None:
+            effective_indices = _compose_indices(selected_indices, error_cell)
+            if effective_indices is None:
                 recs = full_records
             else:
-                idx_set = set(selected_indices)
+                idx_set = set(effective_indices)
                 recs = [r for r in full_records if r["_orig_idx"] in idx_set] or full_records
             if errors_only and has_gt:
                 misclassified = [r for r in recs if str(r.get("prediction", "")) != str(r.get("ground_truth", ""))]
@@ -776,6 +957,11 @@ class NlpWebApp:
 
             total = len(full_records)
             parts = []
+            if error_cell:
+                names = contrib.label_names or []
+                pred_name = names[error_cell["pred"]] if error_cell["pred"] < len(names) else str(error_cell["pred"])
+                true_name = names[error_cell["true"]] if error_cell["true"] < len(names) else str(error_cell["true"])
+                parts.append(f"predicted {pred_name} · true {true_name}")
             if selected_indices is not None:
                 parts.append(f"{len(selected_indices)} selected in embeddings")
             if words:
@@ -867,8 +1053,11 @@ class NlpWebApp:
                     if not click_data or not click_data.get("points"):
                         return None
                     return [int(click_data["points"][0]["customdata"][0])]
+                # An empty selectedData here is almost always plotly re-emitting on a figure recolor
+                # (color-by / word / errors-only toggle), NOT a user deselect — ignore it so the box
+                # survives. Genuine clears go through the clear button or a point click above.
                 if not selected_data or not selected_data.get("points"):
-                    return None
+                    raise PreventUpdate
                 return [int(pt["customdata"][0]) for pt in selected_data["points"]]
 
             @self.app.callback(
@@ -879,6 +1068,84 @@ class NlpWebApp:
                 visible = {"display": "inline", "fontSize": "0.8em"}
                 hidden = {"display": "none", "fontSize": "0.8em"}
                 return visible if selected_indices else hidden
+
+        # ── Error Analysis callbacks (registered only with ground truth) ──
+        if has_gt:
+            names = contrib.label_names or [str(i) for i in range(self._cm.shape[0])]
+            name_to_idx = {name: i for i, name in enumerate(names)}
+            cm = self._cm
+            pred_idx_arr = self._cm_pred_idx
+            true_idx_arr = self._cm_true_idx
+
+            @self.app.callback(
+                Output("confusion-matrix-graph", "figure"),
+                Input("cm-normalize", "value"),
+            )
+            def update_confusion_matrix(normalize):
+                fig = plot_confusion_matrix(
+                    cm,
+                    names,
+                    normalize="true" if normalize == "recall" else None,
+                    title="",  # the tab header already labels this panel
+                )
+                # Let the container height drive size (this panel is only half-column tall).
+                fig.layout.width = None
+                fig.layout.height = None
+                return fig
+
+            # Cell click / clear → the shared error-cell selection. A single owner (dispatching on the
+            # trigger) keeps this the only writer, so no allow_duplicate coordination is needed.
+            @self.app.callback(
+                Output("error-cell", "data"),
+                Output("confusion-matrix-graph", "clickData"),
+                Input("confusion-matrix-graph", "clickData"),
+                Input("error-cell-clear-btn", "n_clicks"),
+                prevent_initial_call=True,
+            )
+            def set_error_cell(click_data, _clear_clicks):
+                trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
+                if "error-cell-clear-btn" in trigger:
+                    return None, None
+                cell = _cell_from_click(click_data, name_to_idx)
+                if cell is None:
+                    raise PreventUpdate
+                pred_i, true_i = cell
+                indices = np.where((pred_idx_arr == pred_i) & (true_idx_arr == true_i))[0].tolist()
+                # Reset clickData so re-clicking the *same* cell registers as a change and re-fires.
+                return {"pred": pred_i, "true": true_i, "indices": indices}, None
+
+            # Per-cell word importance: words driving the (wrong) predicted class vs. the true class.
+            @self.app.callback(
+                Output("error-pred-importance", "figure"),
+                Output("error-true-importance", "figure"),
+                Output("error-cell-caption", "children"),
+                Input("error-cell", "data"),
+            )
+            def update_error_word_charts(error_cell):
+                if not error_cell:
+                    empty = _empty_word_fig("Click a confusion-matrix cell to see the words behind those errors.")
+                    return empty, empty, "Click a cell to see the words behind those errors."
+                pred_i, true_i, indices = error_cell["pred"], error_cell["true"], error_cell["indices"]
+                pred_name, true_name = names[pred_i], names[true_i]
+                if not indices:
+                    empty = _empty_word_fig("No samples for this (predicted, true) pair.")
+                    return empty, empty, f"predicted {pred_name} · true {true_name}: 0 samples"
+                wi_pred = contrib.word_importance(label_idx=pred_i, n_top=15, sample_indices=indices)
+                wi_true = contrib.word_importance(label_idx=true_i, n_top=15, sample_indices=indices)
+                fig_pred = plot_word_importance(
+                    wi_pred, title=f"Words toward predicted: {pred_name}", width=None, height=None
+                )
+                fig_true = plot_word_importance(
+                    wi_true, title=f"Words toward true: {true_name}", width=None, height=None
+                )
+                fig_pred.layout.height = None
+                fig_true.layout.height = None
+                caption = f"predicted {pred_name} · true {true_name}: {len(indices)} sample(s)"
+                if pred_i == true_i:
+                    caption += " — correct predictions (diagonal)"
+                elif len(indices) < 5:
+                    caption += " — few samples; interpret with caution"
+                return fig_pred, fig_true, caption
 
         # ── Tab visibility: toggle display of always-mounted bodies ──────
         # Bodies stay in the DOM (see _tabbed_card); only their `display` flips so the
