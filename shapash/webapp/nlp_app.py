@@ -345,17 +345,6 @@ class NlpWebApp:
                             width="auto",
                             className="align-self-center",
                         ),
-                        dbc.Col(
-                            dbc.Switch(
-                                id="errors-only-switch",
-                                label="Model Errors",
-                                value=False,
-                                className="small mb-0",
-                                style={} if has_gt else {"display": "none"},
-                            ),
-                            width="auto",
-                            className="align-self-center ms-auto",
-                        ),
                     ],
                     className="align-items-center mb-2",
                     style={"flex": "0 0 auto"},
@@ -462,6 +451,17 @@ class NlpWebApp:
                 size="sm",
                 className="text-muted p-0",
                 style={"display": "none", "fontSize": "0.8em"},
+            )
+        )
+        # Right-aligned (ms-auto) and here — rather than inside the Dataset tab body — so it stays
+        # usable from the Embeddings tab too, where it now also drives point highlighting.
+        selection_children.append(
+            dbc.Switch(
+                id="errors-only-switch",
+                label="Model Errors",
+                value=False,
+                className="small mb-0 ms-auto",
+                style={} if has_gt else {"display": "none"},
             )
         )
         selection_bar = html.Div(
@@ -799,11 +799,15 @@ class NlpWebApp:
                     Input("color-by", "value"),
                     Input("scatter-word-select", "value"),
                     Input("class-selector", "value"),
+                    Input("errors-only-switch", "value"),
                 ],
             )
-            def update_scatter_color(color_by, words, label_idx):
+            def update_scatter_color(color_by, words, label_idx, errors_only):
                 return self._build_scatter_fig(
-                    color_by or "prediction", words=words or [], label_idx=int(label_idx or 0)
+                    color_by or "prediction",
+                    words=words or [],
+                    label_idx=int(label_idx or 0),
+                    errors_only=bool(errors_only),
                 )
 
             @self.app.callback(
@@ -927,18 +931,59 @@ class NlpWebApp:
                     result[i] += vals[j]
         return result
 
-    def _build_scatter_fig(self, color_by: str, words: list[str] | None = None, label_idx: int = 0) -> go.Figure:
+    def _error_mask(self) -> np.ndarray | None:
+        """Boolean array, ``True`` where the prediction disagrees with the ground truth.
+
+        ``None`` when either is unavailable. Matches the string comparison used by the
+        "Model Errors" table filter so both stay consistent.
+        """
+        y_true = getattr(self.explainer, "y_true", None)
+        y_pred = self.explainer.y_pred
+        if y_true is None or y_pred is None:
+            return None
+        return np.asarray(y_true).astype(str) != np.asarray(y_pred).astype(str)
+
+    @staticmethod
+    def _emphasize_errors(
+        idx_arr: np.ndarray,
+        base_opacity: float,
+        base_size: float,
+        error_mask: np.ndarray | None,
+    ) -> tuple[list[float] | float, list[float] | float]:
+        """Per-point opacity/size that pops model errors and shadows everything else.
+
+        Keeps the caller's coloring untouched — only opacity and marker size change —
+        so points stay grouped/colored however the "Color by" dropdown already draws them.
+        Returns scalars (the unmodified base values) when ``error_mask`` is unavailable.
+        """
+        if error_mask is None or len(idx_arr) == 0:
+            return base_opacity, base_size
+        is_error = error_mask[idx_arr]
+        opacity = np.where(is_error, max(base_opacity, 0.9), 0.12).tolist()
+        size = np.where(is_error, base_size + 3, max(base_size - 2, 3)).tolist()
+        return opacity, size
+
+    def _build_scatter_fig(
+        self,
+        color_by: str,
+        words: list[str] | None = None,
+        label_idx: int = 0,
+        errors_only: bool = False,
+    ) -> go.Figure:
         """2-D scatter coloured by prediction, ground-truth label, or word SHAP contribution.
 
         One trace per class for label-based coloring so the legend works correctly
         and Plotly's box/lasso select dims unselected points across all traces.
         Word-contribution mode uses a single diverging-colorscale trace.
-        ``customdata`` always stores the original sample index.
+        ``customdata`` always stores the original sample index. When ``errors_only`` is
+        set, misclassified points are emphasized (larger, opaque) and the rest are
+        shadowed (small, faint) without altering their color.
         """
         n = len(self.explainer.texts)
         contrib = self.explainer.contributions
         texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in self.explainer.texts]
         xy = self._scatter_xy
+        error_mask = self._error_mask() if errors_only else None
 
         if color_by == "word_contribution" and words:
             contributions = sum(self._word_contributions(w, label_idx) for w in words)
@@ -952,13 +997,16 @@ class NlpWebApp:
             # constant across word additions/removals. With a stable `uirevision`, a changing WebGL
             # (Scattergl) trace count leaves ghost/"shadow" points from the previous render — keeping
             # exactly two traces avoids that.
+            absent_opacity, absent_size = self._emphasize_errors(absent_mask, 0.35, 5, error_mask)
+            present_opacity, present_size = self._emphasize_errors(present_mask, 0.9, 9, error_mask)
+
             # Gray context layer — absent points (no selected word contributes to them).
             fig.add_trace(
                 go.Scattergl(
                     x=xy[absent_mask, 0].tolist(),
                     y=xy[absent_mask, 1].tolist(),
                     mode="markers",
-                    marker=dict(color="#b0b0b0", size=5, opacity=0.35),
+                    marker=dict(color="#b0b0b0", size=absent_size, opacity=absent_opacity),
                     customdata=absent_mask.reshape(-1, 1).tolist(),
                     text=[texts_short[j] for j in absent_mask],
                     hovertemplate="%{text}<extra>absent</extra>",
@@ -976,8 +1024,8 @@ class NlpWebApp:
                         colorscale="RdBu",
                         cmin=-max_abs,
                         cmax=max_abs,
-                        size=9,
-                        opacity=0.9,
+                        size=present_size,
+                        opacity=present_opacity,
                         colorbar=dict(
                             title=dict(text=colorbar_title, side="right"),
                             thickness=12,
@@ -1018,12 +1066,13 @@ class NlpWebApp:
             if not mask:
                 continue
             mask_arr = np.array(mask)
+            opacity, size = self._emphasize_errors(mask_arr, 0.75, 7, error_mask)
             fig.add_trace(
                 go.Scattergl(
                     x=xy[mask_arr, 0].tolist(),
                     y=xy[mask_arr, 1].tolist(),
                     mode="markers",
-                    marker=dict(color=_PALETTE[i % len(_PALETTE)], size=7, opacity=0.75),
+                    marker=dict(color=_PALETTE[i % len(_PALETTE)], size=size, opacity=opacity),
                     customdata=mask_arr.reshape(-1, 1).tolist(),
                     text=[texts_short[j] for j in mask],
                     hovertemplate=f"<b>{name}</b><br>%{{text}}<extra></extra>",
