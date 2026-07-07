@@ -17,6 +17,8 @@ depend on capabilities, not concrete classes.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from shapash._optional import import_optional_module
@@ -111,10 +113,22 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
     label_names : list[str] or None
         Class names in class-index (id) order. When ``None``, read from ``classifier.config.id2label``.
     batch_size : int, optional
-        Batch size for ``predict`` and ``embed``. Default 32.
+        Batch size for ``predict``, ``embed`` and the SHAP pipeline. Default 32.
+    device : int or str or torch.device or None, optional
+        Device for the SHAP pipeline (e.g. ``0``, ``"cuda"``, ``"cpu"``). When ``None`` (default),
+        the pipeline inherits the device the classifier already lives on, so CPU-only environments
+        work with no configuration. An explicit CUDA request is silently downgraded to CPU (with a
+        warning) when no GPU is available.
     """
 
-    def __init__(self, classifier, tokenizer, label_names: list[str] | None = None, batch_size: int = 32) -> None:
+    def __init__(
+        self,
+        classifier,
+        tokenizer,
+        label_names: list[str] | None = None,
+        batch_size: int = 32,
+        device: int | str | object | None = None,
+    ) -> None:
         if label_names is None:
             id2label = getattr(getattr(classifier, "config", None), "id2label", None)
             if id2label:
@@ -123,6 +137,7 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
         self.classifier = classifier
         self.tokenizer = tokenizer
         self.batch_size = batch_size
+        self.device = device
         self._pipeline = None  # lazily built for SHAP
 
     # ------------------------------------------------------------------
@@ -144,6 +159,24 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
             out.append(probs.cpu().numpy())
         return np.vstack(out)
 
+    def _resolve_pipeline_device(self):
+        """Pick the pipeline device, degrading an unavailable-GPU request to CPU with a warning."""
+        torch = import_optional_module("torch", extra=_NLP_EXTRA)
+        if self.device is None:
+            # Inherit whatever device the classifier already lives on (CPU-safe by construction).
+            return self.classifier.device
+        wants_cuda = (isinstance(self.device, str) and self.device.startswith("cuda")) or (
+            isinstance(self.device, int) and self.device >= 0
+        )
+        if wants_cuda and not torch.cuda.is_available():
+            warnings.warn(
+                f"Requested device {self.device!r} but no CUDA GPU is available; "
+                "falling back to CPU for the SHAP pipeline.",
+                stacklevel=2,
+            )
+            return torch.device("cpu")
+        return self.device
+
     @property
     def shap_callable(self):
         """A ``text-classification`` pipeline built from the classifier, for SHAP's TextMasker."""
@@ -154,6 +187,9 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
                 model=self.classifier,
                 tokenizer=self.tokenizer,
                 top_k=None,
+                device=self._resolve_pipeline_device(),
+                batch_size=self.batch_size,
+                truncation=True,
             )
         return self._pipeline
 
