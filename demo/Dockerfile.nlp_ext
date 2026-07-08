@@ -34,7 +34,7 @@ import datasets; \
 m = 'bhadresh-savani/distilbert-base-uncased-emotion'; \
 AutoTokenizer.from_pretrained(m, use_fast=True); \
 AutoModelForSequenceClassification.from_pretrained(m); \
-datasets.load_dataset('dair-ai/emotion', split='train')"
+datasets.load_dataset('dair-ai/emotion', split='test')"
 
 COPY demo/serve_nlp_ext.py ./serve_nlp_ext.py
 # Pre-computed SHAP + projection cache (built by running serve_nlp_ext.py once — see README).

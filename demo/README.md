@@ -80,6 +80,17 @@ model/dataset downloads are all cached, so only the first run pays for it. Runs 
 Same idea as the snapshot: compute the heavy stuff (SHAP) **once, up front**, then Docker just loads
 it. The model + dataset are downloaded by the Docker build itself, so you don't stage them.
 
+**`demo/serve_nlp_ext.py` is the serving script**, and everything below runs it with its defaults
+(the emotion model/dataset). Model, dataset, split, columns, sample count, and a ground-truth
+label-renaming map are all configurable via `ServeConfig` in that file — see its module docstring
+for `--model-name`/`--dataset-name`/`--dataset-split`/`--text-column`/`--label-column`/`--label-map`/
+`--n` and worked examples (e.g. swapping in an IMDB sentiment model/dataset). `Dockerfile.nlp_ext`
+itself stays hardcoded to the emotion example on purpose (it's meant to run out of the box for
+anyone cloning the repo) — its build-time warm-up (`RUN python -c "..."`) downloads exactly that
+model/dataset/split, so it always matches `ServeConfig`'s defaults. Serving a different model/dataset
+combo in Docker means editing that warm-up line to match, then redoing Step 1 below with the same
+flags before rebuilding.
+
 ### Step 1 — Pre-compute the SHAP cache (one-time, GPU optional)
 
 Needs the `[nlp]` extra (torch, transformers, datasets, pacmap). Run the script once — it computes SHAP
@@ -116,8 +127,8 @@ Just run the same script — it serves on http://127.0.0.1:8051 and reuses the `
 from Step 1 (recomputing only if the input texts change, or if you pass `--recompute`):
 
 ```bash
-python demo/serve_nlp_ext.py            # default 100 samples
-python demo/serve_nlp_ext.py --n 200    # more samples (recomputes + re-caches)
+python demo/serve_nlp_ext.py             # ServeConfig defaults (500 samples, dair-ai/emotion test split)
+python demo/serve_nlp_ext.py --n 1000    # more samples (recomputes + re-caches)
 ```
 
 It uses the GPU if present, otherwise CPU.
