@@ -82,11 +82,11 @@ class ServeConfig:
 
     model_name: str = "bhadresh-savani/distilbert-base-uncased-emotion"
     dataset_name: str = "dair-ai/emotion"
-    dataset_split: str = "train"
+    dataset_split: str = "test"
     text_column: str = "text"
     label_column: str = "label"
     label_map: dict[str, str] = field(default_factory=dict)
-    n: int = 100
+    n: int = 500
     cache_dir: Path = _HERE / "nlp_ext_cache"
     port: int = 8051
     host: str = "0.0.0.0"  # noqa: S104
