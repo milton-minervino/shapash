@@ -34,15 +34,16 @@ a dataset's ``ClassLabel`` names ``"neg"``/``"pos"`` vs. a model's ``config.id2l
 ``"NEGATIVE"``/``"POSITIVE"``) — pass ``--label-map`` to rename ground-truth labels onto the
 model's spelling so predicted vs. ground-truth comparisons in the webapp line up.
 
-Attribution and counterfactual methods are both selectable (Captum-backed alternatives to the
-defaults, see the ``[nlp]`` extra):
+The sentence-highlight attribution method is selectable (a Captum-backed alternative to the default,
+see the ``[nlp]`` extra):
 
 * ``--attribution {shap,lig}`` — sentence-highlight method: ``shap`` (KernelSHAP, default) or ``lig``
   (Captum ``LayerIntegratedGradients``). The two are cached in **separate** subdirectories, so you can
   flip between them freely without ``--recompute``.
-* ``--counterfactual {hotflip,ablation}`` — What-if generator: ``hotflip`` (gradient-based token
-  substitution, default) or ``ablation`` (Captum ``FeatureAblation`` token removal). Runs live in the
-  lab, so it is not cached.
+
+Both counterfactual generators are offered live in the What-if Lab — ``hotflip`` (gradient-based token
+substitution) and ``ablation`` (Captum ``FeatureAblation`` token removal) — and are switched from a
+**method dropdown in the webapp**, so there is no CLI flag for them. They run live and are not cached.
 
 The on-disk cache mirrors these dependencies as a hierarchy under ``--cache-dir``:
 ``<model>/<dataset>__<split>/`` holds the (backend-independent) ``<hash>.proj.npy`` projection, and a
@@ -53,7 +54,7 @@ Usage
 -----
     python demo/serve_nlp_ext.py [--n 100] [--cache-dir demo/nlp_ext_cache] [--port 8051]
     python demo/serve_nlp_ext.py --recompute   # ignore the cache and recompute
-    python demo/serve_nlp_ext.py --attribution lig --counterfactual ablation   # Captum methods
+    python demo/serve_nlp_ext.py --attribution lig   # Captum LayerIntegratedGradients highlights
     python demo/serve_nlp_ext.py --model-name distilbert-base-uncased-finetuned-sst-2-english \\
         --dataset-name sst2 --dataset-split validation --text-column sentence
     python demo/serve_nlp_ext.py --model-name lvwerra/distilbert-imdb --dataset-name stanfordnlp/imdb \\
@@ -77,7 +78,6 @@ import torch
 import transformers
 
 from shapash.backend import NlpCaptumLigBackend
-from shapash.compute.generators import AblationFlipGenerator, HotFlipGenerator
 from shapash.explainer.nlp_explainer import (
     NlpExplainer,
     _hash_texts,  # same keying as the compile cache
@@ -105,7 +105,6 @@ class ServeConfig:
     label_map: dict[str, str] = field(default_factory=dict)
     n: int = 500
     attribution: str = "shap"  # sentence-highlight method: "shap" | "lig" (Captum LayerIntegratedGradients)
-    counterfactual: str = "hotflip"  # what-if generator: "hotflip" | "ablation" (Captum FeatureAblation)
     cache_dir: Path = _HERE / "nlp_ext_cache"
     port: int = 8051
     host: str = "0.0.0.0"  # noqa: S104
@@ -175,15 +174,6 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
             "(Captum LayerIntegratedGradients). Cached separately, so switching needs no --recompute."
         ),
     )
-    parser.add_argument(
-        "--counterfactual",
-        choices=["hotflip", "ablation"],
-        default=defaults.counterfactual,
-        help=(
-            "What-if counterfactual generator: 'hotflip' (gradient-based token substitution, the "
-            "default) or 'ablation' (Captum FeatureAblation token removal). Runs live — not cached."
-        ),
-    )
     parser.add_argument("--cache-dir", type=Path, default=defaults.cache_dir)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--host", default=defaults.host)
@@ -248,13 +238,6 @@ def build_backend(config: ServeConfig, model: HFClassifierModel) -> NlpCaptumLig
     return None
 
 
-def build_cf_generator(config: ServeConfig, model: HFClassifierModel) -> HotFlipGenerator | AblationFlipGenerator:
-    """Return the counterfactual generator selected by ``--counterfactual`` (both fit an HF classifier)."""
-    if config.counterfactual == "ablation":
-        return AblationFlipGenerator(model)
-    return HotFlipGenerator(model)
-
-
 def load_or_project(sentences, model, cache_dir: Path, n_components: int = 2) -> np.ndarray:
     """Return a 2-D PaCMAP projection, reading from / writing to ``cache_dir``.
 
@@ -300,11 +283,12 @@ def main() -> None:
 
     model = load_model(config)
 
+    # No cf_generator is passed: NlpExplainer auto-discovers every built-in compatible with the model
+    # (HotFlip + AblationFlip on an HF classifier) and offers them from the What-if Lab's method dropdown.
     xpl = NlpExplainer(
         model,
         label_names=model.label_names,
         backend=build_backend(config, model),
-        cf_generator=build_cf_generator(config, model),
     )
     # Both steps load from cache if one exists for these exact texts, otherwise they compute and write
     # it. So the first run is slow; later runs only pay the model load.
@@ -323,7 +307,7 @@ def main() -> None:
     logger.info(
         "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s",
         config.attribution,
-        config.counterfactual,
+        ",".join(name for name, _ in xpl.available_cf_generators()) or "none",
         xpl.can_edit(),
         xpl.can_counterfactual(),
     )
