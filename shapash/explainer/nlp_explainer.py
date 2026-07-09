@@ -21,6 +21,7 @@ from plotly import graph_objs as go
 
 from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 from shapash.backend.nlp_shap_backend import NlpShapBackend
+from shapash.compute.generators.ablation_flip import AblationFlipGenerator
 from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
 from shapash.compute.generators.hotflip import HotFlipGenerator
 from shapash.model.base import TextModel
@@ -113,11 +114,15 @@ class NlpExplainer:
             explainer_compute_args=explainer_compute_args or {},
         )
 
-        # Counterfactual generator: explicit > auto-built (HotFlip) when the model is capable > none.
+        # Counterfactual generator: explicit > auto-built > none. HotFlip (gradient-based, richer
+        # substitutions) is preferred; AblationFlip (forward-pass-only removal) is the fallback so a
+        # prediction-only model such as a plain pipeline still gets a What-if Lab.
         if cf_generator is not None:
             self.cf_generator: CounterfactualGenerator | None = cf_generator
         elif self._text_model is not None and HotFlipGenerator.is_compatible(self._text_model):
             self.cf_generator = HotFlipGenerator(self._text_model)
+        elif self._text_model is not None and AblationFlipGenerator.is_compatible(self._text_model):
+            self.cf_generator = AblationFlipGenerator(self._text_model)
         else:
             self.cf_generator = None
 
