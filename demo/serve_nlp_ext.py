@@ -34,10 +34,26 @@ a dataset's ``ClassLabel`` names ``"neg"``/``"pos"`` vs. a model's ``config.id2l
 ``"NEGATIVE"``/``"POSITIVE"``) — pass ``--label-map`` to rename ground-truth labels onto the
 model's spelling so predicted vs. ground-truth comparisons in the webapp line up.
 
+Attribution and counterfactual methods are both selectable (Captum-backed alternatives to the
+defaults, see the ``[nlp]`` extra):
+
+* ``--attribution {shap,lig}`` — sentence-highlight method: ``shap`` (KernelSHAP, default) or ``lig``
+  (Captum ``LayerIntegratedGradients``). The two are cached in **separate** subdirectories, so you can
+  flip between them freely without ``--recompute``.
+* ``--counterfactual {hotflip,ablation}`` — What-if generator: ``hotflip`` (gradient-based token
+  substitution, default) or ``ablation`` (Captum ``FeatureAblation`` token removal). Runs live in the
+  lab, so it is not cached.
+
+The on-disk cache mirrors these dependencies as a hierarchy under ``--cache-dir``:
+``<model>/<dataset>__<split>/`` holds the (backend-independent) ``<hash>.proj.npy`` projection, and a
+per-backend ``<...>/nlp_shap/`` or ``<...>/nlp_captum_lig/`` subdirectory holds that method's
+``<hash>.pkl`` contributions.
+
 Usage
 -----
     python demo/serve_nlp_ext.py [--n 100] [--cache-dir demo/nlp_ext_cache] [--port 8051]
     python demo/serve_nlp_ext.py --recompute   # ignore the cache and recompute
+    python demo/serve_nlp_ext.py --attribution lig --counterfactual ablation   # Captum methods
     python demo/serve_nlp_ext.py --model-name distilbert-base-uncased-finetuned-sst-2-english \\
         --dataset-name sst2 --dataset-split validation --text-column sentence
     python demo/serve_nlp_ext.py --model-name lvwerra/distilbert-imdb --dataset-name stanfordnlp/imdb \\
@@ -60,7 +76,8 @@ import pacmap
 import torch
 import transformers
 
-from shapash.compute.generators import HotFlipGenerator
+from shapash.backend import NlpCaptumLigBackend
+from shapash.compute.generators import AblationFlipGenerator, HotFlipGenerator
 from shapash.explainer.nlp_explainer import (
     NlpExplainer,
     _hash_texts,  # same keying as the compile cache
@@ -87,20 +104,44 @@ class ServeConfig:
     label_column: str = "label"
     label_map: dict[str, str] = field(default_factory=dict)
     n: int = 500
+    attribution: str = "shap"  # sentence-highlight method: "shap" | "lig" (Captum LayerIntegratedGradients)
+    counterfactual: str = "hotflip"  # what-if generator: "hotflip" | "ablation" (Captum FeatureAblation)
     cache_dir: Path = _HERE / "nlp_ext_cache"
     port: int = 8051
     host: str = "0.0.0.0"  # noqa: S104
     recompute: bool = False
 
 
-def _model_cache_dir(config: ServeConfig) -> Path:
-    """Return ``config.cache_dir`` namespaced by model.
+# Short ``--attribution`` choice → the attribution backend's registered ``.name`` (used as the cache
+# subdirectory *and* to pick the backend in ``build_backend``).
+_ATTRIBUTION_BACKENDS = {"shap": "nlp_shap", "lig": "nlp_captum_lig"}
 
-    The compile/projection caches are keyed by a hash of the input texts only (see
-    ``_hash_texts``), so two different models run over the same dataset/``--n`` would
-    otherwise collide on the same cache file. A per-model subdirectory keeps them apart.
+
+def _dataset_slug(config: ServeConfig) -> str:
+    """Filesystem-safe ``<dataset>__<split>`` tag for the cache hierarchy."""
+    return f"{config.dataset_name}__{config.dataset_split}".replace("/", "__")
+
+
+def _dataset_cache_dir(config: ServeConfig) -> Path:
+    """Return ``cache_dir/<model>/<dataset>__<split>`` — the level the projection is cached at.
+
+    The compile/projection caches are keyed by a hash of the input texts only (see ``_hash_texts``),
+    so different models or datasets would otherwise collide on the same cache file; the ``<model>`` and
+    ``<dataset>`` path levels keep them apart. The PaCMAP projection embeds the texts with
+    ``model.embed`` and never touches the attribution backend, so every ``--attribution`` choice shares
+    one projection cache at *this* level (below it, contributions split per backend).
     """
-    return config.cache_dir / config.model_name.replace("/", "__")
+    return config.cache_dir / config.model_name.replace("/", "__") / _dataset_slug(config)
+
+
+def _compile_cache_dir(config: ServeConfig) -> Path:
+    """Return ``<dataset-dir>/<backend>`` — the level contributions are cached at.
+
+    Contributions *do* depend on the attribution backend, so SHAP and LIG get separate subdirectories.
+    Switching ``--attribution`` then reads/writes a different ``<hash>.pkl`` instead of silently
+    reusing the other method's cached highlights — no ``--recompute`` needed to swap methods.
+    """
+    return _dataset_cache_dir(config) / _ATTRIBUTION_BACKENDS[config.attribution]
 
 
 def parse_args(argv: list[str] | None = None) -> ServeConfig:
@@ -125,6 +166,24 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
         ),
     )
     parser.add_argument("--n", type=int, default=defaults.n, help="Number of samples to load.")
+    parser.add_argument(
+        "--attribution",
+        choices=list(_ATTRIBUTION_BACKENDS),
+        default=defaults.attribution,
+        help=(
+            "Sentence-highlight attribution method: 'shap' (KernelSHAP, the default) or 'lig' "
+            "(Captum LayerIntegratedGradients). Cached separately, so switching needs no --recompute."
+        ),
+    )
+    parser.add_argument(
+        "--counterfactual",
+        choices=["hotflip", "ablation"],
+        default=defaults.counterfactual,
+        help=(
+            "What-if counterfactual generator: 'hotflip' (gradient-based token substitution, the "
+            "default) or 'ablation' (Captum FeatureAblation token removal). Runs live — not cached."
+        ),
+    )
     parser.add_argument("--cache-dir", type=Path, default=defaults.cache_dir)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--host", default=defaults.host)
@@ -177,6 +236,25 @@ def load_model(config: ServeConfig) -> HFClassifierModel:
     return HFClassifierModel(classifier, tokenizer)
 
 
+def build_backend(config: ServeConfig, model: HFClassifierModel) -> NlpCaptumLigBackend | None:
+    """Return the attribution backend selected by ``--attribution``.
+
+    Returns ``None`` for ``"shap"`` so ``NlpExplainer`` builds its default ``NlpShapBackend`` (which
+    needs the model's ``shap_callable`` wiring); ``"lig"`` returns an explicit ``NlpCaptumLigBackend``.
+    """
+    if config.attribution == "lig":
+        # LIG runs one integration per class per sample — show a progress bar over the batch.
+        return NlpCaptumLigBackend(model, label_names=model.label_names, show_progress=True)
+    return None
+
+
+def build_cf_generator(config: ServeConfig, model: HFClassifierModel) -> HotFlipGenerator | AblationFlipGenerator:
+    """Return the counterfactual generator selected by ``--counterfactual`` (both fit an HF classifier)."""
+    if config.counterfactual == "ablation":
+        return AblationFlipGenerator(model)
+    return HotFlipGenerator(model)
+
+
 def load_or_project(sentences, model, cache_dir: Path, n_components: int = 2) -> np.ndarray:
     """Return a 2-D PaCMAP projection, reading from / writing to ``cache_dir``.
 
@@ -209,29 +287,46 @@ def main() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     sentences, y_true = load_data(config)
-    cache_dir = _model_cache_dir(config)
+    dataset_dir = _dataset_cache_dir(config)  # projection lives here (shared across attribution backends)
+    compile_dir = _compile_cache_dir(config)  # contributions live here (one subdir per attribution backend)
 
     text_hash = _hash_texts(list(sentences))
     if config.recompute:
-        # Drop this text set's cached artifacts so the steps below recompute + overwrite.
-        logger.info("--recompute: dropping cached SHAP + projection for these texts")
-        (cache_dir / f"{text_hash}.pkl").unlink(missing_ok=True)
-        (cache_dir / f"{text_hash}.proj.npy").unlink(missing_ok=True)
+        # Drop this text set's cached artifacts so the steps below recompute + overwrite. Only the
+        # selected backend's contributions are dropped; other backends' caches are left intact.
+        logger.info("--recompute: dropping cached %s contributions + projection for these texts", config.attribution)
+        (compile_dir / f"{text_hash}.pkl").unlink(missing_ok=True)
+        (dataset_dir / f"{text_hash}.proj.npy").unlink(missing_ok=True)
 
     model = load_model(config)
 
-    xpl = NlpExplainer(model, label_names=model.label_names, cf_generator=HotFlipGenerator(model))
-    # Both steps load from cache_dir if a cache for these exact texts exists, otherwise they
-    # compute and write it. So the first run is slow; later runs only pay the model load.
-    compile_cache = cache_dir / f"{text_hash}.pkl"
+    xpl = NlpExplainer(
+        model,
+        label_names=model.label_names,
+        backend=build_backend(config, model),
+        cf_generator=build_cf_generator(config, model),
+    )
+    # Both steps load from cache if one exists for these exact texts, otherwise they compute and write
+    # it. So the first run is slow; later runs only pay the model load.
+    compile_cache = compile_dir / f"{text_hash}.pkl"
     if compile_cache.exists():
-        logger.info("SHAP cache hit — loading %s", compile_cache)
+        logger.info("Contributions cache hit (%s) — loading %s", config.attribution, compile_cache)
     else:
-        logger.info("SHAP cache miss — computing contributions for %d texts (this is the slow part)", len(sentences))
-    xpl.compile(sentences, y_true=y_true, cache_dir=cache_dir)
-    projected = load_or_project(sentences, model, cache_dir)
+        logger.info(
+            "Contributions cache miss (%s) — computing for %d texts (this is the slow part)",
+            config.attribution,
+            len(sentences),
+        )
+    xpl.compile(sentences, y_true=y_true, cache_dir=compile_dir)
+    projected = load_or_project(sentences, model, dataset_dir)
 
-    logger.info("can_edit=%s | can_counterfactual=%s", xpl.can_edit(), xpl.can_counterfactual())
+    logger.info(
+        "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s",
+        config.attribution,
+        config.counterfactual,
+        xpl.can_edit(),
+        xpl.can_counterfactual(),
+    )
     logger.info("Serving on http://%s:%d (Ctrl+C to stop)", config.host, config.port)
     xpl.run_app(port=config.port, debug=False, host=config.host, scatter_xy=projected)
 
