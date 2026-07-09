@@ -1,0 +1,148 @@
+"""Unit tests for the AblationFlip counterfactual generator.
+
+The Captum scoring step (:meth:`AblationFlipGenerator._ablation_scores`) is stubbed with an exact,
+captum-free re-implementation (measure the drop in the original class when a token is removed) so the
+greedy-flip / minimality logic is exercised without torch or captum. A deterministic bag-of-words fake
+model provides predictions. The real Captum path is covered by the integration tests.
+"""
+
+import unittest
+
+import numpy as np
+
+from shapash.compute.generators import AblationFlipGenerator, Counterfactual
+from shapash.compute.generators.cf_utils import is_prediction_flip, is_word_token
+from shapash.model.base import SupportsTokenization, TextModel
+
+# Per-token [neg_logit, pos_logit] contributions; logits = sum over content tokens.
+_EMB = {
+    "this": [0.1, 0.1],
+    "is": [0.1, 0.1],
+    "great": [0.0, 2.0],
+    "good": [0.0, 1.0],
+    "super": [0.0, 2.0],
+    "meh": [3.0, 0.0],
+    "terrible": [3.0, 0.0],
+}
+
+
+class BagOfWordsModel(TextModel, SupportsTokenization):
+    """Prediction-only (plus tokenization) linear bag-of-words classifier."""
+
+    def __init__(self):
+        super().__init__(label_names=["neg", "pos"])
+
+    def _logits(self, text):
+        toks = [t for t in text.split() if t in _EMB]
+        return np.sum([_EMB[t] for t in toks], axis=0) if toks else np.zeros(2)
+
+    def predict(self, texts):
+        out = []
+        for t in texts:
+            z = self._logits(t)
+            e = np.exp(z - z.max())
+            out.append(e / e.sum())
+        return np.vstack(out)
+
+    def tokenize(self, text):
+        return text.split()
+
+    def detokenize(self, tokens):
+        return " ".join(tokens)
+
+
+def _exact_ablation_scores(self, tokens, content_positions, orig_class):
+    """Captum-free stand-in for ``_ablation_scores``: exact drop in ``orig_class`` per removed token."""
+    base = self.model.predict([self.model.detokenize(list(tokens))])[0][orig_class]
+    scores = []
+    for p in content_positions:
+        remaining = [t for i, t in enumerate(tokens) if i != p]
+        scores.append(base - self.model.predict([self.model.detokenize(remaining)])[0][orig_class])
+    return np.array(scores)
+
+
+def _make_generator():
+    gen = AblationFlipGenerator(BagOfWordsModel())
+    gen._ablation_scores = _exact_ablation_scores.__get__(gen, AblationFlipGenerator)
+    return gen
+
+
+class TestIsWordToken(unittest.TestCase):
+    def test_accepts_words_rejects_subwords_and_specials(self):
+        self.assertTrue(is_word_token("happy"))
+        self.assertFalse(is_word_token("##ing"))
+        self.assertFalse(is_word_token("[CLS]"))
+        self.assertFalse(is_word_token("1b"))
+        self.assertFalse(is_word_token("!"))
+
+
+class TestAblationFlipCompat(unittest.TestCase):
+    def test_compatible_with_tokenizable_predict_only_model(self):
+        self.assertTrue(AblationFlipGenerator.is_compatible(BagOfWordsModel()))
+
+    def test_incompatible_without_tokenization(self):
+        class PredictOnly(TextModel):
+            def predict(self, texts):
+                return np.tile([0.5, 0.5], (len(texts), 1))
+
+        self.assertFalse(AblationFlipGenerator.is_compatible(PredictOnly()))
+
+
+class TestAblationFlipGenerate(unittest.TestCase):
+    def setUp(self):
+        self.gen = _make_generator()
+
+    def test_config_spec_defaults(self):
+        spec = self.gen.config_spec()
+        self.assertEqual(spec["num_examples"].default, 5)
+        self.assertEqual(spec["max_ablations"].default, 3)
+        self.assertEqual(self.gen.resolve_config({"max_ablations": 2})["max_ablations"], 2)
+
+    def test_generates_flip_by_removing_supportive_token(self):
+        cfs = self.gen.generate("this is great", config={"num_examples": 3, "max_ablations": 1})
+        self.assertTrue(cfs, "expected at least one counterfactual")
+        cf = cfs[0]
+        self.assertIsInstance(cf, Counterfactual)
+        self.assertEqual(cf.orig_label, "pos")
+        self.assertEqual(cf.new_label, "neg")
+        # The removed token is the strongly-positive one; removals record an empty replacement.
+        self.assertTrue(all(new == "" for _, _, new in cf.substitutions))
+        self.assertIn("great", [old for _, old, _ in cf.substitutions])
+        self.assertNotIn("great", cf.new_text.split())
+        # The reported flip actually holds under the model.
+        self.assertTrue(
+            is_prediction_flip(self.gen.model.predict([cf.original_text])[0], self.gen.model.predict([cf.new_text])[0])
+        )
+
+    def test_minimality(self):
+        cfs = self.gen.generate("this is great good", config={"num_examples": 10, "max_ablations": 3})
+        sets = [frozenset(cf.flipped_positions) for cf in cfs]
+        for i, a in enumerate(sets):
+            for j, b in enumerate(sets):
+                if i != j:
+                    self.assertFalse(a < b, "returned a non-minimal (superset) counterfactual")
+
+    def test_respects_num_examples_cap(self):
+        # "meh great super": removing either strong-positive token alone flips, so two size-1
+        # counterfactuals exist; the cap stops generation after the first.
+        capped = self.gen.generate("meh great super", config={"num_examples": 1, "max_ablations": 1})
+        self.assertEqual(len(capped), 1)
+        uncapped = self.gen.generate("meh great super", config={"num_examples": 5, "max_ablations": 1})
+        self.assertEqual(len(uncapped), 2)
+
+    def test_targeted_flip(self):
+        cfs = self.gen.generate("this is great", target_label="neg", config={"max_ablations": 2})
+        self.assertTrue(cfs)
+        self.assertTrue(all(cf.new_label == "neg" for cf in cfs))
+
+    def test_tokens_to_ignore_blocks_flip(self):
+        cfs = self.gen.generate("this is great", config={"tokens_to_ignore": ["great", "good"], "max_ablations": 2})
+        self.assertEqual(cfs, [])
+
+    def test_no_content_tokens_returns_empty(self):
+        cfs = self.gen.generate("! ? .", config={"max_ablations": 2})
+        self.assertEqual(cfs, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
