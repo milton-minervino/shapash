@@ -195,6 +195,9 @@ class NlpWebApp:
     def _build_layout(self) -> None:
         contrib = self.explainer.contributions
         label_names = contrib.label_names or [str(i) for i in range(self._n_classes())]
+        # Predicted-label name → class index, shared by the confusion matrix and by the sync
+        # callback that resets the Sentence Highlight class picker to the predicted class.
+        self._label_to_idx = {name: i for i, name in enumerate(label_names)}
         n = len(self.explainer.texts)
 
         # ── Table records — always include _orig_idx for scatter filtering ──
@@ -321,7 +324,7 @@ class NlpWebApp:
         # per-cell word charts below (words toward the predicted vs. the true class).
         error_analysis_body = None
         if has_gt:
-            idx_of = {name: i for i, name in enumerate(label_names)}
+            idx_of = self._label_to_idx
             true_arr = np.array([idx_of.get(str(v), -1) for v in self.explainer.y_true.tolist()])
             pred_arr = np.array([idx_of.get(str(v), -1) for v in self.explainer.y_pred.tolist()])
             k = len(label_names)
@@ -416,13 +419,26 @@ class NlpWebApp:
             )
 
         # ── Global Word Importance panel — controls live inside it ──
-        # (Top-K / Sign / Exclude only affect this panel, so they are co-located here.)
+        # (Top-K / Sign / Exclude / Class only affect this panel, so they are co-located here —
+        # independent from the local class picker in the Sentence Highlight panel below.)
         # The tab label already names the panel, so no H6; a tight controls row + a graph that
         # flex-grows to fill the panel means the whole chart is visible without scrolling.
         word_importance_panel = html.Div(
             [
                 dbc.Row(
                     [
+                        dbc.Col(
+                            [
+                                html.Label("Class", className="fw-bold small mb-0"),
+                                dcc.Dropdown(
+                                    id="global-class-selector",
+                                    options=[{"label": name, "value": i} for i, name in enumerate(label_names)],
+                                    value=0,
+                                    clearable=False,
+                                ),
+                            ],
+                            width=3,
+                        ),
                         dbc.Col(
                             [
                                 html.Label("Top-K words", className="fw-bold small mb-0"),
@@ -527,12 +543,28 @@ class NlpWebApp:
         )
 
         # ── Sentence highlight body (lower-right default tab) ─────────
+        # Local class picker lives here (and drives the sibling Waterfall tab too, since both
+        # render the same selected sentence): it defaults to the predicted class of the initially
+        # selected row and is reset to the newly-selected text's prediction by a sync callback —
+        # see sync_local_class_to_prediction — so switching sentences always starts on "why did the
+        # model predict this", while still letting the user override it for the current sentence.
+        default_local_class = self._label_to_idx.get(self._full_table_records[0].get("prediction"), 0)
         highlight_body = html.Div(
             [
-                html.H6(
-                    id="sentence-highlight-title",
-                    children="Token Contributions",
-                    className="fw-bold",
+                # One inline phrase instead of a title + a same-info dropdown: the class name would
+                # otherwise appear twice (once written out, once as the dropdown's selected value).
+                html.Div(
+                    [
+                        html.Span("Token Contributions for", className="fw-bold small me-2"),
+                        dcc.Dropdown(
+                            id="local-class-selector",
+                            options=[{"label": name, "value": i} for i, name in enumerate(label_names)],
+                            value=default_local_class,
+                            clearable=False,
+                            style={"width": "180px"},
+                        ),
+                    ],
+                    className="d-flex align-items-center mb-2",
                 ),
                 # Min-height + vertical centring so short samples still give the
                 # panel presence instead of collapsing to a thin strip.
@@ -681,22 +713,12 @@ class NlpWebApp:
 
         self.app.layout = dbc.Container(
             [
-                # ── Header (Class selector is the only truly global control) ──
+                # ── Header — the Class selector now lives with the panel it drives: Word
+                # Importance (global) and Sentence Highlight (local, see highlight_body) each
+                # get their own, so switching one no longer silently reinterprets the other. ──
                 dbc.Row(
                     [
-                        dbc.Col(html.H4("Shapash — NLP Explainer", className="mb-0"), width=8),
-                        dbc.Col(
-                            [
-                                html.Label("Class", className="fw-bold small"),
-                                dcc.Dropdown(
-                                    id="class-selector",
-                                    options=[{"label": name, "value": i} for i, name in enumerate(label_names)],
-                                    value=0,
-                                    clearable=False,
-                                ),
-                            ],
-                            width=4,
-                        ),
+                        dbc.Col(html.H4("Shapash — NLP Explainer", className="mb-0"), width=12),
                     ],
                     className="py-2 align-items-center",
                     style={"flex": "0 0 auto"},
@@ -789,7 +811,7 @@ class NlpWebApp:
         @self.app.callback(
             Output("global-importance-graph", "figure"),
             [
-                Input("class-selector", "value"),
+                Input("global-class-selector", "value"),
                 Input("topk-slider", "value"),
                 Input("sign-filter", "value"),
                 Input("word-filter", "value"),
@@ -811,11 +833,11 @@ class NlpWebApp:
                 exclude_words=set(exclude_words_list or []) or None,
                 sample_indices=effective_indices,
             )
-            label_name = (contrib.label_names or [])[int(label_idx)] if contrib.label_names else str(label_idx)
+            # No class name here — the Class dropdown right above the chart already shows it.
             suffix = f" ({len(effective_indices)} samples)" if effective_indices is not None else ""
             fig = plot_word_importance(
                 word_imp,
-                title=f"Word importance — {label_name}{suffix}",
+                title=f"Word importance{suffix}",
                 width=None,
                 height=None,
             )
@@ -841,17 +863,31 @@ class NlpWebApp:
                 tokens=contrib.token_strings[pos],
                 values=contrib.values[pos],
                 base_values=base,
+                label=selected_rows[0].get("prediction"),
             )
+
+        # ── Local class picker: reset to the newly-selected text's predicted class ───────
+        # Fires only on current-datapoint changes (row click, editor Predict, counterfactual
+        # Apply) — not on manual dropdown edits — so a user's in-place class override survives
+        # until they actually switch sentences.
+        @self.app.callback(
+            Output("local-class-selector", "value"),
+            Input(_CURRENT_STORE, "data"),
+        )
+        def sync_local_class_to_prediction(datapoint):
+            if not datapoint or datapoint.get("label") is None:
+                raise PreventUpdate
+            label_idx = self._label_to_idx.get(str(datapoint["label"]))
+            if label_idx is None:
+                raise PreventUpdate
+            return label_idx
 
         # ── Sentence highlight ───────────────────────────────────────────
         @self.app.callback(
-            [
-                Output("sentence-highlight", "children"),
-                Output("sentence-highlight-title", "children"),
-            ],
+            Output("sentence-highlight", "children"),
             [
                 Input(_CURRENT_STORE, "data"),
-                Input("class-selector", "value"),
+                Input("local-class-selector", "value"),
             ],
         )
         def update_sentence_highlight(datapoint, label_idx):
@@ -859,17 +895,16 @@ class NlpWebApp:
                 raise PreventUpdate
             label_idx = int(label_idx)
             tokens, vals, base_value, _ = unpack_datapoint(datapoint, label_idx)
-            label_name = (contrib.label_names or [])[label_idx] if contrib.label_names else str(label_idx)
-            highlight = plot_sentence_highlight(tokens=tokens, values=vals, base_value=base_value)
-            title = f"Token Contributions — {label_name}"
-            return highlight, title
+            return plot_sentence_highlight(tokens=tokens, values=vals, base_value=base_value)
 
         # ── Waterfall chart ──────────────────────────────────────────────
+        # Shares the local class picker with Sentence Highlight — both render the same selected
+        # sentence, so they should always agree on which class's contributions are shown.
         @self.app.callback(
             Output("waterfall-graph", "figure"),
             [
                 Input(_CURRENT_STORE, "data"),
-                Input("class-selector", "value"),
+                Input("local-class-selector", "value"),
                 Input("waterfall-threshold", "value"),
             ],
         )
@@ -984,7 +1019,7 @@ class NlpWebApp:
                 [
                     Input("color-by", "value"),
                     Input("scatter-word-select", "value"),
-                    Input("class-selector", "value"),
+                    Input("global-class-selector", "value"),
                     Input("errors-only-switch", "value"),
                 ],
             )
