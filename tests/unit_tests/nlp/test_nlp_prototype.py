@@ -560,12 +560,20 @@ class TestNlpWebApp(unittest.TestCase):
         self.assertIsNotNone(self.webapp.app.layout)
 
     def test_class_selector_options(self):
-        # Walk layout to find the Dropdown with id "class-selector"
-        dropdown = self._find_component(self.webapp.app.layout, "class-selector")
-        self.assertIsNotNone(dropdown, "class-selector dropdown not found in layout")
-        self.assertEqual(len(dropdown.options), N_CLASSES)
-        labels = [opt["label"] for opt in dropdown.options]
-        self.assertEqual(labels, LABEL_NAMES)
+        # Class selector is now two independent dropdowns: "local-class-selector" (Sentence
+        # Highlight / Waterfall) and "global-class-selector" (Word Importance / Embeddings).
+        for dropdown_id in ("local-class-selector", "global-class-selector"):
+            dropdown = self._find_component(self.webapp.app.layout, dropdown_id)
+            self.assertIsNotNone(dropdown, f"{dropdown_id} dropdown not found in layout")
+            self.assertEqual(len(dropdown.options), N_CLASSES)
+            labels = [opt["label"] for opt in dropdown.options]
+            self.assertEqual(labels, LABEL_NAMES)
+
+    def test_local_class_selector_defaults_to_predicted_class(self):
+        # Defaults to the predicted class of the initially selected row (row 0).
+        dropdown = self._find_component(self.webapp.app.layout, "local-class-selector")
+        row0_prediction = self.webapp._full_table_records[0]["prediction"]
+        self.assertEqual(dropdown.value, LABEL_NAMES.index(row0_prediction))
 
     def test_dataset_table_populated(self):
         table = self._find_component(self.webapp.app.layout, "dataset-table")
@@ -583,7 +591,8 @@ class TestNlpWebApp(unittest.TestCase):
         ids = self._collect_ids(self.webapp.app.layout)
         self.assertIn("global-importance-graph", ids)
         self.assertIn("dataset-table", ids)
-        self.assertIn("class-selector", ids)
+        self.assertIn("local-class-selector", ids)
+        self.assertIn("global-class-selector", ids)
         # token bar chart removed; sentence-highlight replaced it
         self.assertNotIn("local-contributions-graph", ids)
 
