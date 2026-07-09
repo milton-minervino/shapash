@@ -18,7 +18,9 @@ from dash import html
 from shapash.backend.nlp_backend import NlpBackend, NlpContributions, NlpRawExplanation
 from shapash.backend.nlp_lime_backend import NlpLimeBackend
 from shapash.backend.nlp_shap_backend import NlpShapBackend
+from shapash.compute.generators import AblationFlipGenerator, HotFlipGenerator
 from shapash.explainer.nlp_explainer import NlpExplainer
+from shapash.model.base import SupportsEmbeddings, SupportsGradients, SupportsTokenization, TextModel
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
 from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
 from shapash.plots.plot_token_highlight import plot_token_highlight
@@ -439,6 +441,109 @@ class TestNlpExplainer(unittest.TestCase):
     def test_y_true_is_none_by_default(self):
         xpl = _make_explainer(compiled=True)
         self.assertIsNone(xpl.y_true)
+
+
+# ---------------------------------------------------------------------------
+# NlpExplainer — counterfactual generator discovery / selection (captum-free)
+# ---------------------------------------------------------------------------
+
+
+class _FullCapModel(TextModel, SupportsTokenization, SupportsEmbeddings, SupportsGradients):
+    """A model exposing every capability — both HotFlip and AblationFlip are compatible."""
+
+    def __init__(self):
+        super().__init__(label_names=["neg", "pos"])
+
+    def predict(self, texts):
+        return np.tile([0.4, 0.6], (len(texts), 1))
+
+    def tokenize(self, text):
+        return text.split()
+
+    def detokenize(self, tokens):
+        return " ".join(tokens)
+
+    def get_embedding_table(self):
+        return (["a"], np.zeros((1, 2)))
+
+    def embed(self, texts):
+        return np.zeros((len(texts), 2))
+
+    def token_gradients(self, text, target_class):
+        toks = text.split()
+        return toks, np.zeros((len(toks), 2))
+
+    @property
+    def shap_callable(self):
+        return self.predict
+
+
+class _TokenizeOnlyModel(TextModel, SupportsTokenization):
+    """Tokenizable but gradient-free — only AblationFlip is compatible."""
+
+    def __init__(self):
+        super().__init__(label_names=["neg", "pos"])
+
+    def predict(self, texts):
+        return np.tile([0.4, 0.6], (len(texts), 1))
+
+    def tokenize(self, text):
+        return text.split()
+
+    def detokenize(self, tokens):
+        return " ".join(tokens)
+
+    @property
+    def shap_callable(self):
+        return self.predict
+
+
+class TestNlpExplainerGenerators(unittest.TestCase):
+    """Generator auto-discovery drives the webapp's method selector (no captum needed here)."""
+
+    def test_full_capability_model_offers_both_methods(self):
+        xpl = NlpExplainer(_FullCapModel(), backend=object())
+        self.assertEqual(
+            xpl.available_cf_generators(),
+            [("hotflip", "HotFlip"), ("ablation_flip", "Ablation")],
+        )
+        # The preferred (first-discovered) generator stays the active default.
+        self.assertIsInstance(xpl.cf_generator, HotFlipGenerator)
+        self.assertEqual(set(xpl.cf_generators), {"hotflip", "ablation_flip"})
+
+    def test_tokenize_only_model_offers_ablation_only(self):
+        xpl = NlpExplainer(_TokenizeOnlyModel(), backend=object())
+        self.assertEqual(xpl.available_cf_generators(), [("ablation_flip", "Ablation")])
+        self.assertIsInstance(xpl.cf_generator, AblationFlipGenerator)
+
+    def test_explicit_generator_used_verbatim_no_extras(self):
+        model = _FullCapModel()
+        gen = AblationFlipGenerator(model)
+        xpl = NlpExplainer(model, backend=object(), cf_generator=gen)
+        # An explicit choice is not augmented with the other compatible built-ins.
+        self.assertEqual(xpl.available_cf_generators(), [("ablation_flip", "Ablation")])
+        self.assertIs(xpl.cf_generator, gen)
+
+    def test_cf_config_spec_selected_by_generator(self):
+        xpl = NlpExplainer(_FullCapModel(), backend=object())
+        self.assertIn("max_flips", xpl.cf_config_spec("hotflip"))
+        self.assertIn("max_ablations", xpl.cf_config_spec("ablation_flip"))
+        # No argument → the active generator's spec.
+        self.assertIn("max_flips", xpl.cf_config_spec())
+
+    def test_unknown_generator_raises(self):
+        xpl = NlpExplainer(_FullCapModel(), backend=object())
+        with self.assertRaises(KeyError):
+            xpl.cf_config_spec("does_not_exist")
+        with self.assertRaises(KeyError):
+            xpl.generate_counterfactuals("hi there", generator="does_not_exist")
+
+    def test_no_generators_without_text_model(self):
+        # A plain callable is neither a TextModel nor a pipeline → no generators, empty selector.
+        xpl = NlpExplainer(lambda texts: np.tile([0.5, 0.5], (len(texts), 1)), label_names=["neg", "pos"], backend=object())
+        self.assertEqual(xpl.available_cf_generators(), [])
+        self.assertEqual(xpl.cf_config_spec(), {})
+        self.assertIsNone(xpl.cf_generator)
 
 
 # ---------------------------------------------------------------------------

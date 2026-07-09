@@ -46,10 +46,14 @@ class FakeEngine:
     def can_counterfactual(self):
         return self._can_cf
 
-    def cf_config_spec(self):
+    def available_cf_generators(self):
+        return [("hotflip", "HotFlip"), ("ablation_flip", "Ablation")]
+
+    def cf_config_spec(self, generator=None):
+        max_field = "max_ablations" if generator == "ablation_flip" else "max_flips"
         return {
             "num_examples": IntField(label="Max counterfactuals", default=5, minimum=1, maximum=20),
-            "max_flips": IntField(label="Max token flips", default=3, minimum=1, maximum=5),
+            max_field: IntField(label="Max token edits", default=3, minimum=1, maximum=5),
             "tokens_to_ignore": TokenListField(label="Tokens to ignore", default=[]),
         }
 
@@ -60,7 +64,7 @@ class FakeEngine:
         c = _contributions()
         return c, "pos", {"neg": 0.3, "pos": 0.7}
 
-    def generate_counterfactuals(self, text, config=None):
+    def generate_counterfactuals(self, text, config=None, generator=None):
         return [
             Counterfactual(
                 original_text=text,
@@ -108,10 +112,24 @@ class TestWhatIfMounting(unittest.TestCase):
 
     def test_counterfactual_config_controls_in_initial_layout(self):
         # The generate callback's State references these ids, so they must exist in the initial
-        # layout (rendered from the engine's cf_config_spec), not be injected by a later callback.
+        # layout (rendered per generator from cf_config_spec), not be injected by a later callback.
         _, ids = self._ids(FakeEngine(can_edit=True, can_cf=True))
         for name in ("num_examples", "max_flips", "tokens_to_ignore"):
-            self.assertIn(f"counterfactual-cfg-{name}", ids)
+            self.assertIn(f"counterfactual-cfg-hotflip-{name}", ids)
+        for name in ("num_examples", "max_ablations", "tokens_to_ignore"):
+            self.assertIn(f"counterfactual-cfg-ablation_flip-{name}", ids)
+
+    def test_counterfactual_method_selector_present_with_multiple_generators(self):
+        # A method selector and one visibility-toggled control group per generator are in the layout.
+        _, ids = self._ids(FakeEngine(can_edit=True, can_cf=True))
+        self.assertIn("counterfactual-generator", ids)
+        self.assertIn("counterfactual-cfg-group-hotflip", ids)
+        self.assertIn("counterfactual-cfg-group-ablation_flip", ids)
+
+    def test_selector_toggle_callback_registered_with_multiple_generators(self):
+        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        outputs = " ".join(app.app.callback_map.keys())
+        self.assertIn("counterfactual-cfg-group-hotflip.style", outputs)
 
     def test_edit_only_mounts_editor_not_counterfactual(self):
         app, ids = self._ids(FakeEngine(can_edit=True, can_cf=False))
