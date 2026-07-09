@@ -37,3 +37,14 @@ def is_prediction_flip(orig_probs: np.ndarray, cf_probs: np.ndarray, target_clas
 def prediction_difference(orig_probs: np.ndarray, cf_probs: np.ndarray, class_idx: int) -> float:
     """Return how much ``class_idx``'s probability dropped from original to counterfactual."""
     return float(orig_probs[class_idx] - cf_probs[class_idx])
+
+
+def is_word_token(token: str) -> bool:
+    """True for plausible standalone word tokens.
+
+    Rejects sub-word continuations (``##ing``), special/placeholder tokens (``[CLS]``), punctuation
+    and numerics — substituting or removing any of these yields malformed text once detokenized.
+    ``str.isalpha`` handles all of these in one check (``##ing``/``[CLS]``/``1b`` are not alphabetic).
+    Shared by the token-substitution (HotFlip) and token-removal (ablation) generators.
+    """
+    return token.isalpha()
