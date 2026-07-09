@@ -45,6 +45,7 @@ class AblationFlipGenerator(CounterfactualGenerator):
     """Perturbation-based token-removal counterfactuals (Captum ``FeatureAblation``)."""
 
     name = "ablation_flip"
+    display_name = "Ablation"
 
     def config_spec(self) -> dict[str, Field]:
         """Expose ``num_examples``, ``max_ablations`` and ``tokens_to_ignore`` as tunable knobs."""

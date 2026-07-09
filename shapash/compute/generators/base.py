@@ -87,6 +87,8 @@ class CounterfactualGenerator(ABC):
     """
 
     name: str = "counterfactual"
+    #: Human-readable label for the webapp method selector (falls back to a title-cased ``name``).
+    display_name: str = "Counterfactual"
 
     def __init__(self, model: TextModel) -> None:
         self.model = model

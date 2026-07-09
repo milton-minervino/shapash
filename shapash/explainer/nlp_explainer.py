@@ -29,6 +29,11 @@ from shapash.model.hf import HFPipelineModel
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.webapp.nlp_app import NlpWebApp
 
+# Built-in counterfactual generators, in preference order: HotFlip (gradient-based, richer
+# substitutions) first, AblationFlip (forward-pass-only removal) as the broader fallback. Every entry
+# compatible with the bound model is offered in the webapp's method selector.
+_BUILTIN_CF_GENERATORS: tuple[type[CounterfactualGenerator], ...] = (HotFlipGenerator, AblationFlipGenerator)
+
 
 def _looks_like_pipeline(model: object) -> bool:
     """Heuristic: a HuggingFace ``text-classification`` pipeline is callable and has a tokenizer."""
@@ -114,17 +119,21 @@ class NlpExplainer:
             explainer_compute_args=explainer_compute_args or {},
         )
 
-        # Counterfactual generator: explicit > auto-built > none. HotFlip (gradient-based, richer
-        # substitutions) is preferred; AblationFlip (forward-pass-only removal) is the fallback so a
-        # prediction-only model such as a plain pipeline still gets a What-if Lab.
+        # Counterfactual generators: explicit > auto-discovered > none. An explicit ``cf_generator``
+        # is used verbatim (no surprise additions). Otherwise every built-in compatible with the model
+        # is offered — so the webapp can switch methods live — with HotFlip preferred and AblationFlip
+        # (forward-pass-only) covering prediction-only models such as a plain pipeline. ``cf_generator``
+        # stays the *active/default* generator for callers that don't select one.
         if cf_generator is not None:
-            self.cf_generator: CounterfactualGenerator | None = cf_generator
-        elif self._text_model is not None and HotFlipGenerator.is_compatible(self._text_model):
-            self.cf_generator = HotFlipGenerator(self._text_model)
-        elif self._text_model is not None and AblationFlipGenerator.is_compatible(self._text_model):
-            self.cf_generator = AblationFlipGenerator(self._text_model)
+            generators: list[CounterfactualGenerator] = [cf_generator]
+        elif self._text_model is not None:
+            generators = [
+                cls(self._text_model) for cls in _BUILTIN_CF_GENERATORS if cls.is_compatible(self._text_model)
+            ]
         else:
-            self.cf_generator = None
+            generators = []
+        self.cf_generators: dict[str, CounterfactualGenerator] = {g.name: g for g in generators}
+        self.cf_generator: CounterfactualGenerator | None = generators[0] if generators else None
 
         self.contributions: NlpContributions | None = None
         self.texts: pd.Series | None = None
@@ -279,6 +288,7 @@ class NlpExplainer:
         xpl.backend = None
         xpl._text_model = None
         xpl.cf_generator = None
+        xpl.cf_generators = {}
         xpl.label_names = state.get("label_names")
         xpl.texts = state["texts"]
         xpl.contributions = state["contributions"]
@@ -345,15 +355,46 @@ class NlpExplainer:
         label, probabilities = self.predict(text)
         return contributions, label, probabilities
 
-    def generate_counterfactuals(self, text: str, config: dict | None = None) -> list[Counterfactual]:
-        """Generate counterfactuals for ``text`` via the bound generator."""
-        if getattr(self, "cf_generator", None) is None:
-            raise RuntimeError("No counterfactual generator is configured for this explainer.")
-        return self.cf_generator.generate(text, config=config)
+    def available_cf_generators(self) -> list[tuple[str, str]]:
+        """Return ``(name, display_name)`` for each bound generator, in preference order.
 
-    def cf_config_spec(self) -> dict[str, Field]:
-        """Return the generator's tunable config spec (empty when no generator)."""
-        return self.cf_generator.config_spec() if getattr(self, "cf_generator", None) is not None else {}
+        Drives the webapp's counterfactual-method selector; empty when no generator is configured
+        (e.g. a snapshot-restored explainer).
+        """
+        return [(g.name, g.display_name) for g in getattr(self, "cf_generators", {}).values()]
+
+    def generate_counterfactuals(
+        self, text: str, config: dict | None = None, generator: str | None = None
+    ) -> list[Counterfactual]:
+        """Generate counterfactuals for ``text`` via the selected (or active) generator.
+
+        Parameters
+        ----------
+        text : str
+            Text to perturb.
+        config : dict, optional
+            Overrides for the generator's config spec.
+        generator : str, optional
+            ``name`` of one of :meth:`available_cf_generators`. Defaults to the active generator.
+        """
+        gen = self._select_cf_generator(generator)
+        if gen is None:
+            raise RuntimeError("No counterfactual generator is configured for this explainer.")
+        return gen.generate(text, config=config)
+
+    def cf_config_spec(self, generator: str | None = None) -> dict[str, Field]:
+        """Return the tunable config spec of the selected (or active) generator, empty when none."""
+        gen = self._select_cf_generator(generator)
+        return gen.config_spec() if gen is not None else {}
+
+    def _select_cf_generator(self, generator: str | None) -> CounterfactualGenerator | None:
+        """Resolve a generator by ``name`` (or the active one when ``generator`` is ``None``)."""
+        generators = getattr(self, "cf_generators", {})
+        if generator is not None:
+            if generator not in generators:
+                raise KeyError(f"Unknown counterfactual generator {generator!r}; available: {list(generators)}.")
+            return generators[generator]
+        return getattr(self, "cf_generator", None)
 
     # ------------------------------------------------------------------
     # Private
