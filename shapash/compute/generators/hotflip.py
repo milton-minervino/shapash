@@ -32,7 +32,7 @@ from shapash.compute.generators.base import (
     IntField,
     TokenListField,
 )
-from shapash.compute.generators.cf_utils import is_prediction_flip
+from shapash.compute.generators.cf_utils import is_prediction_flip, is_word_token
 from shapash.model.base import SupportsEmbeddings, SupportsGradients, TextModel, has_capabilities
 
 _MAX_FLIPPABLE_TOKENS = 10
@@ -103,7 +103,7 @@ class HotFlipGenerator(CounterfactualGenerator):
             shortlist: list[str] = []
             for cand in np.argsort(scores):
                 cand_tok = vocab[int(cand)]
-                if cand_tok != tokens[pos] and _is_word_token(cand_tok):
+                if cand_tok != tokens[pos] and is_word_token(cand_tok):
                     shortlist.append(cand_tok)
                     if len(shortlist) >= _CANDIDATES_PER_POSITION:
                         break
@@ -151,13 +151,3 @@ class HotFlipGenerator(CounterfactualGenerator):
                     if len(results) >= num_examples:
                         return results
         return results
-
-
-def _is_word_token(token: str) -> bool:
-    """True for plausible standalone word tokens.
-
-    Rejects sub-word continuations (``##ing``), special/placeholder tokens (``[CLS]``), punctuation
-    and numerics — substituting any of these for a whole word yields malformed text once detokenized.
-    ``str.isalpha`` handles all of these in one check (``##ing``/``[CLS]``/``1b`` are not alphabetic).
-    """
-    return token.isalpha()
