@@ -7,6 +7,8 @@ component can require exactly what it needs and no more:
 * ``SupportsTokenization`` — split text into tokens and rebuild text from tokens.
 * ``SupportsEmbeddings`` — expose the input-embedding table and mean-pooled sentence embeddings.
 * ``SupportsGradients`` — expose per-token gradients of a target-class logit.
+* ``SupportsCaptumIG`` — expose the embedding module + a logits forward pass so a layer-attribution
+  method (Captum ``LayerIntegratedGradients``) can attribute through the embeddings.
 
 A prediction-only model (e.g. a HuggingFace pipeline) implements only ``TextModel``; a raw
 classifier with tokenizer access implements all three. Generators check compatibility with
@@ -17,6 +19,7 @@ concrete class — this is what keeps HotFlip and friends model-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 import numpy as np
 
@@ -103,6 +106,44 @@ class SupportsGradients(ABC):
         grads : np.ndarray, shape (n_tokens, hidden_dim)
             Gradient of the target-class logit w.r.t. each token's input embedding.
         """
+
+
+class SupportsCaptumIG(ABC):
+    """Capability: expose the pieces Captum ``LayerIntegratedGradients`` needs.
+
+    A layer-attribution method attributes a target logit *through* the word-embedding module, so it
+    needs three things a plain :meth:`TextModel.predict` cannot provide: the embedding ``nn.Module``
+    to attribute through, a way to turn text into model input tensors (and their reference/baseline
+    ids), and a raw-logits forward pass to use as the Captum ``forward_func``. Kept separate from
+    :class:`SupportsGradients` — which only yields per-token gradient vectors — so a backend can
+    require exactly this surface. Tensor-typed arguments/returns are annotated ``Any`` to keep this
+    module free of a hard ``torch`` import.
+    """
+
+    @property
+    @abstractmethod
+    def embedding_layer(self) -> Any:
+        """Return the word-embedding ``nn.Module`` to compute layer attributions through."""
+
+    @abstractmethod
+    def encode(self, text: str) -> tuple[Any, Any, list[str]]:
+        """Return ``(input_ids, attention_mask, tokens)`` for one text.
+
+        ``input_ids`` and ``attention_mask`` are batch-size-1 tensors on the model device; ``tokens``
+        are the aligned token strings (special tokens included).
+        """
+
+    @abstractmethod
+    def reference_ids(self, input_ids: Any) -> Any:
+        """Return baseline input ids: non-special tokens replaced by a reference (pad/mask) id.
+
+        Same shape/device as ``input_ids``. Special tokens (e.g. ``[CLS]``/``[SEP]``) are kept so the
+        baseline is a well-formed empty-content sequence.
+        """
+
+    @abstractmethod
+    def logits(self, input_ids: Any, attention_mask: Any) -> Any:
+        """Return raw classification logits, shape ``(batch, n_classes)`` (the Captum forward func)."""
 
 
 def has_capabilities(model: object, *capabilities: type) -> bool:
