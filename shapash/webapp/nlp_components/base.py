@@ -11,6 +11,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from shapash.explainer.interactive import InteractiveEngine
+from shapash.model.base import SupportsGradients, has_capabilities
 from shapash.webapp.nlp_view import NlpView
 
 # Capability tokens components may require.
@@ -41,7 +42,11 @@ def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> f
             caps.add(CAP_PREDICT)
         if engine.can_counterfactual():
             caps.add(CAP_COUNTERFACTUAL)
-            caps.add(CAP_GRADIENTS)  # the auto-built generator (HotFlip) is gradient-based
+            # Advertise gradients only when the *bound* generator actually operates on a
+            # gradient-capable model — a forward-pass-only generator (AblationFlip) must not.
+            generator = getattr(engine, "cf_generator", None)
+            if has_capabilities(getattr(generator, "model", None), SupportsGradients):
+                caps.add(CAP_GRADIENTS)
     return frozenset(caps)
 
 
