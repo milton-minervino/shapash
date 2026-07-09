@@ -23,6 +23,7 @@ import numpy as np
 
 from shapash._optional import import_optional_module
 from shapash.model.base import (
+    SupportsCaptumIG,
     SupportsEmbeddings,
     SupportsGradients,
     SupportsTokenization,
@@ -97,11 +98,12 @@ class HFPipelineModel(TextModel, SupportsTokenization):
         return self.tokenizer.convert_tokens_to_string(tokens)
 
 
-class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, SupportsGradients):
+class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG):
     """Full-capability adapter over a raw ``AutoModelForSequenceClassification`` + tokenizer.
 
     Provides prediction, tokenization, the input-embedding table, mean-pooled sentence embeddings,
-    and per-token gradients — everything gradient-based counterfactual generators require.
+    per-token gradients, and the Captum layer-attribution surface — everything gradient-based
+    counterfactual generators and ``LayerIntegratedGradients`` require.
 
     Parameters
     ----------
@@ -268,3 +270,36 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
         kept_tokens = [tokens[i] for i in keep]
         kept_grads = grads[keep]
         return kept_tokens, kept_grads
+
+    # ------------------------------------------------------------------
+    # Captum layer-attribution surface
+    # ------------------------------------------------------------------
+
+    @property
+    def embedding_layer(self):
+        """Return the word-embedding ``nn.Module`` (what ``LayerIntegratedGradients`` attributes through)."""
+        return self.classifier.get_input_embeddings()
+
+    def encode(self, text: str):
+        """Return ``(input_ids, attention_mask, tokens)`` — batch-size-1 tensors + aligned token strings."""
+        device = self.classifier.device
+        enc = self.tokenizer(text, truncation=True, return_tensors="pt")
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
+        return input_ids, attention_mask, tokens
+
+    def reference_ids(self, input_ids):
+        """Return baseline ids: content tokens replaced by the pad/mask reference, special tokens kept."""
+        torch = import_optional_module("torch", extra=_NLP_EXTRA)
+        ids = input_ids[0].tolist()
+        special_mask = self.tokenizer.get_special_tokens_mask(ids, already_has_special_tokens=True)
+        ref_id = self.tokenizer.pad_token_id
+        if ref_id is None:
+            ref_id = self.tokenizer.mask_token_id or self.tokenizer.unk_token_id or 0
+        ref = [tid if is_special else ref_id for tid, is_special in zip(ids, special_mask, strict=True)]
+        return torch.tensor([ref], device=input_ids.device)
+
+    def logits(self, input_ids, attention_mask):
+        """Return raw classification logits ``(batch, n_classes)`` (the Captum forward func)."""
+        return self.classifier(input_ids=input_ids, attention_mask=attention_mask).logits
