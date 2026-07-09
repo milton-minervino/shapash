@@ -52,10 +52,19 @@ class InteractiveEngine(Protocol):
         """
         ...
 
-    def generate_counterfactuals(self, text: str, config: dict | None = None) -> list[Counterfactual]:
-        """Generate counterfactuals for ``text`` using the bound generator."""
+    def available_cf_generators(self) -> list[tuple[str, str]]:
+        """Return ``(name, display_name)`` for each selectable counterfactual generator.
+
+        Empty when no generator is bound. The webapp renders a method selector from this list.
+        """
         ...
 
-    def cf_config_spec(self) -> dict[str, Field]:
-        """Return the bound generator's config spec (empty when no generator)."""
+    def generate_counterfactuals(
+        self, text: str, config: dict | None = None, generator: str | None = None
+    ) -> list[Counterfactual]:
+        """Generate counterfactuals for ``text`` using the selected (or active) generator."""
+        ...
+
+    def cf_config_spec(self, generator: str | None = None) -> dict[str, Field]:
+        """Return the selected (or active) generator's config spec (empty when no generator)."""
         ...

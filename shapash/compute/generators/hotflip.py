@@ -57,6 +57,7 @@ class HotFlipGenerator(CounterfactualGenerator):
     """Gradient-based token-substitution counterfactuals (LIT HotFlip)."""
 
     name = "hotflip"
+    display_name = "HotFlip"
 
     def config_spec(self) -> dict[str, Field]:
         """Expose ``num_examples``, ``max_flips`` and ``tokens_to_ignore`` as tunable knobs."""

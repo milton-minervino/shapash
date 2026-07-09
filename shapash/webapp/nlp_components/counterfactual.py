@@ -1,8 +1,11 @@
 """Counterfactual component: generate what-if flips and apply them into the editor.
 
-Controls are rendered automatically from the bound generator's ``config_spec()`` (so a new knob or a
-new generator needs no UI change). Generated counterfactuals are shown as a table; an *Apply* button
-publishes the chosen text to a shared store the data editor subscribes to.
+When the explainer binds more than one generator (e.g. HotFlip *and* AblationFlip on a gradient model)
+a **method selector** lets the user switch between them live; with a single generator the selector is
+hidden. Each generator's controls are rendered automatically from its ``config_spec()`` (so a new knob
+or a new generator needs no UI change) into its own visibility-toggled group. Generated counterfactuals
+are shown as a table; an *Apply* button publishes the chosen text to a shared store the data editor
+subscribes to.
 """
 
 from __future__ import annotations
@@ -17,6 +20,12 @@ from shapash.webapp.nlp_components.datapoint import datapoint_from_contributions
 
 _CARD_STYLE = {"border": "1px solid #dee2e6", "borderRadius": "4px", "padding": "12px", "height": "100%"}
 
+# Inline flex styles (not the Bootstrap ``d-flex`` class, whose ``!important`` would defeat the
+# ``display: none`` visibility toggle on the per-generator control groups).
+_INLINE = {"display": "flex", "alignItems": "center", "gap": "0.4rem"}
+_GROUP_STYLE = {"display": "flex", "flexWrap": "wrap", "alignItems": "center", "gap": "0.75rem"}
+_HIDDEN = {"display": "none"}
+
 
 class CounterfactualComponent(WebappComponent):
     """Spec-driven counterfactual generation panel."""
@@ -27,15 +36,19 @@ class CounterfactualComponent(WebappComponent):
     # Requires the editor too (it reads the editor's text and applies flips back into it).
     requires = frozenset({CAP_COUNTERFACTUAL, CAP_PREDICT})
 
-    def _config_fields(self, engine) -> list[tuple[str, Field]]:
-        """Ordered ``(name, field)`` pairs from the engine's config spec."""
-        return list(engine.cf_config_spec().items())
+    def _generators(self, engine) -> list[tuple[str, str]]:
+        """Ordered ``(name, display_name)`` pairs the engine offers (empty when none)."""
+        return engine.available_cf_generators() if engine is not None else []
 
-    def _config_controls(self, engine) -> list:
-        """Render one control per config field (IntField → number, TokenListField → text)."""
-        rows = []
-        for name, fld in self._config_fields(engine):
-            cid = f"{self.id}-cfg-{name}"
+    def _fields(self, engine, generator: str) -> list[tuple[str, Field]]:
+        """Ordered ``(name, field)`` pairs from one generator's config spec."""
+        return list(engine.cf_config_spec(generator).items())
+
+    def _config_controls(self, engine, generator: str) -> list:
+        """Render each config field of ``generator`` as an inline label+control (IntField → number)."""
+        items = []
+        for name, fld in self._fields(engine, generator):
+            cid = f"{self.id}-cfg-{generator}-{name}"
             if isinstance(fld, IntField):
                 control = dcc.Input(
                     id=cid,
@@ -44,7 +57,7 @@ class CounterfactualComponent(WebappComponent):
                     max=fld.maximum,
                     step=1,
                     value=fld.default,
-                    style={"width": "90px"},
+                    style={"width": "80px"},
                 )
             elif isinstance(fld, TokenListField):
                 control = dbc.Input(
@@ -52,36 +65,66 @@ class CounterfactualComponent(WebappComponent):
                     type="text",
                     value=",".join(fld.default),
                     placeholder="comma,separated",
-                    style={"width": "180px"},
+                    style={"width": "150px"},
                 )
             else:  # pragma: no cover - future field types
                 control = dbc.Input(id=cid, type="text", value=str(fld.default))
-            rows.append(
-                dbc.Row(
-                    [
-                        dbc.Col(html.Label(fld.label, className="small fw-bold mb-0"), width="auto"),
-                        dbc.Col(control, width="auto"),
-                    ],
-                    className="align-items-center mb-2 g-2",
+            items.append(
+                html.Div(
+                    [html.Label(fld.label, className="small fw-bold mb-0"), control],
+                    style=_INLINE,
                 )
             )
-        return rows
+        return items
 
     def layout(self, view, engine=None) -> html.Div:
-        """Return the counterfactual card with config controls rendered from the generator spec.
+        """Return the counterfactual card with a method selector and per-generator config controls.
 
-        The controls are built here (not injected by a callback) so their ids exist in the initial
-        layout — otherwise the ``generate`` callback's ``State`` references a not-yet-created object.
+        The selector and *every* generator's controls are built here (not injected by a callback) so
+        their ids exist in the initial layout — otherwise the ``generate`` callback's ``State`` would
+        reference not-yet-created objects. Only the active generator's control group is visible; the
+        selector callback toggles the rest. The selector is hidden when a single generator is bound.
         """
-        controls = self._config_controls(engine) if engine is not None else []
+        generators = self._generators(engine)
+        default_gen = generators[0][0] if generators else None
+
+        # Method selector — kept in the layout even for a single generator (so its id/State exists),
+        # just hidden. Its config controls live in per-generator groups toggled by the selector.
+        selector = html.Div(
+            [
+                html.Label("Method", className="small fw-bold mb-0"),
+                dbc.Select(
+                    id=f"{self.id}-generator",
+                    options=[{"label": label, "value": name} for name, label in generators],
+                    value=default_gen,
+                    size="sm",
+                    style={"width": "170px"},
+                ),
+            ],
+            style=_INLINE if len(generators) > 1 else _HIDDEN,
+        )
+        groups = [
+            html.Div(
+                self._config_controls(engine, name),
+                id=f"{self.id}-cfg-group-{name}",
+                style=_GROUP_STYLE if name == default_gen else _HIDDEN,
+            )
+            for name, _ in generators
+        ]
+        # Selector + the active generator's controls all flow on one line to save vertical space.
+        controls_row = html.Div(
+            [selector, *groups],
+            id=f"{self.id}-controls",
+            className="d-flex flex-wrap align-items-center gap-3 mb-2",
+        )
         return html.Div(
             [
                 html.H6("Counterfactual Suggestions", className="fw-bold mb-2"),
                 html.Small(
-                    "Find minimal token substitutions that flip the prediction of the edited text.",
+                    "Find minimal token edits that flip the prediction of the edited text.",
                     className="text-muted d-block mb-2",
                 ),
-                html.Div(controls, id=f"{self.id}-controls"),
+                controls_row,
                 dbc.Button("Generate", id=f"{self.id}-generate-btn", color="secondary", size="sm", className="mb-2"),
                 dcc.Loading(html.Div(id=f"{self.id}-results")),
                 dcc.Store(id=f"{self.id}-store", data=[]),
@@ -90,14 +133,26 @@ class CounterfactualComponent(WebappComponent):
         )
 
     def register_callbacks(self, app, view, engine, stores) -> None:
-        """Wire control rendering, Generate, and per-row Apply (→ shared editor store)."""
+        """Wire the method selector, Generate, and per-row Apply (→ shared editor store)."""
         apply_store = stores["apply"]
         current_store = stores["current"]
-        fields = self._config_fields(engine)
 
-        # Config controls are rendered in `layout()` (they must be in the initial layout), so no
-        # separate render callback is needed here.
-        config_states = [State(f"{self.id}-cfg-{name}", "value") for name, _ in fields]
+        generators = self._generators(engine)
+        gen_names = [name for name, _ in generators]
+        # Flat, ordered list of every (generator, field name, field) — one State per rendered control.
+        all_fields = [(gen, name, fld) for gen in gen_names for name, fld in self._fields(engine, gen)]
+        config_states = [State(f"{self.id}-cfg-{gen}-{name}", "value") for gen, name, _ in all_fields]
+
+        # Show only the selected generator's control group. Skipped for a single-method explainer
+        # (nothing to toggle); config controls themselves live in `layout()` so their ids always exist.
+        if len(gen_names) > 1:
+
+            @app.callback(
+                [Output(f"{self.id}-cfg-group-{gen}", "style") for gen in gen_names],
+                Input(f"{self.id}-generator", "value"),
+            )
+            def toggle_controls(selected):
+                return [_GROUP_STYLE if gen == selected else _HIDDEN for gen in gen_names]
 
         # Reads the current datapoint (a selected dataset row *or* an edited/predicted text) so
         # counterfactuals can be generated for both, not only hand-typed editor text.
@@ -106,21 +161,25 @@ class CounterfactualComponent(WebappComponent):
             Output(f"{self.id}-store", "data"),
             Input(f"{self.id}-generate-btn", "n_clicks"),
             State(current_store, "data"),
+            State(f"{self.id}-generator", "value"),
             *config_states,
         )
-        def generate(n_clicks, datapoint, *config_values):
+        def generate(n_clicks, datapoint, selected_gen, *config_values):
             text = (datapoint or {}).get("text", "")
             if not n_clicks or not text or not text.strip():
                 raise PreventUpdate
+            gen_name = selected_gen or (gen_names[0] if gen_names else None)
             config = {}
-            for (name, fld), value in zip(fields, config_values, strict=True):
+            for (gen, name, fld), value in zip(all_fields, config_values, strict=True):
+                if gen != gen_name:
+                    continue  # only the active generator's controls feed its config
                 if isinstance(fld, IntField):
                     config[name] = int(value) if value is not None else fld.default
                 elif isinstance(fld, TokenListField):
                     config[name] = [t.strip() for t in (value or "").split(",") if t.strip()]
                 else:  # pragma: no cover
                     config[name] = value
-            cfs = engine.generate_counterfactuals(text, config=config)
+            cfs = engine.generate_counterfactuals(text, config=config, generator=gen_name)
             if not cfs:
                 return html.Div("No counterfactual found within these limits.", className="text-muted"), []
             return _results_table(cfs, self.id), [cf.new_text for cf in cfs]
