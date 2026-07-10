@@ -58,14 +58,15 @@ class HFPipelineModel(TextModel, SupportsTokenization):
         scores are returned.
     label_names : list[str] or None
         Class names in output-column order. When ``None``, inferred from the pipeline's first
-        prediction (the labels it emits).
+        prediction (the labels it emits). When given, validated against those labels on the first
+        prediction — a mismatched set raises ``ValueError`` rather than silently misaligning columns.
     """
 
     def __init__(self, pipeline, label_names: list[str] | None = None) -> None:
         super().__init__(label_names=label_names)
         self.pipeline = pipeline
         self.tokenizer = getattr(pipeline, "tokenizer", None)
-        self._order: list[str] | None = list(label_names) if label_names else None
+        self._order: list[str] | None = None
 
     @property
     def shap_callable(self):
@@ -78,10 +79,16 @@ class HFPipelineModel(TextModel, SupportsTokenization):
         if self._order is None:
             first = raw[0] if raw and isinstance(raw[0], list) else raw
             labels = [d["label"] for d in first]
-            self._order = (
-                list(self.label_names) if (self.label_names and set(self.label_names) <= set(labels)) else labels
-            )
-            if self.label_names is None:
+            if self.label_names is not None:
+                if set(self.label_names) != set(labels):
+                    raise ValueError(
+                        f"label_names {self.label_names!r} do not match the labels the pipeline "
+                        f"emits {labels!r}; pass the exact label set (any order), or leave "
+                        "label_names=None to infer it from the pipeline."
+                    )
+                self._order = list(self.label_names)
+            else:
+                self._order = labels
                 self.label_names = list(self._order)
         return _probs_from_pipeline_output(raw, self._order)
 
