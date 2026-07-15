@@ -1,10 +1,10 @@
 """Minimal Dash webapp for NLP text classification explanations.
 
-Prototype bridge toward Phase 5b (composable WebappComponents). The three
-panels here (global word importance, dataset table, local token contributions)
-map directly onto the three ``WebappComponent`` instances that Phase 5b would
-register for a text modality. All tabular-only SmartApp panels (violin, cluster,
-scatter prediction picking, confusion matrix) are absent rather than disabled.
+Prototype bridge toward Phase 5b (composable WebappComponents). Panels are being extracted into
+``WebappComponent``s one at a time (see ``shapash/webapp/nlp_components/``); global word importance,
+the dataset table, scatter, and error analysis are still built inline here pending their own
+extraction. All tabular-only SmartApp panels (violin, cluster, scatter prediction picking) beyond
+what NLP needs are absent rather than disabled.
 """
 
 from __future__ import annotations
@@ -21,14 +21,13 @@ from dash import Input, Output, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
 
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
-from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
-from shapash.plots.plot_waterfall import plot_waterfall
 from shapash.plots.plot_word_importance import plot_word_importance
 from shapash.webapp.nlp_components import (
     CounterfactualComponent,
     DataEditorComponent,
+    SentenceHighlightComponent,
+    WaterfallComponent,
     pack_datapoint,
-    unpack_datapoint,
 )
 from shapash.webapp.nlp_view import NlpView
 
@@ -153,14 +152,10 @@ class NlpWebApp:
 
         # What-if Lab: read-only view + live engine (the explainer itself when it is live).
         # Components self-disable via their `requires` when the engine lacks a capability
-        # (e.g. an explainer restored from a snapshot holds no model).
+        # (e.g. an explainer restored from a snapshot holds no model). `self._components` itself is
+        # assembled later in `_build_layout` (it needs `_full_table_records`, not ready yet here).
         self._view = NlpView(explainer)
         self._engine = explainer
-        self._components = [
-            comp
-            for comp in (DataEditorComponent(), CounterfactualComponent())
-            if type(comp).is_available(self._view, self._engine)
-        ]
 
         self.app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
         self.app.title = "Shapash — NLP Explainer"
@@ -194,9 +189,9 @@ class NlpWebApp:
     def _build_layout(self) -> None:
         contrib = self._view.contributions
         label_names = contrib.label_names or [str(i) for i in range(self._view.n_classes)]
-        # Predicted-label name → class index, shared by the confusion matrix and by the sync
-        # callback that resets the Sentence Highlight class picker to the predicted class.
-        self._label_to_idx = {name: i for i, name in enumerate(label_names)}
+        # Predicted-label name → class index, shared by the confusion matrix and (via
+        # NlpView.label_to_idx) by SentenceHighlightComponent's predicted-class sync callback.
+        self._label_to_idx = self._view.label_to_idx
         n = self._view.n_samples
 
         # ── Table records — always include _orig_idx for scatter filtering ──
@@ -541,71 +536,6 @@ class NlpWebApp:
             style={"height": "100%", "display": "flex", "flexDirection": "column"},
         )
 
-        # ── Sentence highlight body (lower-right default tab) ─────────
-        # Local class picker lives here (and drives the sibling Waterfall tab too, since both
-        # render the same selected sentence): it defaults to the predicted class of the initially
-        # selected row and is reset to the newly-selected text's prediction by a sync callback —
-        # see sync_local_class_to_prediction — so switching sentences always starts on "why did the
-        # model predict this", while still letting the user override it for the current sentence.
-        default_local_class = self._label_to_idx.get(self._full_table_records[0].get("prediction"), 0)
-        highlight_body = html.Div(
-            [
-                # One inline phrase instead of a title + a same-info dropdown: the class name would
-                # otherwise appear twice (once written out, once as the dropdown's selected value).
-                html.Div(
-                    [
-                        html.Span("Token Contributions for", className="fw-bold small me-2"),
-                        dcc.Dropdown(
-                            id="local-class-selector",
-                            options=[{"label": name, "value": i} for i, name in enumerate(label_names)],
-                            value=default_local_class,
-                            clearable=False,
-                            style={"width": "180px"},
-                        ),
-                    ],
-                    className="d-flex align-items-center mb-2",
-                ),
-                # Min-height + vertical centring so short samples still give the
-                # panel presence instead of collapsing to a thin strip.
-                html.Div(
-                    id="sentence-highlight",
-                    style={
-                        "minHeight": "150px",
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "justifyContent": "center",
-                    },
-                ),
-            ],
-            style={"height": "100%"},
-        )
-
-        # ── Waterfall body (lower-right second tab) ───────────────────
-        waterfall_body = html.Div(
-            [
-                html.Div(
-                    [
-                        html.Label(
-                            "Group tokens below (% of max contribution)",
-                            className="small fw-bold mb-1 d-block",
-                        ),
-                        dcc.Slider(
-                            id="waterfall-threshold",
-                            min=0,
-                            max=50,
-                            step=1,
-                            value=10,
-                            marks={0: "0%", 10: "10%", 25: "25%", 50: "50%"},
-                            tooltip={"placement": "bottom", "always_visible": False},
-                        ),
-                    ],
-                    className="mb-2",
-                ),
-                dcc.Graph(id="waterfall-graph", config={"displayModeBar": False}),
-            ],
-            style={"height": "100%"},
-        )
-
         # ── Selection bar: persistent, always-visible filter state + clears ──
         # Lives above the left tabs so a scatter/word selection stays visible whichever
         # left tab (table or embeddings) is active. Clear buttons are consolidated here
@@ -664,6 +594,24 @@ class NlpWebApp:
         # ── Assemble the three panels as tab groups (all bodies stay mounted) ──
         self._tab_groups = {}
 
+        # Local class picker default: the predicted class of the initially selected row. It is reset
+        # to the newly-selected text's prediction by a sync callback owned by
+        # SentenceHighlightComponent — see sync_local_class_to_prediction — so switching sentences
+        # always starts on "why did the model predict this", while still letting the user override it
+        # for the current sentence.
+        default_local_class = self._label_to_idx.get(self._full_table_records[0].get("prediction"), 0)
+        self._components = [
+            comp
+            for comp in (
+                SentenceHighlightComponent(default_local_class),
+                WaterfallComponent(),
+                DataEditorComponent(),
+                CounterfactualComponent(),
+            )
+            if type(comp).is_available(self._view, self._engine)
+        ]
+        highlight_comp = next(c for c in self._components if isinstance(c, SentenceHighlightComponent))
+        waterfall_comp = next(c for c in self._components if isinstance(c, WaterfallComponent))
         editor_comp = next((c for c in self._components if isinstance(c, DataEditorComponent)), None)
         cf_comp = next((c for c in self._components if isinstance(c, CounterfactualComponent)), None)
 
@@ -682,8 +630,8 @@ class NlpWebApp:
             upper_right_tabs.append(("counterfactual", "Counterfactuals", cf_comp.layout(self._view, self._engine)))
 
         lower_right_tabs: list = [
-            ("highlight", "Sentence", highlight_body),
-            ("waterfall", "Waterfall", waterfall_body),
+            ("highlight", "Sentence", highlight_comp.layout(self._view, self._engine)),
+            ("waterfall", "Waterfall", waterfall_comp.layout(self._view, self._engine)),
         ]
 
         left_column = html.Div(
@@ -707,7 +655,9 @@ class NlpWebApp:
             # Selected confusion-matrix cell: {"pred": idx, "true": idx, "indices": [...]} or None.
             dcc.Store(id="error-cell", data=None),
         ]
-        if self._components:
+        # Only the What-if Lab (editor + counterfactual) reads/writes the apply store; the always-on
+        # core panels (highlight, waterfall) never do, so their presence alone shouldn't create it.
+        if editor_comp is not None or cf_comp is not None:
             stores.append(dcc.Store(id=_APPLY_STORE, data=None))
 
         self.app.layout = dbc.Container(
@@ -865,62 +815,9 @@ class NlpWebApp:
                 label=selected_rows[0].get("prediction"),
             )
 
-        # ── Local class picker: reset to the newly-selected text's predicted class ───────
-        # Fires only on current-datapoint changes (row click, editor Predict, counterfactual
-        # Apply) — not on manual dropdown edits — so a user's in-place class override survives
-        # until they actually switch sentences.
-        @self.app.callback(
-            Output("local-class-selector", "value"),
-            Input(_CURRENT_STORE, "data"),
-        )
-        def sync_local_class_to_prediction(datapoint):
-            if not datapoint or datapoint.get("label") is None:
-                raise PreventUpdate
-            label_idx = self._label_to_idx.get(str(datapoint["label"]))
-            if label_idx is None:
-                raise PreventUpdate
-            return label_idx
-
-        # ── Sentence highlight ───────────────────────────────────────────
-        @self.app.callback(
-            Output("sentence-highlight", "children"),
-            [
-                Input(_CURRENT_STORE, "data"),
-                Input("local-class-selector", "value"),
-            ],
-        )
-        def update_sentence_highlight(datapoint, label_idx):
-            if not datapoint or label_idx is None:
-                raise PreventUpdate
-            label_idx = int(label_idx)
-            tokens, vals, base_value, _ = unpack_datapoint(datapoint, label_idx)
-            return plot_sentence_highlight(tokens=tokens, values=vals, base_value=base_value)
-
-        # ── Waterfall chart ──────────────────────────────────────────────
-        # Shares the local class picker with Sentence Highlight — both render the same selected
-        # sentence, so they should always agree on which class's contributions are shown.
-        @self.app.callback(
-            Output("waterfall-graph", "figure"),
-            [
-                Input(_CURRENT_STORE, "data"),
-                Input("local-class-selector", "value"),
-                Input("waterfall-threshold", "value"),
-            ],
-        )
-        def update_waterfall(datapoint, label_idx, threshold_pct):
-            if not datapoint or label_idx is None:
-                raise PreventUpdate
-            label_idx = int(label_idx)
-            tokens, vals, base_value, _ = unpack_datapoint(datapoint, label_idx)
-            label_name = (contrib.label_names or [])[label_idx] if contrib.label_names else str(label_idx)
-            min_pct = (threshold_pct if threshold_pct is not None else 10) / 100.0
-            return plot_waterfall(
-                tokens=tokens,
-                values=vals,
-                base_value=base_value,
-                min_pct=min_pct,
-                title=f"Token contributions — {label_name}",
-            )
+        # Local class picker sync + sentence highlight + waterfall are registered by
+        # SentenceHighlightComponent / WaterfallComponent (see the component loop at the end of this
+        # method) — they only need the current-datapoint store, already shared via `stores["current"]`.
 
         # ── Word-bar click / clear → table word filter ───────────────────
         # Resetting the graph's clickData to None after each event lets the SAME bar be clicked
@@ -1195,7 +1092,7 @@ class NlpWebApp:
 
         # (The selection-summary readout is written by filter_table, which knows the row count.)
 
-        # ── What-if Lab component callbacks (self-contained, capability-gated) ──
+        # ── Registered components (always-on core panels + capability-gated What-if Lab) ──
         stores = {"apply": _APPLY_STORE, "current": _CURRENT_STORE}
         for comp in self._components:
             comp.register_callbacks(self.app, self._view, self._engine, stores)

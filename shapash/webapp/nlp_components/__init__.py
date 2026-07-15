@@ -21,12 +21,16 @@ from shapash.webapp.nlp_components.datapoint import (
     pack_datapoint,
     unpack_datapoint,
 )
+from shapash.webapp.nlp_components.sentence_highlight import SentenceHighlightComponent
+from shapash.webapp.nlp_components.waterfall import WaterfallComponent
 
 __all__ = [
     "WebappComponent",
     "available_capabilities",
     "DataEditorComponent",
     "CounterfactualComponent",
+    "SentenceHighlightComponent",
+    "WaterfallComponent",
     "pack_datapoint",
     "unpack_datapoint",
     "datapoint_from_contributions",

@@ -60,6 +60,12 @@ class NlpView:
         return self.y_true is not None
 
     @property
+    def label_to_idx(self) -> dict[str, int]:
+        """Class name to output-column index, in ``label_names`` order."""
+        names = self.label_names or [str(i) for i in range(self.n_classes)]
+        return {name: i for i, name in enumerate(names)}
+
+    @property
     def n_classes(self) -> int:
         """Number of classes inferred from the compiled contributions."""
         sample = self.contributions.values[0]
