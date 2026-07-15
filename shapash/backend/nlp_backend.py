@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from shapash.backend.base_backend import BaseBackend
+from shapash.backend.backend import Backend
 
 
 @dataclass
@@ -152,23 +152,20 @@ class NlpContributions:
         return importance.head(n_top)
 
 
-class NlpBackend(BaseBackend):
+class NlpBackend(Backend):
     """Abstract base class for NLP explainability backends.
 
     Owns the ``__init__`` skeleton shared by all text backends and the
     ``get_local_contributions`` implementation.  Concrete subclasses must
-    implement ``run_explainer`` and return the standard dict described in the
-    module docstring.
-
-    Skips ``BaseBackend.__init__`` because ``check_model`` cannot handle text
-    pipelines or raw callables.
+    implement ``run_explainer`` and return an ``NlpRawExplanation``.
 
     Parameters
     ----------
     model : callable
         Text model or pipeline accepted by the concrete backend.
     preprocessing : None
-        Unused; accepted for interface compatibility with ``BaseBackend``.
+        Unused; accepted only for signature compatibility with the concrete
+        subclasses' ``super().__init__`` calls.
     label_names : list[str] or None
         Class names in the same order as the model output columns.
     explainer_args : dict, optional
@@ -176,10 +173,6 @@ class NlpBackend(BaseBackend):
     explainer_compute_args : dict, optional
         Keyword arguments forwarded to the explainer call / ``explain_instance``.
     """
-
-    column_aggregation = "sum"
-    support_groups = False
-    supported_cases = ["classification"]
 
     def __init__(
         self,
@@ -189,12 +182,7 @@ class NlpBackend(BaseBackend):
         explainer_args: dict | None = None,
         explainer_compute_args: dict | None = None,
     ) -> None:
-        # Do NOT call super().__init__() — check_model fails for text pipelines.
         self.model = model
-        self.preprocessing = None
-        self.explain_data = None
-        self.state = None
-        self._case = "classification"
         self._classes = label_names or []
         self.explainer_args = explainer_args or {}
         self.explainer_compute_args = explainer_compute_args or {}
