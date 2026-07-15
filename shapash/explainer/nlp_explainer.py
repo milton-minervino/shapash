@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -49,6 +50,59 @@ def _hash_texts(text_list: list[str]) -> str:
 
 def _cache_file(data_hash: str, cache_dir: Path) -> Path:
     return cache_dir / f"{data_hash}.pkl"
+
+
+@dataclass
+class InferenceResults:
+    """Model + explainer output for a batch — a pure function of the input texts.
+
+    This is exactly the payload the disk cache persists: recomputing it is the
+    expensive step ``compile`` memoizes.  It deliberately excludes anything that
+    is *not* a function of the input-text hash — ground truth, class names, the
+    2-D projection — so a hash-keyed cache file can never carry a stale ``y_true``.
+
+    Attributes
+    ----------
+    contributions : NlpContributions
+        Token-level contributions for every sample in the batch.
+    y_pred : pd.Series
+        Argmax label per sample.
+    y_prob : pd.DataFrame or None
+        Per-class probabilities, one column per class (or a single confidence
+        column), aligned to the sample index.
+    """
+
+    contributions: NlpContributions
+    y_pred: pd.Series
+    y_prob: pd.DataFrame | None = None
+
+
+@dataclass
+class TextResults:
+    """Portable results bundle for offline webapp serving.
+
+    Wraps the computed :class:`InferenceResults` with the dataset context needed
+    to render without a live model — the source texts, optional ground truth, and
+    class names.  This is the object :meth:`NlpExplainer.save_snapshot` serializes;
+    the scatter projection travels in the snapshot envelope alongside it, not here,
+    because it is a webapp view artifact rather than an explanation result.
+
+    Attributes
+    ----------
+    texts : pd.Series
+        The source text samples.
+    computed : InferenceResults
+        Contributions and predictions — the memoizable model/explainer output.
+    y_true : pd.Series or None
+        Ground-truth labels, when supplied to ``compile``.
+    label_names : list[str] or None
+        Human-readable class names in model-output order.
+    """
+
+    texts: pd.Series
+    computed: InferenceResults
+    y_true: pd.Series | None = None
+    label_names: list[str] | None = None
 
 
 class NlpExplainer:
@@ -179,22 +233,24 @@ class NlpExplainer:
 
             if cache_path is not None and cache_path.exists():
                 with cache_path.open("rb") as f:
-                    cached = pickle.load(f)  # noqa: S301
-                self.contributions = cached["contributions"]
-                self.y_pred = cached["y_pred"]
-                self.y_prob = cached.get("y_prob")
+                    computed: InferenceResults = pickle.load(f)  # noqa: S301
             else:
                 explain_data = self.backend.run_explainer(text_list)
-                self.contributions = self.backend.get_local_contributions(text_list, explain_data)
+                contributions = self.backend.get_local_contributions(text_list, explain_data)
                 pred_df = self._predict(text_list)
-                self.y_pred = pred_df["prediction"]
-                self.y_prob = pred_df.drop(columns=["prediction"])
+                computed = InferenceResults(
+                    contributions=contributions,
+                    y_pred=pred_df["prediction"],
+                    y_prob=pred_df.drop(columns=["prediction"]),
+                )
                 if cache_path is not None:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     with cache_path.open("wb") as f:
-                        pickle.dump(
-                            {"contributions": self.contributions, "y_pred": self.y_pred, "y_prob": self.y_prob}, f
-                        )
+                        pickle.dump(computed, f)
+
+            self.contributions = computed.contributions
+            self.y_pred = computed.y_pred
+            self.y_prob = computed.y_prob
 
             self.contributions.label_names = self.label_names
             self.contributions.index = self.texts.index
@@ -258,17 +314,16 @@ class NlpExplainer:
         """
         if self.contributions is None:
             raise RuntimeError("Call compile() before save_snapshot().")
-        state = {
-            "texts": self.texts,
-            "contributions": self.contributions,
-            "y_pred": self.y_pred,
-            "y_prob": self.y_prob,
-            "y_true": self.y_true,
-            "label_names": self.label_names,
-            "scatter_xy": scatter_xy,
-        }
+        results = TextResults(
+            texts=self.texts,
+            computed=InferenceResults(contributions=self.contributions, y_pred=self.y_pred, y_prob=self.y_prob),
+            y_true=self.y_true,
+            label_names=self.label_names,
+        )
+        # Snapshot envelope: the portable results bundle plus the scatter projection,
+        # which is a webapp view artifact and so rides alongside TextResults, not within it.
         with Path(path).open("wb") as f:
-            pickle.dump(state, f)
+            pickle.dump({"results": results, "scatter_xy": scatter_xy}, f)
 
     @classmethod
     def from_snapshot(cls, path: str | Path) -> tuple[NlpExplainer, object]:
@@ -283,18 +338,19 @@ class NlpExplainer:
         """
         with Path(path).open("rb") as f:
             state = pickle.load(f)  # noqa: S301
+        results: TextResults = state["results"]
         xpl = cls.__new__(cls)
         xpl.model = None
         xpl.backend = None
         xpl._text_model = None
         xpl.cf_generator = None
         xpl.cf_generators = {}
-        xpl.label_names = state.get("label_names")
-        xpl.texts = state["texts"]
-        xpl.contributions = state["contributions"]
-        xpl.y_pred = state["y_pred"]
-        xpl.y_prob = state.get("y_prob")
-        xpl.y_true = state.get("y_true")
+        xpl.label_names = results.label_names
+        xpl.texts = results.texts
+        xpl.contributions = results.computed.contributions
+        xpl.y_pred = results.computed.y_pred
+        xpl.y_prob = results.computed.y_prob
+        xpl.y_true = results.y_true
         xpl._data_hash = None
         return xpl, state.get("scatter_xy")
 
