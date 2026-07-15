@@ -1,6 +1,7 @@
 import inspect
 import sys
 
+from .backend import Backend
 from .base_backend import BaseBackend
 from .lime_backend import LimeBackend
 from .nlp_backend import NlpBackend, NlpContributions, NlpRawExplanation
@@ -19,7 +20,7 @@ def get_backend_cls_from_name(name):
         for _, cls in inspect.getmembers(sys.modules[__name__])
         if (
             inspect.isclass(cls)
-            and issubclass(cls, BaseBackend)
+            and issubclass(cls, Backend)
             and cls.name.lower() == name.lower()
             and cls.name.lower() != "base"
         )
