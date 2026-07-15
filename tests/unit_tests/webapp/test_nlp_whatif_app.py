@@ -13,6 +13,7 @@ import pandas as pd
 from shapash.backend.nlp_backend import NlpContributions
 from shapash.compute.generators.base import Counterfactual, IntField, TokenListField
 from shapash.webapp.nlp_app import NlpWebApp
+from shapash.webapp.nlp_view import NlpView
 
 LABEL_NAMES = ["neg", "pos"]
 
@@ -243,6 +244,25 @@ class TestThreePanelLayout(unittest.TestCase):
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("left-tabs-body-table.style", outputs)
         self.assertIn("lower-right-tabs-body-waterfall.style", outputs)
+
+
+class TestReadContractSeam(unittest.TestCase):
+    """The app shell reads compiled data only through ``NlpView``; it keeps no raw explainer handle.
+
+    ``FakeEngine`` exposes the view/engine surface but has no ``explainer`` attribute, so a mounted
+    app proves the read path is served by the contract alone. These asserts lock the seam so a future
+    edit cannot silently reintroduce a ``self.explainer`` bypass (see nlp_app engine/view split).
+    """
+
+    def test_app_holds_no_raw_explainer_handle(self):
+        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        self.assertFalse(hasattr(app, "explainer"))
+
+    def test_app_exposes_view_and_engine_roles(self):
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine)
+        self.assertIsInstance(app._view, NlpView)  # read contract
+        self.assertIs(app._engine, engine)  # live-action contract
 
 
 if __name__ == "__main__":

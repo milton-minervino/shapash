@@ -64,3 +64,8 @@ class NlpView:
         """Number of classes inferred from the compiled contributions."""
         sample = self.contributions.values[0]
         return sample.shape[1] if np.ndim(sample) == 2 else 1
+
+    @property
+    def n_samples(self) -> int:
+        """Number of samples in the compiled batch."""
+        return len(self.texts) if self.texts is not None else 0

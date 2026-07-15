@@ -144,7 +144,6 @@ class NlpWebApp:
     def __init__(self, explainer, scatter_xy: np.ndarray | None = None) -> None:
         if explainer.contributions is None:
             raise RuntimeError("NlpExplainer.compile() must be called before launching the webapp.")
-        self.explainer = explainer
         if scatter_xy is not None:
             scatter_xy = np.asarray(scatter_xy)
             n = len(explainer.texts)
@@ -193,26 +192,26 @@ class NlpWebApp:
     # ------------------------------------------------------------------
 
     def _build_layout(self) -> None:
-        contrib = self.explainer.contributions
-        label_names = contrib.label_names or [str(i) for i in range(self._n_classes())]
+        contrib = self._view.contributions
+        label_names = contrib.label_names or [str(i) for i in range(self._view.n_classes)]
         # Predicted-label name → class index, shared by the confusion matrix and by the sync
         # callback that resets the Sentence Highlight class picker to the predicted class.
         self._label_to_idx = {name: i for i, name in enumerate(label_names)}
-        n = len(self.explainer.texts)
+        n = self._view.n_samples
 
         # ── Table records — always include _orig_idx for scatter filtering ──
         records: dict[str, list] = {
             "_orig_idx": list(range(n)),
-            "text": self.explainer.texts.tolist(),
-            "prediction": (self.explainer.y_pred.tolist() if self.explainer.y_pred is not None else [""] * n),
+            "text": self._view.texts.tolist(),
+            "prediction": (self._view.y_pred.tolist() if self._view.y_pred is not None else [""] * n),
         }
-        if getattr(self.explainer, "y_true", None) is not None:
-            records["ground_truth"] = self.explainer.y_true.tolist()
+        if self._view.y_true is not None:
+            records["ground_truth"] = self._view.y_true.tolist()
 
         # Single "Probability" column — confidence of the predicted class.
         # max(axis=1) works for both binary and multiclass since the predicted
         # label is always the argmax, regardless of how columns are named.
-        y_prob: pd.DataFrame | None = getattr(self.explainer, "y_prob", None)
+        y_prob: pd.DataFrame | None = self._view.y_prob
         if y_prob is not None:
             records["probability"] = y_prob.max(axis=1).tolist()
 
@@ -257,7 +256,7 @@ class NlpWebApp:
         scatter_col_content = None
         if self._scatter_xy is not None:
             color_options = [{"label": "Prediction", "value": "prediction"}]
-            if getattr(self.explainer, "y_true", None) is not None:
+            if self._view.y_true is not None:
                 color_options.append({"label": "Ground Truth", "value": "ground_truth"})
             color_options.append({"label": "Word contribution", "value": "word_contribution"})
 
@@ -325,8 +324,8 @@ class NlpWebApp:
         error_analysis_body = None
         if has_gt:
             idx_of = self._label_to_idx
-            true_arr = np.array([idx_of.get(str(v), -1) for v in self.explainer.y_true.tolist()])
-            pred_arr = np.array([idx_of.get(str(v), -1) for v in self.explainer.y_pred.tolist()])
+            true_arr = np.array([idx_of.get(str(v), -1) for v in self._view.y_true.tolist()])
+            pred_arr = np.array([idx_of.get(str(v), -1) for v in self._view.y_pred.tolist()])
             k = len(label_names)
             cm = np.zeros((k, k), dtype=int)
             for t, p in zip(true_arr, pred_arr, strict=True):
@@ -788,7 +787,7 @@ class NlpWebApp:
     # ------------------------------------------------------------------
 
     def _register_callbacks(self) -> None:
-        contrib = self.explainer.contributions
+        contrib = self._view.contributions
         full_records = self._full_table_records
         has_gt = self._has_gt
 
@@ -1213,14 +1212,10 @@ class NlpWebApp:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _n_classes(self) -> int:
-        sample = self.explainer.contributions.values[0]
-        return sample.shape[1] if sample.ndim == 2 else 1
-
     def _word_contributions(self, word: str, label_idx: int) -> np.ndarray:
         """Per-sample sum of SHAP contributions for all tokens matching *word*."""
-        contrib = self.explainer.contributions
-        n = len(self.explainer.texts)
+        contrib = self._view.contributions
+        n = self._view.n_samples
         result = np.zeros(n)
         word_lower = word.lower()
         for i in range(n):
@@ -1239,8 +1234,8 @@ class NlpWebApp:
         ``None`` when either is unavailable. Matches the string comparison used by the
         "Model Errors" table filter so both stay consistent.
         """
-        y_true = getattr(self.explainer, "y_true", None)
-        y_pred = self.explainer.y_pred
+        y_true = self._view.y_true
+        y_pred = self._view.y_pred
         if y_true is None or y_pred is None:
             return None
         return np.asarray(y_true).astype(str) != np.asarray(y_pred).astype(str)
@@ -1281,9 +1276,9 @@ class NlpWebApp:
         set, misclassified points are emphasized (larger, opaque) and the rest are
         shadowed (small, faint) without altering their color.
         """
-        n = len(self.explainer.texts)
-        contrib = self.explainer.contributions
-        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in self.explainer.texts]
+        n = self._view.n_samples
+        contrib = self._view.contributions
+        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in self._view.texts]
         xy = self._scatter_xy
         error_mask = self._error_mask() if errors_only else None
 
@@ -1353,10 +1348,10 @@ class NlpWebApp:
             )
             return fig
 
-        if color_by == "ground_truth" and getattr(self.explainer, "y_true", None) is not None:
-            labels = [str(label) for label in self.explainer.y_true.tolist()]
-        elif self.explainer.y_pred is not None:
-            labels = [str(label) for label in self.explainer.y_pred.tolist()]
+        if color_by == "ground_truth" and self._view.y_true is not None:
+            labels = [str(label) for label in self._view.y_true.tolist()]
+        elif self._view.y_pred is not None:
+            labels = [str(label) for label in self._view.y_pred.tolist()]
         else:
             labels = [""] * n
 
