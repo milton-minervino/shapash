@@ -13,6 +13,7 @@ import pandas as pd
 from shapash.backend.nlp_backend import NlpContributions
 from shapash.compute.generators.base import Counterfactual, IntField, TokenListField
 from shapash.webapp.nlp_app import NlpWebApp
+from shapash.webapp.nlp_components import CounterfactualComponent, DataEditorComponent
 from shapash.webapp.nlp_view import NlpView
 
 LABEL_NAMES = ["neg", "pos"]
@@ -104,12 +105,18 @@ class TestWhatIfMounting(unittest.TestCase):
         _collect_ids(app.app.layout, found)
         return app, found
 
+    @staticmethod
+    def _whatif_components(app):
+        # app._components also holds the always-on core panels (Sentence Highlight, Waterfall);
+        # scope these assertions to the capability-gated What-if Lab ones only.
+        return [c for c in app._components if isinstance(c, (DataEditorComponent, CounterfactualComponent))]
+
     def test_full_capabilities_mount_both(self):
         app, ids = self._ids(FakeEngine(can_edit=True, can_cf=True))
         self.assertIn("data-editor-input", ids)
         self.assertIn("data-editor-predict-btn", ids)
         self.assertIn("counterfactual-generate-btn", ids)
-        self.assertEqual(len(app._components), 2)
+        self.assertEqual(len(self._whatif_components(app)), 2)
 
     def test_counterfactual_config_controls_in_initial_layout(self):
         # The generate callback's State references these ids, so they must exist in the initial
@@ -136,14 +143,14 @@ class TestWhatIfMounting(unittest.TestCase):
         app, ids = self._ids(FakeEngine(can_edit=True, can_cf=False))
         self.assertIn("data-editor-input", ids)
         self.assertNotIn("counterfactual-generate-btn", ids)
-        self.assertEqual(len(app._components), 1)
+        self.assertEqual(len(self._whatif_components(app)), 1)
 
     def test_no_capabilities_hides_whatif_lab(self):
         app, ids = self._ids(FakeEngine(can_edit=False, can_cf=False))
         self.assertNotIn("data-editor-input", ids)
         self.assertNotIn("counterfactual-generate-btn", ids)
         self.assertNotIn("whatif-apply-store", ids)
-        self.assertEqual(app._components, [])
+        self.assertEqual(self._whatif_components(app), [])
 
     def test_callbacks_registered_when_mounted(self):
         app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
