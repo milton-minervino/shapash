@@ -18,6 +18,7 @@ Currently ships text adapters for HuggingFace models. ``SentenceTransformerModel
 from __future__ import annotations
 
 from shapash.model.base import (
+    SupportsActivations,
     SupportsEmbeddings,
     SupportsGradients,
     SupportsTokenization,
@@ -31,6 +32,7 @@ __all__ = [
     "SupportsTokenization",
     "SupportsEmbeddings",
     "SupportsGradients",
+    "SupportsActivations",
     "has_capabilities",
     "HFPipelineModel",
     "HFClassifierModel",
