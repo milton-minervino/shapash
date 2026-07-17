@@ -23,6 +23,7 @@ import numpy as np
 
 from shapash._optional import import_optional_module
 from shapash.model.base import (
+    SupportsActivations,
     SupportsCaptumIG,
     SupportsEmbeddings,
     SupportsGradients,
@@ -31,6 +32,16 @@ from shapash.model.base import (
 )
 
 _NLP_EXTRA = 'Install the NLP extra: pip install "shapash[nlp]".'
+
+# Pooled-representation module candidates for :attr:`HFClassifierModel.default_activation_layer`, most
+# model-specific first: DistilBERT exposes ``pre_classifier``, BERT/DeBERTa a top-level ``pooler``. The
+# first that exists on the classifier is the default similar-example decision-space; when none do (e.g.
+# RoBERTa/XLM-R, whose head reads the raw ``<s>`` hidden state), we fall back to the sentinel below.
+_POOLED_LAYER_CANDIDATES = ("pre_classifier", "pooler")
+# Sentinel returned by ``default_activation_layer`` when the model has no pooled head module: it means
+# "use the mean-pooled last hidden state" (what ``embed`` computes) — a representation every
+# architecture provides, so similar-example retrieval works with no per-model configuration.
+_LAST_HIDDEN_STATE = "__last_hidden_state__"
 
 
 def _probs_from_pipeline_output(raw: list, order: list[str]) -> np.ndarray:
@@ -105,7 +116,9 @@ class HFPipelineModel(TextModel, SupportsTokenization):
         return self.tokenizer.convert_tokens_to_string(tokens)
 
 
-class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG):
+class HFClassifierModel(
+    TextModel, SupportsTokenization, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG, SupportsActivations
+):
     """Full-capability adapter over a raw ``AutoModelForSequenceClassification`` + tokenizer.
 
     Provides prediction, tokenization, the input-embedding table, mean-pooled sentence embeddings,
@@ -245,6 +258,73 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
         return np.vstack(out)
 
     # ------------------------------------------------------------------
+    # Layer activations (similar-example retrieval)
+    # ------------------------------------------------------------------
+
+    @property
+    def default_activation_layer(self) -> str:
+        """The model's pooled decision-space representation, resolved per-architecture.
+
+        Returns the first of ``pre_classifier`` (DistilBERT) / ``pooler`` (BERT, DeBERTa) that the
+        classifier actually exposes — the pooled ``[CLS]`` vector the head reads, a good default
+        decision-space for similar-example retrieval. When the model has no such module (e.g.
+        RoBERTa/XLM-R), returns the :data:`_LAST_HIDDEN_STATE` sentinel, and :meth:`activations` falls
+        back to the mean-pooled last hidden state (what :meth:`embed` computes) — a representation every
+        architecture provides, so retrieval needs no per-model configuration. Override either by passing
+        an explicit ``layer`` to :meth:`activations`.
+        """
+        modules = dict(self.classifier.named_modules())
+        for name in _POOLED_LAYER_CANDIDATES:
+            if name in modules:
+                return name
+        return _LAST_HIDDEN_STATE
+
+    def activations(self, texts: list[str], layer: str | None = None) -> np.ndarray:
+        """Return one activation vector per text at ``layer``, shape ``(n_texts, hidden_dim)``.
+
+        A forward hook captures the named submodule's output on each batch. A pooled ``(batch, hidden)``
+        output (e.g. ``pre_classifier``) is used as-is; a token-level ``(batch, seq, hidden)`` output
+        (e.g. a transformer layer) is mean-pooled over non-padding tokens via the attention mask. The
+        model runs under ``no_grad`` — this is inference only.
+        """
+        torch = import_optional_module("torch", extra=_NLP_EXTRA)
+        layer_name = layer or self.default_activation_layer
+        if layer_name == _LAST_HIDDEN_STATE:
+            # No pooled head module on this architecture — use the universal mean-pooled last hidden
+            # state (mask-aware), which embed() already computes. Keeps retrieval model-agnostic.
+            return self.embed(list(texts))
+        modules = dict(self.classifier.named_modules())
+        if layer_name not in modules:
+            raise KeyError(
+                f"Layer {layer_name!r} not found on the model. Available top-level modules: "
+                f"{[n for n, _ in self.classifier.named_children()]}."
+            )
+        module = modules[layer_name]
+
+        captured: list = []
+        handle = module.register_forward_hook(lambda _mod, _inp, out: captured.append(out.detach()))
+        device = self.classifier.device
+        texts = list(texts)
+        out = []
+        try:
+            for i in range(0, len(texts), self.batch_size):
+                batch = self.tokenizer(
+                    texts[i : i + self.batch_size], padding=True, truncation=True, return_tensors="pt"
+                )
+                batch = {k: v.to(device) for k, v in batch.items()}
+                captured.clear()
+                with torch.no_grad():
+                    self.classifier(**batch)
+                act = captured[0]
+                if act.dim() == 3:  # token-level layer output -> mask-aware mean pool to one vector
+                    mask = batch["attention_mask"].unsqueeze(-1)
+                    act = (act * mask).sum(1) / mask.sum(1)
+                out.append(act.cpu().numpy())
+        finally:
+            handle.remove()
+        return np.vstack(out)
+
+    # ------------------------------------------------------------------
     # Gradients
     # ------------------------------------------------------------------
 
@@ -310,3 +390,36 @@ class HFClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings, Sup
     def logits(self, input_ids, attention_mask):
         """Return raw classification logits ``(batch, n_classes)`` (the Captum forward func)."""
         return self.classifier(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    def word_alignment(self, text: str) -> tuple[list[str], list[list[int]], list[int]] | None:
+        """Group subwords into whole words via the fast tokenizer's ``word_ids()`` (see base ABC).
+
+        Re-encodes ``text`` with the same ``truncation=True`` as :meth:`encode`, so the returned
+        positions align with the token/attribution axis. ``word_ids()`` maps each subword to its word
+        index (``None`` for special tokens), giving exact, scheme-independent grouping — no ``##`` / ``Ġ``
+        / ``▁`` string-guessing. Display strings come from ``convert_tokens_to_string`` so each word is
+        rebuilt correctly whatever the tokenization scheme. Returns ``None`` for a slow tokenizer (no
+        ``word_ids()``), letting the caller fall back to a token-string heuristic.
+        """
+        if not getattr(self.tokenizer, "is_fast", False):
+            return None
+        enc = self.tokenizer(text, truncation=True)
+        word_ids = enc.word_ids()
+        tokens = self.tokenizer.convert_ids_to_tokens(enc["input_ids"])
+
+        # Special tokens (and any tokenless position) carry word_id None: fold their attribution into
+        # the baseline. Content subwords sharing a word_id compose one word.
+        special_positions = [i for i, wid in enumerate(word_ids) if wid is None]
+        words: list[str] = []
+        word_positions: list[list[int]] = []
+        prev_wid: int | None = None
+        for i, wid in enumerate(word_ids):
+            if wid is None:
+                continue
+            if wid != prev_wid:
+                word_positions.append([i])
+                prev_wid = wid
+            else:
+                word_positions[-1].append(i)
+        words = [self.tokenizer.convert_tokens_to_string([tokens[i] for i in pos]).strip() for pos in word_positions]
+        return words, word_positions, special_positions

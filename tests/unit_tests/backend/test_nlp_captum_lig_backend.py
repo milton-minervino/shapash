@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 
 from shapash.backend import NlpCaptumLigBackend, get_backend_cls_from_name
-from shapash.backend.nlp_captum_lig_backend import _aggregate_subwords
+from shapash.backend.nlp_captum_lig_backend import _aggregate_by_alignment, _aggregate_subwords
 from shapash.model.base import TextModel
 
 
@@ -71,6 +71,62 @@ class TestAggregateSubwords(unittest.TestCase):
         self.assertEqual(words, [])
         self.assertEqual(word_contribs.shape, (0, 2))
         np.testing.assert_allclose(new_base, [4.0, 6.0])
+
+    def test_byte_bpe_word_start_markers_and_angle_specials(self):
+        # RoBERTa/XLM-R: "Ġ" marks word *starts*, specials are "<s>"/"</s>" (not brackets). The first
+        # content token ("im") carries no marker but is still a new word.
+        tokens = ["<s>", "im", "Ġfeeling", "Ġhappy", "</s>"]
+        contribs = np.arange(10, dtype=float).reshape(5, 2)
+        words, word_contribs, new_base = _aggregate_subwords(tokens, contribs, np.zeros(2))
+        self.assertEqual(words, ["im", "feeling", "happy"])  # no "<s>"/"Ġ" leakage
+        np.testing.assert_allclose(word_contribs, [[2.0, 3.0], [4.0, 5.0], [6.0, 7.0]])
+        np.testing.assert_allclose(new_base, [0.0 + 8.0, 1.0 + 9.0])  # <s> + </s> folded
+
+    def test_byte_bpe_midword_piece_is_merged(self):
+        # An unmarked non-initial piece ("ing") continues the previous word under byte-BPE.
+        tokens = ["<s>", "Ġfeel", "ing", "</s>"]
+        contribs = np.array([[1.0], [2.0], [3.0], [4.0]])
+        words, word_contribs, _ = _aggregate_subwords(tokens, contribs, np.zeros(1))
+        self.assertEqual(words, ["feeling"])
+        np.testing.assert_allclose(word_contribs, [[5.0]])  # 2 + 3
+
+    def test_sentencepiece_word_start_marker(self):
+        # DeBERTa-v2/v3 / T5: "▁" marks word starts.
+        tokens = ["[CLS]", "▁im", "▁feeling", "[SEP]"]
+        contribs = np.ones((4, 2))
+        words, _, _ = _aggregate_subwords(tokens, contribs, np.zeros(2))
+        self.assertEqual(words, ["im", "feeling"])
+
+    def test_explicit_special_set_overrides_regex(self):
+        # When the model's own special set is passed, membership decides specials — a token that merely
+        # *looks* bracket-y ("<odd>") is content unless it's actually in the set.
+        tokens = ["<s>", "hi", "<odd>"]
+        contribs = np.array([[1.0], [2.0], [3.0]])
+        words, word_contribs, new_base = _aggregate_subwords(
+            tokens, contribs, np.zeros(1), special_tokens={"<s>"}
+        )
+        self.assertEqual(words, ["hi", "<odd>"])  # "<odd>" kept as content, only "<s>" folded
+        np.testing.assert_allclose(new_base, [1.0])
+
+
+class TestAggregateByAlignment(unittest.TestCase):
+    """``_aggregate_by_alignment`` folds exact tokenizer grouping — pure numpy, no torch."""
+
+    def test_sums_words_and_folds_specials(self):
+        contribs = np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0], [4.0, 3.0], [6.0, 5.0]])
+        # words = ["im", "feeling"] over positions [[1], [2, 3]]; specials at 0 and 4.
+        alignment = (["im", "feeling"], [[1], [2, 3]], [0, 4])
+        words, word_contribs, new_base = _aggregate_by_alignment(contribs, np.array([10.0, 20.0]), alignment)
+        self.assertEqual(words, ["im", "feeling"])
+        np.testing.assert_allclose(word_contribs, [[2.0, 1.0], [7.0, 5.0]])  # [2,3] summed
+        np.testing.assert_allclose(new_base, [10.0 + 1.0 + 6.0, 20.0 + 0.0 + 5.0])
+
+    def test_preserves_completeness(self):
+        contribs = np.random.default_rng(1).normal(size=(5, 3))
+        base = np.array([0.5, -0.5, 1.0])
+        alignment = (["a", "b"], [[1], [2, 3]], [0, 4])
+        _, word_contribs, new_base = _aggregate_by_alignment(contribs, base, alignment)
+        np.testing.assert_allclose(new_base + word_contribs.sum(axis=0), base + contribs.sum(axis=0))
 
 
 class TestProgressIter(unittest.TestCase):

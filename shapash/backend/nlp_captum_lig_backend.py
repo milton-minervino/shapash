@@ -34,21 +34,48 @@ from shapash.model.base import SupportsCaptumIG, has_capabilities
 
 _NLP_EXTRA = 'Install the NLP extra: pip install "shapash[nlp]".'
 
-# ``[CLS]``/``[SEP]``/``[PAD]``-style bracket tokens (and blanks); their attribution is folded into the
-# baseline during word aggregation so it is neither shown nor lost.
-_SPECIAL_RE = re.compile(r"^\[.*\]$|^\s*$")
+# Last-ditch special-token detector for the string fallback *only when the caller passes no explicit
+# special set* (the pure-numpy unit tests, and the degenerate case). Covers bracket specials
+# (BERT/DistilBERT/DeBERTa ``[CLS]``/``[SEP]``/``[PAD]``) and angle-bracket specials (RoBERTa/XLM-R
+# ``<s>``/``</s>``/``<pad>``/``<mask>``), plus blanks. In real use the backend passes the model's own
+# ``all_special_tokens`` instead, so specials are model-derived rather than guessed here.
+_SPECIAL_RE = re.compile(r"^\[.*\]$|^<.*>$|^\s*$")
+
+# The one irreducibly hard-coded bit of the *fallback* path: the subword marker convention. Byte-level
+# BPE (``Ġ``, RoBERTa/XLM-R) and SentencePiece (``▁``, DeBERTa-v2/v3, T5) mark word *starts*; WordPiece
+# marks *continuations* with ``##``. A slow tokenizer exposes no ``word_ids()`` to derive grouping from,
+# so this convention is the only signal left. (Fast tokenizers never reach here — see word_alignment.)
+_WORD_START_MARKERS = ("Ġ", "▁")  # "Ġ", "▁"
+
+
+def _fallback_uses_word_start_markers(tokens: list[str]) -> bool:
+    """True when the tokens use word-*start* markers (byte-BPE/SentencePiece) vs. WordPiece ``##``.
+
+    Decides how an *unmarked* content token is treated: a continuation of the previous word under
+    byte-BPE/SentencePiece (e.g. ``feel`` + ``ing``), but a brand-new word under WordPiece (``i``,
+    ``am``). The very first content token is always a new word regardless (no previous word to join).
+    """
+    return any(t.strip().startswith(_WORD_START_MARKERS) for t in tokens)
 
 
 def _aggregate_subwords(
-    tokens: list[str], contributions: np.ndarray, base_values: np.ndarray
+    tokens: list[str],
+    contributions: np.ndarray,
+    base_values: np.ndarray,
+    special_tokens: set[str] | None = None,
 ) -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Merge WordPiece subwords into whole words and fold special tokens into the baseline.
+    """Token-string fallback: merge subwords into words and fold specials into the baseline.
 
-    LIG attributes at the tokenizer's subword granularity, so raw output carries ``[CLS]``/``[SEP]``
-    specials and ``##``-prefixed continuation pieces. This collapses each word's subword attributions
-    into a single value (matching the word-level highlights the SHAP backend produces) while
-    **preserving LIG's completeness relation**: special-token attributions are added to ``base_values``
-    rather than discarded, so ``base + Σ(word contributions)`` still equals ``logits(x)``.
+    Used only when the tokenizer exposes no ``word_ids()`` (a slow tokenizer); the exact, fully
+    model-driven grouping lives in :meth:`~shapash.model.base.SupportsCaptumIG.word_alignment`. This
+    collapses each word's subword attributions into a single value (matching the word-level highlights
+    the SHAP backend produces) while **preserving LIG's completeness relation**: special-token
+    attributions are added to ``base_values`` rather than discarded, so ``base + Σ(word contributions)``
+    still equals ``logits(x)``.
+
+    Handles every subword scheme via the marker convention (``##`` continuation vs ``Ġ``/``▁`` word-start
+    — see :func:`_fallback_uses_word_start_markers`), so RoBERTa/XLM-R (byte-BPE) and DeBERTa/T5
+    (SentencePiece) merge correctly, not just WordPiece.
 
     Parameters
     ----------
@@ -58,6 +85,10 @@ def _aggregate_subwords(
         Per-subword contributions, shape ``(seq, n_classes)``.
     base_values : np.ndarray
         Baseline logits for the sample, shape ``(n_classes,)``.
+    special_tokens : set[str] or None
+        The model's own special tokens (``tokenizer.all_special_tokens``). When given, specials are
+        detected by membership — model-derived, not guessed. When ``None``, a last-ditch bracket /
+        angle-bracket regex (:data:`_SPECIAL_RE`) is used instead.
 
     Returns
     -------
@@ -65,22 +96,84 @@ def _aggregate_subwords(
         Word strings, per-word contributions ``(n_words, n_classes)``, and the adjusted baseline
         ``(n_classes,)`` with special-token attribution folded in.
     """
+    word_start_markers = _fallback_uses_word_start_markers(tokens)
+
+    def _is_special(tok: str) -> bool:
+        return tok in special_tokens if special_tokens is not None else bool(_SPECIAL_RE.match(tok))
+
     words: list[str] = []
     word_rows: list[np.ndarray] = []
     base = base_values.astype(float).copy()
     for tok, row in zip(tokens, contributions, strict=True):
         stripped = tok.strip()
-        if _SPECIAL_RE.match(stripped):
+        if _is_special(stripped) or stripped == "":
             base = base + row  # fold special-token attribution into the baseline (keep completeness)
-        elif stripped.startswith("##") and words:
-            words[-1] += stripped[2:]
-            word_rows[-1] = word_rows[-1] + row
+        elif stripped.startswith("##"):  # WordPiece continuation
+            _extend_or_start(words, word_rows, stripped[2:], row, continuation=bool(words))
+        elif stripped.startswith(_WORD_START_MARKERS):  # byte-BPE/SentencePiece word start
+            _extend_or_start(words, word_rows, stripped[1:], row, continuation=False)
         else:
-            words.append(stripped)
-            word_rows.append(row.astype(float).copy())
+            # Unmarked: a mid-word piece under byte-BPE/SentencePiece (join), else a whole word.
+            _extend_or_start(words, word_rows, stripped, row, continuation=word_start_markers and bool(words))
 
     stacked = np.stack(word_rows, axis=0) if word_rows else np.zeros((0, contributions.shape[-1]))
     return words, stacked, base
+
+
+def _extend_or_start(
+    words: list[str], word_rows: list[np.ndarray], piece: str, row: np.ndarray, *, continuation: bool
+) -> None:
+    """Append ``piece``/``row`` to the current word (``continuation``) or start a new one, in place."""
+    if continuation and words:
+        words[-1] += piece
+        word_rows[-1] = word_rows[-1] + row
+    else:
+        words.append(piece)
+        word_rows.append(row.astype(float).copy())
+
+
+def _aggregate_by_alignment(
+    contributions: np.ndarray,
+    base_values: np.ndarray,
+    alignment: tuple[list[str], list[list[int]], list[int]],
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Exact aggregation from the tokenizer's own word grouping (:meth:`TextModel.word_alignment`).
+
+    Sums each word's subword rows and folds special-token rows into the baseline — same completeness
+    guarantee as :func:`_aggregate_subwords`, but with no string-marker guessing.
+    """
+    words, word_positions, special_positions = alignment
+    base = base_values.astype(float).copy()
+    if special_positions:
+        base = base + contributions[special_positions].sum(axis=0)
+    if word_positions:
+        word_rows = np.stack([contributions[pos].sum(axis=0) for pos in word_positions], axis=0)
+    else:
+        word_rows = np.zeros((0, contributions.shape[-1]))
+    return words, word_rows, base
+
+
+def _valid_alignment(
+    alignment: tuple[list[str], list[list[int]], list[int]] | None, n_tokens: int
+) -> tuple[list[str], list[list[int]], list[int]] | None:
+    """Return ``alignment`` only when its positions index within ``n_tokens``, else ``None``.
+
+    A defensive guard: ``word_alignment`` re-encodes the text, so a tokenizer whose second encoding
+    disagreed on length would misalign against the attribution rows — fall back to the string path.
+    """
+    if alignment is None:
+        return None
+    _, word_positions, special_positions = alignment
+    indices = [i for pos in word_positions for i in pos] + list(special_positions)
+    if indices and max(indices) >= n_tokens:
+        return None
+    return alignment
+
+
+def _model_special_tokens(model: SupportsCaptumIG) -> set[str] | None:
+    """Return the model tokenizer's ``all_special_tokens`` as a set, or ``None`` when unavailable."""
+    specials = getattr(getattr(model, "tokenizer", None), "all_special_tokens", None)
+    return set(specials) if specials else None
 
 
 class NlpCaptumLigBackend(NlpBackend):
@@ -174,9 +267,16 @@ class NlpCaptumLigBackend(NlpBackend):
 
             # Collapse subwords to whole words (dropping special tokens) so LIG highlights read like
             # the SHAP backend's; special-token attribution is folded into base_logits to stay additive.
-            word_tokens, word_contribs, base_logits = _aggregate_subwords(
-                list(tokens), np.stack(per_class, axis=-1), base_logits
-            )
+            # Prefer the model's exact, tokenizer-driven grouping; fall back to the token-string
+            # heuristic (with the model's own special set) only for a slow tokenizer.
+            stacked = np.stack(per_class, axis=-1)  # (seq, n_classes)
+            alignment = _valid_alignment(model.word_alignment(text), n_tokens=stacked.shape[0])
+            if alignment is not None:
+                word_tokens, word_contribs, base_logits = _aggregate_by_alignment(stacked, base_logits, alignment)
+            else:
+                word_tokens, word_contribs, base_logits = _aggregate_subwords(
+                    list(tokens), stacked, base_logits, special_tokens=_model_special_tokens(model)
+                )
             contributions.append(word_contribs)  # (n_words, n_classes)
             base_values.append(base_logits)
             data.append(word_tokens)
