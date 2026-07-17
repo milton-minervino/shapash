@@ -105,6 +105,12 @@ class ServeConfig:
     label_map: dict[str, str] = field(default_factory=dict)
     n: int = 500
     attribution: str = "shap"  # sentence-highlight method: "shap" | "lig" (Captum LayerIntegratedGradients)
+    # Similar-examples reference corpus: the split neighbours are retrieved from (the model's own
+    # training split) and how many rows of it to bank. ``similarity_layer=None`` uses the model default
+    # (pre-classifier pooled vector). Set ``n_reference=0`` to disable the "Similar Examples" panel.
+    reference_split: str = "train"
+    n_reference: int = 2000
+    similarity_layer: str | None = None
     cache_dir: Path = _HERE / "nlp_ext_cache"
     port: int = 8051
     host: str = "0.0.0.0"  # noqa: S104
@@ -174,6 +180,22 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
             "(Captum LayerIntegratedGradients). Cached separately, so switching needs no --recompute."
         ),
     )
+    parser.add_argument(
+        "--reference-split",
+        default=defaults.reference_split,
+        help="Dataset split used as the similar-examples reference corpus (the model's training split).",
+    )
+    parser.add_argument(
+        "--n-reference",
+        type=int,
+        default=defaults.n_reference,
+        help="Reference rows to bank for 'Similar Examples' (0 disables the panel).",
+    )
+    parser.add_argument(
+        "--similarity-layer",
+        default=defaults.similarity_layer,
+        help="Fully-qualified layer to compare in for similar-example retrieval (default: model's pre-classifier).",
+    )
     parser.add_argument("--cache-dir", type=Path, default=defaults.cache_dir)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--host", default=defaults.host)
@@ -186,8 +208,8 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
     return ServeConfig(**vars(args))
 
 
-def load_data(config: ServeConfig) -> tuple[list[str], list[str]]:
-    """Load ``config.n`` samples and their display label strings from the configured dataset.
+def _load_split(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
+    """Load the first ``n`` ``(texts, label_strings)`` of ``split`` from the configured dataset.
 
     Ground-truth label strings come from the dataset's own ``ClassLabel`` feature names when
     present (the usual shape for HF classification datasets); otherwise the raw values are
@@ -195,15 +217,61 @@ def load_data(config: ServeConfig) -> tuple[list[str], list[str]]:
     names when the two disagree on spelling/casing (e.g. dataset ``"neg"`` vs. model
     ``"NEGATIVE"``) despite sharing the same class order.
     """
-    dataset = datasets.load_dataset(config.dataset_name, split=config.dataset_split)
-    sentences = dataset[config.text_column][: config.n]
-    raw_labels = dataset[config.label_column][: config.n]
+    dataset = datasets.load_dataset(config.dataset_name, split=split)
+    sentences = dataset[config.text_column][:n]
+    raw_labels = dataset[config.label_column][:n]
     names = getattr(dataset.features.get(config.label_column), "names", None)
-    y_true = [names[i] for i in raw_labels] if names is not None else [str(v) for v in raw_labels]
+    labels = [names[i] for i in raw_labels] if names is not None else [str(v) for v in raw_labels]
     if config.label_map:
-        y_true = [config.label_map.get(v, v) for v in y_true]
-    logger.info("Loaded %d samples from %s (split=%s)", len(sentences), config.dataset_name, config.dataset_split)
-    return sentences, y_true
+        labels = [config.label_map.get(v, v) for v in labels]
+    logger.info("Loaded %d samples from %s (split=%s)", len(sentences), config.dataset_name, split)
+    return sentences, labels
+
+
+def load_data(config: ServeConfig) -> tuple[list[str], list[str]]:
+    """Load the served ``config.n`` samples + label strings from ``config.dataset_split``."""
+    return _load_split(config, config.dataset_split, config.n)
+
+
+def load_reference_corpus(config: ServeConfig) -> tuple[list[str], list[str]] | None:
+    """Load the similar-examples reference corpus (the model's training split).
+
+    Returns ``(texts, labels)`` from ``config.reference_split`` for the "Similar Examples" panel,
+    or ``None`` when disabled (``n_reference <= 0``). This is the pool neighbours are retrieved from,
+    so it is the model's *training* set rather than the served (test) split.
+    """
+    if config.n_reference <= 0:
+        return None
+    return _load_split(config, config.reference_split, config.n_reference)
+
+
+def _load_tokenizer(model_name: str):
+    """Load the tokenizer, preferring a fast one but falling back to the slow implementation.
+
+    A fast tokenizer is best — it unlocks the exact ``word_ids()`` word-alignment the LIG highlights
+    use — but some checkpoints ship no ``tokenizer.json``, so the fast load raises. We then retry with
+    ``use_fast=False``; a slow tokenizer still works (the LIG backend degrades to its scheme-aware
+    string merge). When *both* fail, the checkpoint has no standard HF tokenizer at all — typically a
+    custom ``trust_remote_code`` architecture — which the ``HFClassifierModel`` adapter does not support;
+    surface that as a clear error rather than a deep tokenizer stack trace.
+    """
+    try:
+        return transformers.AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    except Exception as fast_err:  # noqa: BLE001 — retry slow, then re-raise with a usable hint
+        logger.warning(
+            "Fast tokenizer unavailable for %s (%s) — retrying with use_fast=False.",
+            model_name,
+            type(fast_err).__name__,
+        )
+        try:
+            return transformers.AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        except Exception as slow_err:  # noqa: BLE001 — no standard tokenizer; give an actionable message
+            raise RuntimeError(
+                f"Could not load a tokenizer for {model_name!r} in fast or slow mode. This is usually a "
+                "checkpoint with a non-standard or custom (trust_remote_code) tokenizer/architecture, "
+                "which the HFClassifierModel adapter does not support. Use a standard "
+                "AutoModelForSequenceClassification checkpoint that ships a normal HF tokenizer."
+            ) from slow_err
 
 
 def load_model(config: ServeConfig) -> HFClassifierModel:
@@ -220,7 +288,7 @@ def load_model(config: ServeConfig) -> HFClassifierModel:
         device = "cpu"
         logger.info("No CUDA device found — using CPU")
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    tokenizer = _load_tokenizer(config.model_name)
     classifier = transformers.AutoModelForSequenceClassification.from_pretrained(config.model_name).to(device)
     logger.info("Loaded model %s on device: %s", config.model_name, next(classifier.parameters()).device)
     return HFClassifierModel(classifier, tokenizer)
@@ -283,12 +351,21 @@ def main() -> None:
 
     model = load_model(config)
 
+    # Similar-examples reference corpus (the training split) + a cache dir for its activation bank,
+    # keyed by corpus/layer/model so it is embedded once and reloaded on later runs.
+    reference_corpus = load_reference_corpus(config)
+    similar_cache_dir = dataset_dir / "similar"
+
     # No cf_generator is passed: NlpExplainer auto-discovers every built-in compatible with the model
     # (HotFlip + AblationFlip on an HF classifier) and offers them from the What-if Lab's method dropdown.
+    # reference_corpus enables the "Similar Examples" panel (skipped when --n-reference 0).
     xpl = NlpExplainer(
         model,
         label_names=model.label_names,
         backend=build_backend(config, model),
+        reference_corpus=reference_corpus,
+        similarity_layer=config.similarity_layer,
+        reference_cache_dir=similar_cache_dir,
     )
     # Both steps load from cache if one exists for these exact texts, otherwise they compute and write
     # it. So the first run is slow; later runs only pay the model load.
@@ -304,12 +381,18 @@ def main() -> None:
     xpl.compile(sentences, y_true=y_true, cache_dir=compile_dir)
     projected = load_or_project(sentences, model, dataset_dir)
 
+    if xpl.can_find_similar():
+        # Build (and cache) the reference activation bank now so the first in-app lookup is instant.
+        logger.info("Warming similar-examples bank over %d reference texts…", len(reference_corpus[0]))
+        xpl.find_similar(sentences[0], top_k=1)
+
     logger.info(
-        "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s",
+        "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s | can_find_similar=%s",
         config.attribution,
         ",".join(name for name, _ in xpl.available_cf_generators()) or "none",
         xpl.can_edit(),
         xpl.can_counterfactual(),
+        xpl.can_find_similar(),
     )
     logger.info("Serving on http://%s:%d (Ctrl+C to stop)", config.host, config.port)
     xpl.run_app(port=config.port, debug=False, host=config.host, scatter_xy=projected)
