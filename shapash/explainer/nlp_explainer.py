@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +26,8 @@ from shapash.backend.nlp_shap_backend import NlpShapBackend
 from shapash.compute.generators.ablation_flip import AblationFlipGenerator
 from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
 from shapash.compute.generators.hotflip import HotFlipGenerator
-from shapash.model.base import TextModel
+from shapash.compute.retrieval.similar_examples import Neighbor, SimilarExampleRetriever
+from shapash.model.base import SupportsActivations, TextModel, has_capabilities
 from shapash.model.hf import HFPipelineModel
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.webapp.nlp_app import NlpWebApp
@@ -126,6 +128,18 @@ class NlpExplainer:
         Forwarded to ``NlpShapBackend.__init__`` when no ``backend`` is given.
     explainer_compute_args : dict, optional
         Forwarded to ``NlpShapBackend.__init__`` when no ``backend`` is given.
+    reference_corpus : tuple[list[str], list[str] or None], optional
+        ``(texts, labels)`` reference pool for similar-example retrieval — typically the
+        model's training set. When given *and* the model supports layer activations, the webapp gains
+        a "Similar Examples" panel that retrieves the most similar reference examples for the
+        selected/edited text. ``labels`` may be ``None``. Ignored when the model cannot expose
+        activations (e.g. a prediction-only pipeline).
+    similarity_layer : str, optional
+        Fully-qualified layer name to compare in for similar-example retrieval. Defaults to the model's
+        ``default_activation_layer`` (the pre-classifier pooled vector for ``HFClassifierModel``).
+    reference_cache_dir : str or Path, optional
+        When given, the reference activation bank is persisted here and reloaded on later runs, so
+        only the first launch pays the (one-off) cost of embedding the reference corpus.
 
     Examples
     --------
@@ -148,6 +162,9 @@ class NlpExplainer:
         cf_generator: CounterfactualGenerator | None = None,
         explainer_args: dict | None = None,
         explainer_compute_args: dict | None = None,
+        reference_corpus: tuple[list[str], list[str] | None] | None = None,
+        similarity_layer: str | None = None,
+        reference_cache_dir: str | Path | None = None,
     ) -> None:
         self.model = model
         self.label_names = label_names
@@ -189,12 +206,31 @@ class NlpExplainer:
         self.cf_generators: dict[str, CounterfactualGenerator] = {g.name: g for g in generators}
         self.cf_generator: CounterfactualGenerator | None = generators[0] if generators else None
 
+        # Similar-example retrieval: only when a reference corpus is supplied AND the model
+        # can expose layer activations (a prediction-only pipeline cannot) — otherwise the panel gates
+        # itself off, mirroring how counterfactuals require a gradient-capable model.
+        self._retriever: SimilarExampleRetriever | None = None
+        if reference_corpus is not None and has_capabilities(self._text_model, SupportsActivations):
+            ref_texts, ref_labels = reference_corpus
+            self._retriever = SimilarExampleRetriever(
+                self._text_model,  # type: ignore[arg-type]  # has_capabilities narrows the capability
+                reference_texts=ref_texts,
+                reference_labels=ref_labels,
+                layer=similarity_layer,
+                cache_dir=reference_cache_dir,
+            )
+
         self.contributions: NlpContributions | None = None
         self.texts: pd.Series | None = None
         self.y_pred: pd.Series | None = None
         self.y_prob: pd.DataFrame | None = None
         self.y_true: pd.Series | None = None
         self._data_hash: str | None = None
+        # Serializes the live compute ops (predict / explain_text / find_similar / generate) — the
+        # webapp runs Dash callbacks on Werkzeug's threaded server, and the shared HF fast tokenizer
+        # (used directly *and* via the SHAP pipeline) is not thread-safe: concurrent calls raise
+        # "Already borrowed". Re-entrant so explain_text can nest predict on the same thread.
+        self._compute_lock = threading.RLock()
 
     def compile(
         self,
@@ -345,6 +381,7 @@ class NlpExplainer:
         xpl._text_model = None
         xpl.cf_generator = None
         xpl.cf_generators = {}
+        xpl._retriever = None
         xpl.label_names = results.label_names
         xpl.texts = results.texts
         xpl.contributions = results.computed.contributions
@@ -352,6 +389,7 @@ class NlpExplainer:
         xpl.y_prob = results.computed.y_prob
         xpl.y_true = results.y_true
         xpl._data_hash = None
+        xpl._compute_lock = threading.RLock()
         return xpl, state.get("scatter_xy")
 
     def run_app(self, port: int = 8050, debug: bool = False, host: str = "127.0.0.1", scatter_xy=None) -> None:
@@ -379,6 +417,14 @@ class NlpExplainer:
     # InteractiveEngine — live what-if surface (see explainer/interactive.py)
     # ------------------------------------------------------------------
 
+    def _compute_guard(self) -> threading.RLock:
+        """Return the lock serializing live model compute (lazily created for ``__new__``/snapshot paths)."""
+        lock = getattr(self, "_compute_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._compute_lock = lock
+        return lock
+
     def can_edit(self) -> bool:
         """Whether edited text can be re-predicted and re-explained live.
 
@@ -390,10 +436,42 @@ class NlpExplainer:
         """Whether a counterfactual generator is bound and ready."""
         return getattr(self, "cf_generator", None) is not None
 
+    def can_find_similar(self) -> bool:
+        """Whether similar-example retrieval is available (a reference corpus + activation-capable model).
+
+        ``False`` after ``from_snapshot`` (no model) or when no ``reference_corpus`` was supplied.
+        """
+        return getattr(self, "_retriever", None) is not None
+
+    def find_similar(self, text: str, top_k: int = 5) -> list[Neighbor]:
+        """Return the reference examples most similar to ``text`` in the similarity layer's space.
+
+        Parameters
+        ----------
+        text : str
+            Query text (a selected dataset row, an edited sentence, or a counterfactual).
+        top_k : int
+            Number of neighbours to return.
+
+        Returns
+        -------
+        list[Neighbor]
+            Reference examples ordered by descending similarity.
+        """
+        retriever = getattr(self, "_retriever", None)
+        if retriever is None:
+            raise RuntimeError(
+                "find_similar() requires a reference_corpus and an activation-capable model "
+                "(unavailable on a snapshot)."
+            )
+        with self._compute_guard():  # activations() tokenizes — serialize against explain_text/predict
+            return retriever.query(text, top_k=top_k)
+
     def predict(self, text: str) -> tuple[str, dict[str, float]]:
         """Predict a single text, returning ``(label, {label: probability})``."""
         text_model = self._require_text_model()
-        probs = text_model.predict([text])[0]
+        with self._compute_guard():
+            probs = text_model.predict([text])[0]
         names = text_model.label_names or self.label_names or [str(i) for i in range(len(probs))]
         idx = int(probs.argmax())
         return names[idx], {name: float(p) for name, p in zip(names, probs, strict=False)}
@@ -405,10 +483,13 @@ class NlpExplainer:
         """
         if getattr(self, "backend", None) is None:
             raise RuntimeError("explain_text() requires a live backend (unavailable on a snapshot).")
-        raw = self.backend.run_explainer([text])
-        contributions = self.backend.get_local_contributions([text], raw)
-        contributions.label_names = self.label_names
-        label, probabilities = self.predict(text)
+        # Hold the lock across the whole op: run_explainer drives the SHAP pipeline (which tokenizes)
+        # and predict tokenizes again — both must be serialized against a concurrent find_similar.
+        with self._compute_guard():
+            raw = self.backend.run_explainer([text])
+            contributions = self.backend.get_local_contributions([text], raw)
+            contributions.label_names = self.label_names
+            label, probabilities = self.predict(text)  # re-entrant: same thread re-acquires the RLock
         return contributions, label, probabilities
 
     def available_cf_generators(self) -> list[tuple[str, str]]:
@@ -436,7 +517,8 @@ class NlpExplainer:
         gen = self._select_cf_generator(generator)
         if gen is None:
             raise RuntimeError("No counterfactual generator is configured for this explainer.")
-        return gen.generate(text, config=config)
+        with self._compute_guard():  # generators tokenize / run the model — same serialization
+            return gen.generate(text, config=config)
 
     def cf_config_spec(self, generator: str | None = None) -> dict[str, Field]:
         """Return the tunable config spec of the selected (or active) generator, empty when none."""

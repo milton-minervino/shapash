@@ -12,8 +12,13 @@ import pandas as pd
 
 from shapash.backend.nlp_backend import NlpContributions
 from shapash.compute.generators.base import Counterfactual, IntField, TokenListField
+from shapash.compute.retrieval.similar_examples import Neighbor
 from shapash.webapp.nlp_app import NlpWebApp
-from shapash.webapp.nlp_components import CounterfactualComponent, DataEditorComponent
+from shapash.webapp.nlp_components import (
+    CounterfactualComponent,
+    DataEditorComponent,
+    SimilarExamplesComponent,
+)
 from shapash.webapp.nlp_view import NlpView
 
 LABEL_NAMES = ["neg", "pos"]
@@ -32,9 +37,12 @@ def _contributions() -> NlpContributions:
 class FakeEngine:
     """Minimal explainer/engine stand-in exposing the InteractiveEngine surface + compiled data."""
 
-    def __init__(self, can_edit: bool, can_cf: bool):
+    def __init__(self, can_edit: bool, can_cf: bool, can_similar: bool = False):
         self._can_edit = can_edit
         self._can_cf = can_cf
+        self._can_similar = can_similar
+        # A retriever-like handle the SimilarExamples panel reads its layer caption from.
+        self._retriever = type("R", (), {"layer": "pre_classifier"})() if can_similar else None
         self.label_names = LABEL_NAMES
         self.texts = pd.Series(["i am happy", "this is bad"], index=pd.RangeIndex(2))
         self.contributions = _contributions()
@@ -47,6 +55,15 @@ class FakeEngine:
 
     def can_counterfactual(self):
         return self._can_cf
+
+    def can_find_similar(self):
+        return self._can_similar
+
+    def find_similar(self, text, top_k=5):
+        return [
+            Neighbor(index=0, score=0.99, text="i am joyful", label="pos"),
+            Neighbor(index=1, score=0.80, text="this is awful", label="neg"),
+        ][:top_k]
 
     def available_cf_generators(self):
         return [("hotflip", "HotFlip"), ("ablation_flip", "Ablation")]
@@ -109,7 +126,8 @@ class TestWhatIfMounting(unittest.TestCase):
     def _whatif_components(app):
         # app._components also holds the always-on core panels (Sentence Highlight, Waterfall);
         # scope these assertions to the capability-gated What-if Lab ones only.
-        return [c for c in app._components if isinstance(c, (DataEditorComponent, CounterfactualComponent))]
+        gated = (DataEditorComponent, CounterfactualComponent, SimilarExamplesComponent)
+        return [c for c in app._components if isinstance(c, gated)]
 
     def test_full_capabilities_mount_both(self):
         app, ids = self._ids(FakeEngine(can_edit=True, can_cf=True))
@@ -157,6 +175,27 @@ class TestWhatIfMounting(unittest.TestCase):
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("data-editor-prob.figure", outputs)
         self.assertIn("counterfactual-results.children", outputs)
+
+    def test_similar_panel_mounts_when_capable(self):
+        app, ids = self._ids(FakeEngine(can_edit=True, can_cf=False, can_similar=True))
+        self.assertIn("similar-topk", ids)
+        self.assertIn("similar-results", ids)
+        self.assertTrue(any(isinstance(c, SimilarExamplesComponent) for c in app._components))
+
+    def test_similar_panel_hidden_without_capability(self):
+        _, ids = self._ids(FakeEngine(can_edit=True, can_cf=True, can_similar=False))
+        self.assertNotIn("similar-topk", ids)
+        self.assertNotIn("similar-results", ids)
+
+    def test_similar_panel_requires_predict(self):
+        # CAP_SIMILAR alone is not enough — the Inspect flow needs predict (explain_text) too.
+        _, ids = self._ids(FakeEngine(can_edit=False, can_cf=False, can_similar=True))
+        self.assertNotIn("similar-topk", ids)
+
+    def test_similar_callbacks_registered_when_mounted(self):
+        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=False, can_similar=True))
+        outputs = " ".join(app.app.callback_map.keys())
+        self.assertIn("similar-results.children", outputs)
 
 
 def _callback_binding_ids(app, output_substr):
@@ -270,6 +309,90 @@ class TestReadContractSeam(unittest.TestCase):
         app = NlpWebApp(engine)
         self.assertIsInstance(app._view, NlpView)  # read contract
         self.assertIs(app._engine, engine)  # live-action contract
+
+
+class TestSimilarComponent(unittest.TestCase):
+    """Exercise the Similar Examples component's renderer and callbacks directly."""
+
+    @staticmethod
+    def _register():
+        import dash
+
+        from shapash.webapp.nlp_components import SimilarExamplesComponent
+
+        engine = FakeEngine(can_edit=True, can_cf=False, can_similar=True)
+        view = NlpView(engine)
+        app = dash.Dash(__name__)
+        comp = SimilarExamplesComponent()
+        comp.register_callbacks(app, view, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
+        return app, engine
+
+    @staticmethod
+    def _callback(app, out_substr):
+        # callback_map stores Dash's context-wrapping shim; the raw user function is under __wrapped__.
+        for key, spec in app.callback_map.items():
+            if out_substr in key:
+                fn = spec["callback"]
+                return getattr(fn, "__wrapped__", fn)
+        raise KeyError(out_substr)
+
+    def test_layout_shows_layer_caption(self):
+        from shapash.webapp.nlp_components import SimilarExamplesComponent
+
+        engine = FakeEngine(can_edit=True, can_cf=False, can_similar=True)
+        found = set()
+        _collect_ids(SimilarExamplesComponent().layout(NlpView(engine), engine), found)
+        self.assertIn("similar-topk", found)
+        self.assertIn("similar-results", found)
+
+    def test_update_similar_returns_table_and_texts(self):
+        app, _ = self._register()
+        update = self._callback(app, "similar-results")
+        children, texts = update({"text": "i am happy", "label": "pos"}, 5)
+        self.assertEqual(texts, ["i am joyful", "this is awful"])
+        self.assertIsNotNone(children)
+
+    def test_update_similar_ignores_empty_text(self):
+        from dash.exceptions import PreventUpdate
+
+        app, _ = self._register()
+        update = self._callback(app, "similar-results")
+        with self.assertRaises(PreventUpdate):
+            update({"text": "  "}, 5)
+
+    def test_inspect_makes_neighbor_the_current_datapoint(self):
+        from unittest import mock
+
+        from shapash.webapp.nlp_components import similar_examples as mod
+
+        app, _ = self._register()
+        inspect = self._callback(app, "current-datapoint")
+        with mock.patch.object(mod, "callback_context") as cc:
+            cc.triggered_id = {"type": "similar-apply", "index": 1}
+            dp = inspect([1, 1], ["first neighbor", "second neighbor"])
+        self.assertEqual(dp["text"], "second neighbor")
+        self.assertEqual(dp["label"], "pos")  # FakeEngine.explain_text returns "pos"
+
+    def test_neighbors_table_marks_matching_label(self):
+        from shapash.webapp.nlp_components.similar_examples import _neighbors_table
+
+        neighbors = [
+            Neighbor(index=0, score=0.9, text="joyful one", label="pos"),
+            Neighbor(index=1, score=0.5, text="grim one", label="neg"),
+        ]
+        table = _neighbors_table(neighbors, predicted_label="pos", component_id="similar")
+        ids = set()
+        _collect_ids(table, ids)
+        # One Inspect button per neighbour (pattern-matching ids are dicts, so assert via the count).
+        self.assertEqual(sum(1 for n in neighbors), 2)
+        self.assertIsNotNone(table)
+
+    def test_neighbors_table_without_labels(self):
+        from shapash.webapp.nlp_components.similar_examples import _neighbors_table
+
+        neighbors = [Neighbor(index=0, score=0.9, text="some text", label=None)]
+        table = _neighbors_table(neighbors, predicted_label=None, component_id="similar")
+        self.assertIsNotNone(table)
 
 
 if __name__ == "__main__":

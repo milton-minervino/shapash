@@ -18,6 +18,7 @@ from shapash.webapp.nlp_view import NlpView
 CAP_PREDICT = "engine:predict"
 CAP_COUNTERFACTUAL = "engine:counterfactual"
 CAP_GRADIENTS = "model:gradients"
+CAP_SIMILAR = "engine:similar"
 
 
 def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> frozenset[str]:
@@ -40,6 +41,8 @@ def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> f
     if engine is not None:
         if engine.can_edit():
             caps.add(CAP_PREDICT)
+        if engine.can_find_similar():
+            caps.add(CAP_SIMILAR)
         if engine.can_counterfactual():
             caps.add(CAP_COUNTERFACTUAL)
             # Advertise gradients only when the *bound* generator actually operates on a

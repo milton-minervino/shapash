@@ -20,6 +20,7 @@ from typing import Protocol, runtime_checkable
 
 from shapash.backend.nlp_backend import NlpContributions
 from shapash.compute.generators.base import Counterfactual, Field
+from shapash.compute.retrieval.similar_examples import Neighbor
 
 
 @runtime_checkable
@@ -67,4 +68,12 @@ class InteractiveEngine(Protocol):
 
     def cf_config_spec(self, generator: str | None = None) -> dict[str, Field]:
         """Return the selected (or active) generator's config spec (empty when no generator)."""
+        ...
+
+    def can_find_similar(self) -> bool:
+        """Whether similar-example retrieval over a reference corpus is available."""
+        ...
+
+    def find_similar(self, text: str, top_k: int = 5) -> list[Neighbor]:
+        """Return the ``top_k`` reference examples most similar to ``text``, most-similar first."""
         ...
