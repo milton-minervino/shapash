@@ -26,6 +26,7 @@ from shapash.webapp.nlp_components import (
     CounterfactualComponent,
     DataEditorComponent,
     SentenceHighlightComponent,
+    SimilarExamplesComponent,
     WaterfallComponent,
     pack_datapoint,
 )
@@ -519,7 +520,15 @@ class NlpWebApp:
                     columnDefs=column_defs,
                     defaultColDef={"resizable": True, "sortable": True},
                     dashGridOptions={
-                        "rowSelection": "single",
+                        # AG Grid v32.2+ (dash-ag-grid ≥31) replaced the string form
+                        # ("single"/"multiple") with an object. In the new API a row click no
+                        # longer selects by default — you must opt in via enableClickSelection,
+                        # otherwise `selectedRows` never populates and every click 204s.
+                        "rowSelection": {
+                            "mode": "singleRow",
+                            "checkboxes": False,
+                            "enableClickSelection": True,
+                        },
                         "tooltipShowDelay": 300,
                         "rowHeight": 38,
                     },
@@ -607,6 +616,7 @@ class NlpWebApp:
                 WaterfallComponent(),
                 DataEditorComponent(),
                 CounterfactualComponent(),
+                SimilarExamplesComponent(),
             )
             if type(comp).is_available(self._view, self._engine)
         ]
@@ -614,6 +624,7 @@ class NlpWebApp:
         waterfall_comp = next(c for c in self._components if isinstance(c, WaterfallComponent))
         editor_comp = next((c for c in self._components if isinstance(c, DataEditorComponent)), None)
         cf_comp = next((c for c in self._components if isinstance(c, CounterfactualComponent)), None)
+        similar_comp = next((c for c in self._components if isinstance(c, SimilarExamplesComponent)), None)
 
         left_tabs: list = [("table", "Dataset", text_samples_body)]
         if scatter_col_content is not None:
@@ -628,6 +639,8 @@ class NlpWebApp:
             upper_right_tabs.append(("errors", "Error Analysis", error_analysis_body))
         if cf_comp is not None:
             upper_right_tabs.append(("counterfactual", "Counterfactuals", cf_comp.layout(self._view, self._engine)))
+        if similar_comp is not None:
+            upper_right_tabs.append(("similar", "Similar Examples", similar_comp.layout(self._view, self._engine)))
 
         lower_right_tabs: list = [
             ("highlight", "Sentence", highlight_comp.layout(self._view, self._engine)),
