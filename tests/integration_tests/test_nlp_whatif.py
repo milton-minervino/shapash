@@ -11,7 +11,7 @@ import pytest
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("torch")
 
-from shapash.compute.generators import HotFlipGenerator  # noqa: E402
+from shapash.compute.generators import AblationFlipGenerator, HotFlipGenerator, TokenListField  # noqa: E402
 from shapash.explainer.interactive import InteractiveEngine  # noqa: E402
 from shapash.explainer.nlp_explainer import NlpExplainer  # noqa: E402
 from shapash.model import HFClassifierModel, HFPipelineModel  # noqa: E402
@@ -131,13 +131,17 @@ def test_explainer_interactive_engine_with_classifier(hf):
     assert all(cf.new_label != cf.orig_label for cf in cfs)
 
 
-def test_explainer_pipeline_is_editable_but_no_counterfactuals(hf):
+def test_explainer_pipeline_gets_ablation_flip_but_not_hotflip(hf):
+    """A predict-only pipeline can't run gradient-based HotFlip, but AblationFlip (forward-pass-only,
+    needs only tokenization) auto-binds as the fallback — so it still gets a What-if Lab.
+    """
     _, _, pipe = hf
     xpl = NlpExplainer(pipe, label_names=LABELS)  # predict-only pipeline
     assert xpl.can_edit()
-    assert not xpl.can_counterfactual()
-    assert xpl.cf_generator is None
-    assert xpl.cf_config_spec() == {}
+    assert xpl.can_counterfactual()
+    assert isinstance(xpl.cf_generator, AblationFlipGenerator)
+    assert [name for name, _ in xpl.available_cf_generators()] == ["ablation_flip"]
+    assert set(xpl.cf_config_spec()) == {"num_examples", "max_ablations", "tokens_to_ignore"}
 
 
 def _find_callback_key(app, output_substr):
@@ -191,17 +195,30 @@ def test_whatif_app_callbacks_end_to_end(hf):
     assert payload["current-datapoint"]["data"]["tokens"]
 
     # Generate: current datapoint text -> counterfactual results table + store of new texts.
+    # The classifier model binds both HotFlip and AblationFlip (see test_explainer_interactive_engine_
+    # with_classifier), so the counterfactual panel renders a method selector plus one config-control
+    # group per generator, each namespaced "counterfactual-cfg-{generator}-{field}". The callback's
+    # State list mirrors that layout exactly (selector, then every generator's fields in order) — build
+    # it from the live config specs rather than hardcoding ids, so it keeps matching the panel's layout.
+    gen_names = [name for name, _ in xpl.available_cf_generators()]
+    assert "hotflip" in gen_names
+    overrides = {"hotflip": {"num_examples": 3, "max_flips": 2, "tokens_to_ignore": ""}}
+    state = [
+        {"id": "current-datapoint", "property": "data", "value": {"text": "i am so happy today"}},
+        {"id": "counterfactual-generator", "property": "value", "value": "hotflip"},
+    ]
+    for gen in gen_names:
+        for field_name, field in xpl.cf_config_spec(gen).items():
+            default = ",".join(field.default) if isinstance(field, TokenListField) else field.default
+            value = overrides.get(gen, {}).get(field_name, default)
+            state.append({"id": f"counterfactual-cfg-{gen}-{field_name}", "property": "value", "value": value})
+
     gen_key = _find_callback_key(app, "counterfactual-results")
     r = _post_callback(
         app,
         gen_key,
         inputs=[{"id": "counterfactual-generate-btn", "property": "n_clicks", "value": 1}],
-        state=[
-            {"id": "current-datapoint", "property": "data", "value": {"text": "i am so happy today"}},
-            {"id": "counterfactual-cfg-num_examples", "property": "value", "value": 3},
-            {"id": "counterfactual-cfg-max_flips", "property": "value", "value": 2},
-            {"id": "counterfactual-cfg-tokens_to_ignore", "property": "value", "value": ""},
-        ],
+        state=state,
     )
     assert r.status_code == 200
     payload = r.get_json()["response"]
