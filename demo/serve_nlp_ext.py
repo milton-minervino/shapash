@@ -9,8 +9,9 @@ What *can* be avoided on every restart is recomputing the expensive stuff around
 model. This script caches both to ``--cache-dir`` (keyed by a hash of the input texts):
 
 * **SHAP contributions + predictions** — via the built-in ``compile(cache_dir=...)``.
-* **The 2-D PaCMAP projection** — via a small ``<hash>.proj.npy`` written here (the
-  library deliberately does not own a projection method).
+* **The text embeddings and the 2-D projection** — via ``compute_projection(cache_dir=...)``. The
+  library owns the embedding + caching (so the scatter and the similar-example neighbours are always
+  in the same space); this script only supplies the reducer, PaCMAP.
 
 The caching is automatic: each run **loads** the cache if one exists for these exact
 texts, otherwise it **computes and writes** it. So the first run is slow; every run after
@@ -46,9 +47,47 @@ substitution) and ``ablation`` (Captum ``FeatureAblation`` token removal) — an
 **method dropdown in the webapp**, so there is no CLI flag for them. They run live and are not cached.
 
 The on-disk cache mirrors these dependencies as a hierarchy under ``--cache-dir``:
-``<model>/<dataset>__<split>/`` holds the (backend-independent) ``<hash>.proj.npy`` projection, and a
-per-backend ``<...>/nlp_shap/`` or ``<...>/nlp_captum_lig/`` subdirectory holds that method's
-``<hash>.pkl`` contributions.
+``<model>/<dataset>__<split>/`` holds the (backend-independent) embedding-store artifacts — the
+vectors and the projection derived from them — and a per-backend ``<...>/nlp_shap/`` or
+``<...>/nlp_captum_lig/`` subdirectory holds that method's ``<hash>.pkl`` contributions.
+
+Serving a *custom* model (external-head checkpoints)
+----------------------------------------------------
+Any standard ``AutoModelForSequenceClassification`` checkpoint loads automatically from ``--model-name``
+alone (``load_model`` builds an ``HFClassifierModel``; label names come from ``config.id2label``). That
+covers every certified encoder architecture — BERT, DistilBERT, RoBERTa, XLM-R, DeBERTa-v1, and a MiniLM
+packaged as a sequence classifier.
+
+A model whose classification **head is custom** cannot be introspected from its name — its layer
+structure, weight-key convention, and input contract are non-standard (a sentence-transformer body + a
+separate MLP head, a SetFit head, a hand-rolled ``nn.Module``, …). These are served through the
+``MODEL_BUILDERS`` registry: a ``{--model-name: builder}`` map consulted *before* the generic path. To add
+one:
+
+1. Write a builder ``def build_x(config: ServeConfig, device: str) -> TextModel:`` that assembles the
+   right adapter and returns it. Put **all** model-specific code inside it — the core ``load_model`` never
+   changes. Pick the adapter by shape:
+
+   * **sentence-transformer body + head** → :class:`~shapash.model.SentenceTransformerModel` (pass the
+     ``sentence_transformers`` model + a *logits* head ``nn.Module``; drop any final ``softmax`` the head
+     applies — ``predict`` softmaxes and the LIG backend needs logit space; set ``pool=`` to the body's
+     pooling mode, usually ``"mean"``).
+   * **raw encoder body + head** (head not fused into an ``AutoModelForSequenceClassification``) →
+     :class:`~shapash.model.TorchClassifierModel` (pass ``body, head, tokenizer``; ``pool="cls"`` for a
+     CLS-pooled head, ``"mean"`` otherwise).
+   * **standard classifier that merely needs ``trust_remote_code``** → just call
+     ``HFClassifierModel(AutoModelForSequenceClassification.from_pretrained(name, trust_remote_code=True),
+     tokenizer)``.
+
+2. Register it: ``MODEL_BUILDERS["org/your-model"] = build_x``. Nothing else changes — caching, the
+   What-if Lab, both attribution backends, counterfactuals, and similar-examples all work through the
+   capability interface regardless of adapter.
+
+``_build_shhossain_sentiment_model`` (registered for
+``shhossain/all-MiniLM-L6-v2-sentiment-classifier``) is the worked example: a MiniLM ST body + a trained
+``fc1 -> relu -> fc2 -> relu -> out`` MLP head, ``trust_remote_code`` with no HF tokenizer, so the generic
+path can't touch it — but ``SentenceTransformerModel`` serves it faithfully (it reproduces the source
+model's predictions exactly).
 
 Usage
 -----
@@ -59,8 +98,11 @@ Usage
         --dataset-name sst2 --dataset-split validation --text-column sentence
     python demo/serve_nlp_ext.py --model-name lvwerra/distilbert-imdb --dataset-name stanfordnlp/imdb \\
         --label-column label --label-map '{"neg": "NEGATIVE", "pos": "POSITIVE"}'
+    # A registered custom (external-head) model — served via MODEL_BUILDERS, no other flags needed:
+    python demo/serve_nlp_ext.py --model-name shhossain/all-MiniLM-L6-v2-sentiment-classifier
 
-First run needs transformers, datasets and pacmap (the ``[nlp]`` extra).
+First run needs transformers, datasets and pacmap (the ``[nlp]`` extra). A ``SentenceTransformerModel``
+custom builder additionally needs the ``sentence-transformers`` package.
 """
 
 from __future__ import annotations
@@ -68,21 +110,22 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import datasets
-import numpy as np
 import pacmap
 import torch
 import transformers
+from torch import nn
 
 from shapash.backend import NlpCaptumLigBackend
 from shapash.explainer.nlp_explainer import (
     NlpExplainer,
     _hash_texts,  # same keying as the compile cache
 )
-from shapash.model import HFClassifierModel
+from shapash.model import HFClassifierModel, SentenceTransformerModel, TextModel
 
 _HERE = Path(__file__).parent
 
@@ -106,11 +149,13 @@ class ServeConfig:
     n: int = 500
     attribution: str = "shap"  # sentence-highlight method: "shap" | "lig" (Captum LayerIntegratedGradients)
     # Similar-examples reference corpus: the split neighbours are retrieved from (the model's own
-    # training split) and how many rows of it to bank. ``similarity_layer=None`` uses the model default
-    # (pre-classifier pooled vector). Set ``n_reference=0`` to disable the "Similar Examples" panel.
+    # training split) and how many rows of it to bank. Set ``n_reference=0`` to disable the "Similar
+    # Examples" panel.
     reference_split: str = "train"
     n_reference: int = 2000
-    similarity_layer: str | None = None
+    # Representation space the scatter projects *and* neighbours are ranked in — one setting for both,
+    # so they can never disagree. ``None`` keeps whatever the model was built with ("decision").
+    embedding_space: str | None = None
     cache_dir: Path = _HERE / "nlp_ext_cache"
     port: int = 8051
     host: str = "0.0.0.0"  # noqa: S104
@@ -192,9 +237,13 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
         help="Reference rows to bank for 'Similar Examples' (0 disables the panel).",
     )
     parser.add_argument(
-        "--similarity-layer",
-        default=defaults.similarity_layer,
-        help="Fully-qualified layer to compare in for similar-example retrieval (default: model's pre-classifier).",
+        "--embedding-space",
+        default=defaults.embedding_space,
+        help=(
+            "Representation space for the 2-D scatter and similar-example retrieval: 'decision' "
+            "(input to the final classification linear, class-discriminative), 'pooled' (the pooled "
+            "last hidden state, semantic), or any backbone submodule name. Default: the model's own."
+        ),
     )
     parser.add_argument("--cache-dir", type=Path, default=defaults.cache_dir)
     parser.add_argument("--port", type=int, default=defaults.port)
@@ -274,12 +323,84 @@ def _load_tokenizer(model_name: str):
             ) from slow_err
 
 
-def load_model(config: ServeConfig) -> HFClassifierModel:
-    """Load the tokenizer + classifier on the best available device.
+def _load_hf_classifier(config: ServeConfig, device: str) -> HFClassifierModel:
+    """The generic default: any standard ``AutoModelForSequenceClassification`` checkpoint.
 
-    Label names aren't passed explicitly: ``HFClassifierModel`` reads them from the model's
-    own ``config.id2label`` when none are given, so a new ``--model-name`` brings its own
-    classes automatically.
+    Covers every certified encoder architecture (BERT/DistilBERT/RoBERTa/XLM-R/DeBERTa-v1, and MiniLM
+    packaged as a sequence classifier). Label names come from the model's own ``config.id2label``, so a
+    new ``--model-name`` brings its own classes with no extra flags.
+    """
+    tokenizer = _load_tokenizer(config.model_name)
+    classifier = transformers.AutoModelForSequenceClassification.from_pretrained(config.model_name).to(device)
+    logger.info("Loaded %s as HFClassifierModel on device: %s", config.model_name, next(classifier.parameters()).device)
+    return HFClassifierModel(classifier, tokenizer)
+
+
+# Reconcile the shhossain checkpoint's own class label spelling with the dair-ai/emotion dataset it is
+# demoed against ("sad" -> "sadness"); every other class name already matches.
+_SHHOSSAIN_LABEL_ALIASES = {"sad": "sadness"}
+
+
+# ── Custom-model builders ──────────────────────────────────────────────────────────────────────────
+# Standard checkpoints load generically above. A model whose classification *head* is custom (its layer
+# structure / weight keys / IO contract are not a standard, so they can't be introspected from a name
+# alone) needs a per-model builder. Register one function per such checkpoint below; the generic path is
+# never touched. Each builder takes (config, device) and returns any TextModel adapter.
+
+
+def _build_shhossain_sentiment_model(config: ServeConfig, device: str) -> SentenceTransformerModel:
+    """Example builder — ``shhossain/all-MiniLM-L6-v2-sentiment-classifier`` (ST body + MLP head).
+
+    This checkpoint is a custom ``trust_remote_code`` model: a standard ``all-MiniLM-L6-v2`` body plus a
+    trained ``fc1 -> relu -> fc2 -> relu -> out -> softmax`` MLP head, and it ships no HF tokenizer — so the
+    generic HF path cannot load it. Everything model-specific (the head's weight-key convention, dropping
+    its final softmax to recover logits, mean pooling) is contained *here*, not in the core loader.
+    """
+    huggingface_hub = __import__("huggingface_hub")
+    sentence_transformers = __import__("sentence_transformers")
+    safetensors_torch = __import__("safetensors.torch", fromlist=["load_file"])
+
+    with open(huggingface_hub.hf_hub_download(config.model_name, "config.json")) as fh:
+        cfg = json.load(fh)
+    class_map = cfg["class_map"]
+    labels = [class_map[str(i)] for i in range(len(class_map))]
+    # This checkpoint's class_map spells one emotion as "sad" while its natural demo dataset
+    # (dair-ai/emotion) names the same class "sadness"; align them so predicted-vs-ground-truth
+    # comparisons in the webapp line up. (Same intent as the --label-map flag, but done here since
+    # the mismatch is intrinsic to this model's own labels, not a dataset choice.)
+    labels = [_SHHOSSAIN_LABEL_ALIASES.get(label, label) for label in labels]
+
+    st_model = sentence_transformers.SentenceTransformer(cfg["embedding_model"], device=device)
+    weights = safetensors_torch.load_file(huggingface_hub.hf_hub_download(config.model_name, "model.safetensors"))
+    # Rebuild the trained MLP as a *logits* head (sizes from weight shapes; the checkpoint's final softmax
+    # is dropped — SentenceTransformerModel.predict softmaxes and the LIG backend needs logit space).
+    head = nn.Sequential(
+        nn.Linear(weights["fc1.weight"].shape[1], weights["fc1.weight"].shape[0]),
+        nn.ReLU(),
+        nn.Linear(weights["fc2.weight"].shape[1], weights["fc2.weight"].shape[0]),
+        nn.ReLU(),
+        nn.Linear(weights["out.weight"].shape[1], weights["out.weight"].shape[0]),
+    )
+    for idx, name in ((0, "fc1"), (2, "fc2"), (4, "out")):
+        head[idx].load_state_dict({"weight": weights[f"{name}.weight"], "bias": weights[f"{name}.bias"]})
+    return SentenceTransformerModel(st_model, head.to(device).eval(), label_names=labels, pool="mean")
+
+
+# ``--model-name`` -> a custom builder for a checkpoint whose head can't be introspected from its name.
+# Anything not listed takes the generic ``_load_hf_classifier`` path. To serve a new custom model, add a
+# ``build(config, device) -> TextModel`` function above and one entry here — the core loader is untouched.
+# See the module docstring's "Serving a custom model" section for the per-adapter recipe.
+MODEL_BUILDERS: dict[str, Callable[[ServeConfig, str], TextModel]] = {
+    "shhossain/all-MiniLM-L6-v2-sentiment-classifier": _build_shhossain_sentiment_model,
+}
+
+
+def load_model(config: ServeConfig) -> TextModel:
+    """Load the model on the best available device: a registered custom builder, else the generic HF path.
+
+    Standard ``AutoModelForSequenceClassification`` checkpoints of any certified architecture load with no
+    configuration; a checkpoint whose head is custom (so it can't be introspected from its name) is built
+    by its entry in :data:`MODEL_BUILDERS`.
     """
     if torch.cuda.is_available():
         device = "cuda"
@@ -288,13 +409,11 @@ def load_model(config: ServeConfig) -> HFClassifierModel:
         device = "cpu"
         logger.info("No CUDA device found — using CPU")
 
-    tokenizer = _load_tokenizer(config.model_name)
-    classifier = transformers.AutoModelForSequenceClassification.from_pretrained(config.model_name).to(device)
-    logger.info("Loaded model %s on device: %s", config.model_name, next(classifier.parameters()).device)
-    return HFClassifierModel(classifier, tokenizer)
+    builder = MODEL_BUILDERS.get(config.model_name)
+    return builder(config, device) if builder is not None else _load_hf_classifier(config, device)
 
 
-def build_backend(config: ServeConfig, model: HFClassifierModel) -> NlpCaptumLigBackend | None:
+def build_backend(config: ServeConfig, model: TextModel) -> NlpCaptumLigBackend | None:
     """Return the attribution backend selected by ``--attribution``.
 
     Returns ``None`` for ``"shap"`` so ``NlpExplainer`` builds its default ``NlpShapBackend`` (which
@@ -306,25 +425,16 @@ def build_backend(config: ServeConfig, model: HFClassifierModel) -> NlpCaptumLig
     return None
 
 
-def load_or_project(sentences, model, cache_dir: Path, n_components: int = 2) -> np.ndarray:
-    """Return a 2-D PaCMAP projection, reading from / writing to ``cache_dir``.
+def build_reducer() -> pacmap.PaCMAP:
+    """The dimensionality reducer for the scatter — a *demo* choice, not a library one.
 
-    Cached alongside the ``compile`` results under the same text hash so a single
-    ``cache_dir`` holds everything the app needs after the first run.
+    ``NlpExplainer.compute_projection`` owns everything that must stay consistent (which space the
+    texts are embedded in, and the caching of both the vectors and the coordinates) and takes the
+    reducer as an argument, because which manifold method suits your data is a modelling decision.
+    PaCMAP is a good default for text clusters; swap in UMAP, t-SNE, or drop the argument entirely for
+    the built-in PCA.
     """
-    cache_file = cache_dir / f"{_hash_texts(list(sentences))}.proj.npy"
-    if cache_file.exists():
-        logger.info("Projection cache hit — loading %s", cache_file)
-        return np.load(cache_file)
-
-    logger.info("Projection cache miss — computing PaCMAP projection (embedding %d texts)", len(sentences))
-    projector = pacmap.PaCMAP(n_components=n_components, n_neighbors=5, MN_ratio=0.5, FP_ratio=2.0)
-    projected = projector.fit_transform(model.embed(sentences), init="pca")
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    np.save(cache_file, projected)
-    logger.info("Projection computed and cached to %s", cache_file)
-    return projected
+    return pacmap.PaCMAP(n_components=2, n_neighbors=5, MN_ratio=0.5, FP_ratio=2.0)
 
 
 def main() -> None:
@@ -347,12 +457,19 @@ def main() -> None:
         # selected backend's contributions are dropped; other backends' caches are left intact.
         logger.info("--recompute: dropping cached %s contributions + projection for these texts", config.attribution)
         (compile_dir / f"{text_hash}.pkl").unlink(missing_ok=True)
-        (dataset_dir / f"{text_hash}.proj.npy").unlink(missing_ok=True)
+        # The embeddings + projection are dropped by compute_projection(recompute=True) below, which
+        # knows their key; only the contributions pickle is this script's to manage.
 
     model = load_model(config)
+    if config.embedding_space is not None:
+        # One setting drives both the scatter projection and similar-example retrieval. Assigning it
+        # here (rather than threading it through every MODEL_BUILDERS entry) is safe because the
+        # setter validates the name against the backbone — a typo raises now, not mid-forward-pass.
+        model.embedding_space = config.embedding_space
+    logger.info("Embedding space: %s (scatter projection + similar examples)", model.resolve_space())
 
-    # Similar-examples reference corpus (the training split) + a cache dir for its activation bank,
-    # keyed by corpus/layer/model so it is embedded once and reloaded on later runs.
+    # Similar-examples reference corpus (the training split) + a cache dir for its embedding bank,
+    # keyed by corpus/space/model so it is embedded once and reloaded on later runs.
     reference_corpus = load_reference_corpus(config)
     similar_cache_dir = dataset_dir / "similar"
 
@@ -364,7 +481,6 @@ def main() -> None:
         label_names=model.label_names,
         backend=build_backend(config, model),
         reference_corpus=reference_corpus,
-        similarity_layer=config.similarity_layer,
         reference_cache_dir=similar_cache_dir,
     )
     # Both steps load from cache if one exists for these exact texts, otherwise they compute and write
@@ -379,7 +495,7 @@ def main() -> None:
             len(sentences),
         )
     xpl.compile(sentences, y_true=y_true, cache_dir=compile_dir)
-    projected = load_or_project(sentences, model, dataset_dir)
+    projected = xpl.compute_projection(reducer=build_reducer(), cache_dir=dataset_dir, recompute=config.recompute)
 
     if xpl.can_find_similar():
         # Build (and cache) the reference activation bank now so the first in-app lookup is instant.
