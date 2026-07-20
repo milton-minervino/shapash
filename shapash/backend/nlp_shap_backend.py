@@ -124,7 +124,10 @@ class NlpShapBackend(NlpBackend):
         elif self.explainer_args:
             self.explainer = shap.Explainer(**self.explainer_args)
         else:
-            self.explainer = shap.Explainer(model)
+            # ``masker=None`` lets SHAP auto-infer a Text masker from a transformers pipeline (the
+            # HFClassifierModel/pipeline path); an explicit masker is required when ``model`` is a plain
+            # scoring callable (external-head models expose one via ``TextModel.shap_masker``).
+            self.explainer = shap.Explainer(model, masker=self.masker)
 
     def run_explainer(self, x) -> NlpRawExplanation:
         """Run the SHAP text explainer and return all explanation components.
