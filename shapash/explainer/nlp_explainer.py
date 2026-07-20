@@ -18,16 +18,19 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from plotly import graph_objs as go
+from sklearn.decomposition import PCA
 
 from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 from shapash.backend.nlp_shap_backend import NlpShapBackend
+from shapash.compute.embedding_store import EmbeddingStore
 from shapash.compute.generators.ablation_flip import AblationFlipGenerator
 from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
 from shapash.compute.generators.hotflip import HotFlipGenerator
 from shapash.compute.retrieval.similar_examples import Neighbor, SimilarExampleRetriever
-from shapash.model.base import SupportsActivations, TextModel, has_capabilities
+from shapash.model.base import SupportsEmbeddings, TextModel, has_capabilities
 from shapash.model.hf import HFPipelineModel
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.webapp.nlp_app import NlpWebApp
@@ -52,6 +55,22 @@ def _hash_texts(text_list: list[str]) -> str:
 
 def _cache_file(data_hash: str, cache_dir: Path) -> Path:
     return cache_dir / f"{data_hash}.pkl"
+
+
+def _reducer_tag(reducer: object) -> str:
+    """Name a reducer for a cache tag: its class plus a digest of its parameters when it exposes them.
+
+    Two runs of the same reducer class with different settings produce different coordinates, so the
+    class name alone would silently reload the wrong scatter. ``get_params()`` (sklearn's convention,
+    which ``pacmap`` also follows) makes the settings part of the tag. A reducer without it is keyed by
+    class name only — documented on :meth:`NlpExplainer.compute_projection` as needing ``recompute``.
+    """
+    name = type(reducer).__name__.lower()
+    get_params = getattr(reducer, "get_params", None)
+    if get_params is None:
+        return name
+    digest = hashlib.md5(repr(sorted(get_params().items())).encode(), usedforsecurity=False).hexdigest()
+    return f"{name}-{digest[:8]}"
 
 
 @dataclass
@@ -130,15 +149,15 @@ class NlpExplainer:
         Forwarded to ``NlpShapBackend.__init__`` when no ``backend`` is given.
     reference_corpus : tuple[list[str], list[str] or None], optional
         ``(texts, labels)`` reference pool for similar-example retrieval — typically the
-        model's training set. When given *and* the model supports layer activations, the webapp gains
-        a "Similar Examples" panel that retrieves the most similar reference examples for the
-        selected/edited text. ``labels`` may be ``None``. Ignored when the model cannot expose
-        activations (e.g. a prediction-only pipeline).
-    similarity_layer : str, optional
-        Fully-qualified layer name to compare in for similar-example retrieval. Defaults to the model's
-        ``default_activation_layer`` (the pre-classifier pooled vector for ``HFClassifierModel``).
+        model's training set. When given *and* the model supports embeddings, the webapp gains a
+        "Similar Examples" panel that retrieves the most similar reference examples for the
+        selected/edited text. ``labels`` may be ``None``. Ignored when the model cannot embed
+        (e.g. a prediction-only pipeline).
+        Neighbours are compared in the model's own ``embedding_space``. To compare in a different
+        space, set the model's ``embedding_space`` — that moves the neighbours and any scatter built
+        by :meth:`compute_projection` together, since both read the space through the same store.
     reference_cache_dir : str or Path, optional
-        When given, the reference activation bank is persisted here and reloaded on later runs, so
+        When given, the reference embedding bank is persisted here and reloaded on later runs, so
         only the first launch pays the (one-off) cost of embedding the reference corpus.
 
     Examples
@@ -163,7 +182,6 @@ class NlpExplainer:
         explainer_args: dict | None = None,
         explainer_compute_args: dict | None = None,
         reference_corpus: tuple[list[str], list[str] | None] | None = None,
-        similarity_layer: str | None = None,
         reference_cache_dir: str | Path | None = None,
     ) -> None:
         self.model = model
@@ -181,11 +199,15 @@ class NlpExplainer:
         else:
             self._text_model = None
 
-        # The SHAP/LIME backend consumes a plain callable; a TextModel exposes it via shap_callable.
+        # The SHAP/LIME backend consumes a plain callable; a TextModel exposes it via shap_callable and
+        # its companion masker via shap_masker (``None`` for a pipeline-backed model, which SHAP can
+        # infer a Text masker from; an explicit one when shap_callable is a bare scoring function).
         shap_model = self._text_model.shap_callable if self._text_model is not None else model
+        shap_masker = self._text_model.shap_masker if self._text_model is not None else None
         self.backend: NlpBackend = backend or NlpShapBackend(
             model=shap_model,
             label_names=self.label_names,
+            masker=shap_masker,
             explainer_args=explainer_args or {},
             explainer_compute_args=explainer_compute_args or {},
         )
@@ -206,17 +228,16 @@ class NlpExplainer:
         self.cf_generators: dict[str, CounterfactualGenerator] = {g.name: g for g in generators}
         self.cf_generator: CounterfactualGenerator | None = generators[0] if generators else None
 
-        # Similar-example retrieval: only when a reference corpus is supplied AND the model
-        # can expose layer activations (a prediction-only pipeline cannot) — otherwise the panel gates
-        # itself off, mirroring how counterfactuals require a gradient-capable model.
+        # Similar-example retrieval: only when a reference corpus is supplied AND the model can embed
+        # (a prediction-only pipeline cannot) — otherwise the panel gates itself off, mirroring how
+        # counterfactuals require a gradient-capable model.
         self._retriever: SimilarExampleRetriever | None = None
-        if reference_corpus is not None and has_capabilities(self._text_model, SupportsActivations):
+        if reference_corpus is not None and has_capabilities(self._text_model, SupportsEmbeddings):
             ref_texts, ref_labels = reference_corpus
             self._retriever = SimilarExampleRetriever(
                 self._text_model,  # type: ignore[arg-type]  # has_capabilities narrows the capability
                 reference_texts=ref_texts,
                 reference_labels=ref_labels,
-                layer=similarity_layer,
                 cache_dir=reference_cache_dir,
             )
 
@@ -332,6 +353,65 @@ class NlpExplainer:
 
         return plot_token_highlight(tokens=tokens, values=values, title=title, max_tokens=max_tokens)
 
+    def compute_projection(self, reducer=None, cache_dir: str | Path | None = None, recompute: bool = False):
+        """Return a 2-D projection of the compiled texts, ready to pass to :meth:`run_app`.
+
+        The library owns the parts that must stay consistent — *which* space the texts are embedded in
+        and how that is cached — while the caller injects the dimensionality reducer, which is a
+        modelling choice shapash has no business picking for you. Embedding goes through the model's
+        current ``embedding_space``, so the scatter and the similar-example neighbours are guaranteed
+        to sit in the same space; they even share the cached vectors.
+
+        Parameters
+        ----------
+        reducer : object, optional
+            Anything with ``fit_transform(X) -> (n_samples, 2)`` — ``sklearn`` PCA/TSNE, ``pacmap``,
+            ``umap``. Defaults to :class:`sklearn.decomposition.PCA` with two components (sklearn is
+            already a core dependency, so the default costs no extra install).
+        cache_dir : str or Path, optional
+            When given, both the embeddings and the projected coordinates are persisted here and
+            reloaded on later runs, so only the first call pays the cost. The key covers the model, the
+            effective space, the texts, and the reducer's class + parameters.
+        recompute : bool, optional
+            Drop this text set's cached artifacts first, forcing a fresh embed + fit.
+
+        Returns
+        -------
+        np.ndarray, shape (n_samples, 2)
+            Coordinates aligned with the compiled texts.
+
+        Notes
+        -----
+        The reducer's contribution to the cache key is its class name plus a digest of ``get_params()``
+        when it exposes one (sklearn and pacmap both do). A reducer with neither is keyed by class name
+        alone, so re-tuning such a reducer needs ``recompute=True`` to take effect.
+
+        Examples
+        --------
+        >>> xpl.compile(texts)
+        >>> xy = xpl.compute_projection(reducer=pacmap.PaCMAP(n_components=2), cache_dir="cache/")
+        >>> xpl.run_app(scatter_xy=xy)
+        """
+        if self.texts is None:
+            raise RuntimeError("Call compile() before compute_projection().")
+        text_model = self._require_text_model()
+        if not has_capabilities(text_model, SupportsEmbeddings):
+            raise TypeError(
+                f"{type(text_model).__name__} does not support embeddings (SupportsEmbeddings); "
+                "pass pre-computed coordinates to run_app(scatter_xy=...) instead."
+            )
+        if reducer is None:
+            reducer = PCA(n_components=2)
+
+        store = EmbeddingStore(text_model, self.texts.tolist(), cache_dir=cache_dir)
+        if recompute:
+            store.clear()
+        with self._compute_guard():  # embed() tokenizes — serialize against the live compute ops
+            return store.cached_array(
+                f"{_reducer_tag(reducer)}.proj",
+                lambda: np.asarray(reducer.fit_transform(store.vectors())),
+            )
+
     def save_snapshot(self, path: str | Path, scatter_xy=None) -> None:
         """Persist compiled results (no model or backend) for offline serving.
 
@@ -402,12 +482,18 @@ class NlpExplainer:
         debug : bool
             Enable Dash debug mode (hot reload, error overlay).
         scatter_xy : np.ndarray, optional
-            Pre-computed 2-D projection of the text samples, shape
-            ``(n_samples, 2)``.  When provided, a scatter panel appears in the
-            webapp that can be used to lasso/box-select a subset of samples,
-            filtering both the dataset table and the global word importance
-            plot to that subset.  Compute with any projection method
-            (PaCMAP, UMAP, PCA, t-SNE …) and pass the result here.
+            Pre-computed 2-D projection of the text samples, shape ``(n_samples, 2)``. When provided, a
+            scatter panel appears in the webapp that can be used to lasso/box-select a subset of
+            samples, filtering both the dataset table and the global word importance plot to that
+            subset.
+
+            Prefer :meth:`compute_projection`, whose output goes here and which guarantees the scatter
+            is drawn in the same space the similar-example neighbours are ranked in. This parameter is
+            an **unverified escape hatch**: coordinates from any source are accepted as-is, so a
+            projection built from a different space (or a different model entirely) renders happily
+            next to neighbours computed in another — selecting a cluster then means something other
+            than it appears to. Use it when you want coordinates the library cannot produce, and
+            accept that keeping them consistent is yours to manage.
         """
         if self.contributions is None:
             raise RuntimeError("Call compile() before run_app().")
@@ -437,14 +523,14 @@ class NlpExplainer:
         return getattr(self, "cf_generator", None) is not None
 
     def can_find_similar(self) -> bool:
-        """Whether similar-example retrieval is available (a reference corpus + activation-capable model).
+        """Whether similar-example retrieval is available (a reference corpus + embedding-capable model).
 
         ``False`` after ``from_snapshot`` (no model) or when no ``reference_corpus`` was supplied.
         """
         return getattr(self, "_retriever", None) is not None
 
     def find_similar(self, text: str, top_k: int = 5) -> list[Neighbor]:
-        """Return the reference examples most similar to ``text`` in the similarity layer's space.
+        """Return the reference examples most similar to ``text`` in the model's embedding space.
 
         Parameters
         ----------
@@ -461,10 +547,9 @@ class NlpExplainer:
         retriever = getattr(self, "_retriever", None)
         if retriever is None:
             raise RuntimeError(
-                "find_similar() requires a reference_corpus and an activation-capable model "
-                "(unavailable on a snapshot)."
+                "find_similar() requires a reference_corpus and an embedding-capable model (unavailable on a snapshot)."
             )
-        with self._compute_guard():  # activations() tokenizes — serialize against explain_text/predict
+        with self._compute_guard():  # embed() tokenizes — serialize against explain_text/predict
             return retriever.query(text, top_k=top_k)
 
     def predict(self, text: str) -> tuple[str, dict[str, float]]:

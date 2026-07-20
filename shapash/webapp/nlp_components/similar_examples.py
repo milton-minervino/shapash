@@ -7,9 +7,9 @@ similarity, its label, whether that label matches the current prediction, its te
 button that (mirroring the counterfactual panel) re-explains that example live and makes it the current
 datapoint, so its token contributions render immediately in the Sentence/Waterfall panels.
 
-The lookup is one forward pass against a precomputed activation bank, so it runs live on every
+The lookup is one forward pass against a precomputed embedding bank, so it runs live on every
 selection change. Gated by ``CAP_SIMILAR`` + ``CAP_PREDICT``: mounts only when the explainer holds a
-reference corpus and a live, activation-capable model (self-disables on a snapshot or a
+reference corpus and a live, embedding-capable model (self-disables on a snapshot or a
 prediction-only pipeline).
 """
 
