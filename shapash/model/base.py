@@ -5,12 +5,13 @@ probability matrix. Optional *capabilities* are expressed as separate mixin ABCs
 component can require exactly what it needs and no more:
 
 * ``SupportsTokenization`` — split text into tokens and rebuild text from tokens.
-* ``SupportsEmbeddings`` — expose the input-embedding table and mean-pooled sentence embeddings.
+* ``SupportsEmbeddings`` — expose the input-embedding table and one dense vector per text, in a
+  caller-selectable *representation space* (see :meth:`SupportsEmbeddings.embed`). This single
+  capability backs both the 2-D projection scatter and similar-example retrieval, which agree only
+  as far as they both go through it — see the caveat on :class:`SupportsEmbeddings`.
 * ``SupportsGradients`` — expose per-token gradients of a target-class logit.
 * ``SupportsCaptumIG`` — expose the embedding module + a logits forward pass so a layer-attribution
   method (Captum ``LayerIntegratedGradients``) can attribute through the embeddings.
-* ``SupportsActivations`` — expose a named intermediate layer's activation as one dense vector per
-  text, so similar-example retrieval can compare a query against a corpus in that layer's space.
 
 A prediction-only model (e.g. a HuggingFace pipeline) implements only ``TextModel``; a raw
 classifier with tokenizer access implements all three. Generators check compatibility with
@@ -21,7 +22,7 @@ concrete class — this is what keeps HotFlip and friends model-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -62,6 +63,28 @@ class TextModel(ABC):
         """Number of classes, or ``None`` when unknown before the first prediction."""
         return len(self.label_names) if self.label_names is not None else None
 
+    @property
+    def shap_masker(self) -> Any:
+        """Masker SHAP should use, or ``None`` to let SHAP infer one from :attr:`shap_callable`.
+
+        SHAP's text explainer needs a scoring function *and* a way to segment/mask the text. When
+        ``shap_callable`` is a ``transformers`` pipeline SHAP infers a ``Text`` masker from it, so the
+        default ``None`` is correct. Adapters whose ``shap_callable`` is a plain callable (no tokenizer
+        for SHAP to find) must override this and return an explicit ``shap.maskers.Text``.
+        """
+        return None
+
+    @property
+    def model_id(self) -> str:
+        """Stable identity for this adapter *and its configuration*, for cache keys.
+
+        Anything that changes the vectors or scores a downstream cache stores must appear here —
+        otherwise two differently-configured models collide on the same cache entry and silently reload
+        each other's results. The default is the class name alone, which is only safe for an adapter with
+        no configuration; :class:`~shapash.model.encoder.EncoderClassifierModel` overrides it.
+        """
+        return type(self).__name__
+
 
 class SupportsTokenization(ABC):
     """Capability: split text into tokens and rebuild text from tokens."""
@@ -76,15 +99,65 @@ class SupportsTokenization(ABC):
 
 
 class SupportsEmbeddings(ABC):
-    """Capability: expose the input-embedding table and mean-pooled sentence embeddings."""
+    """Capability: expose the input-embedding table and one dense vector per text.
+
+    :meth:`embed` is the single entry point for *"give me a vector per text in some representation
+    space"* — the space is a parameter, not a separate capability. Everything downstream that compares
+    or projects texts (the 2-D projection scatter, similar-example retrieval) is expected to go
+    through it, so that changing the model's space moves them together.
+
+    That agreement is a **convention, not a guarantee**: a caller who computes its own coordinates and
+    hands them to the webapp (``run_app(scatter_xy=...)``) bypasses this entirely, and nothing detects
+    it. Use :meth:`~shapash.explainer.nlp_explainer.NlpExplainer.compute_projection`, which derives the
+    scatter from this method, unless you specifically want a space of your own choosing.
+    """
 
     @abstractmethod
     def get_embedding_table(self) -> tuple[list[str], np.ndarray]:
         """Return ``(vocab, matrix)`` where ``matrix`` has shape ``(vocab_size, hidden_dim)``."""
 
+    def resolve_space(self, space: str | None = None) -> str:
+        """Return the name of the space :meth:`embed` will actually use for ``space``.
+
+        Everything that caches embeddings must key on the *effective* space, not on the argument it was
+        given — otherwise ``None`` (meaning "the adapter's default") collides with whatever that default
+        currently is, and a cache entry from one space is silently reloaded for another. This is the one
+        place that resolution happens; callers must not reimplement it.
+
+        Parameters
+        ----------
+        space : str or None, optional
+            The space a caller asked for, or ``None`` for the adapter's default.
+
+        Returns
+        -------
+        str
+            A concrete space name, never ``None``. The base implementation has no notion of a default
+            space and reports ``"default"``; adapters with a configurable one (e.g.
+            :class:`~shapash.model.encoder.EncoderClassifierModel`) override this.
+        """
+        return space if space is not None else "default"
+
     @abstractmethod
-    def embed(self, texts: list[str]) -> np.ndarray:
-        """Return one dense vector per text, shape ``(n_texts, hidden_dim)``."""
+    def embed(self, texts: list[str], space: str | None = None) -> np.ndarray:
+        """Return one dense vector per text, shape ``(n_texts, hidden_dim)``.
+
+        Parameters
+        ----------
+        texts : list of str
+            Input strings.
+        space : str or None, optional
+            Which representation to return. When ``None`` (default), the adapter's configured default
+            space is used. Adapters are free to define their own space names; the shared
+            :class:`~shapash.model.encoder.EncoderClassifierModel` vocabulary is ``"decision"`` (input
+            to the final classification linear), ``"pooled"`` (the pooled last hidden state), or any
+            named submodule of the model, whose token-level output is pooled to one vector per text.
+
+        Returns
+        -------
+        np.ndarray, shape (n_texts, hidden_dim)
+            Dense vectors aligned to ``texts``. The dimension depends on ``space``.
+        """
 
 
 class SupportsGradients(ABC):
@@ -170,39 +243,32 @@ class SupportsCaptumIG(ABC):
         return None
 
 
-class SupportsActivations(ABC):
-    """Capability: expose a named intermediate layer's activation as one dense vector per text.
+@runtime_checkable
+class EmbeddingSource(Protocol):
+    """Structural type for the surface an embedding *cache* consumes.
 
-    This is the surface similar-example retrieval needs: it builds a bank of activation vectors
-    over a reference corpus and compares a query's vector against it (e.g. by cosine similarity) to
-    retrieve the most similar examples. Kept separate from :class:`SupportsEmbeddings` — whose
-    ``embed`` is fixed to the last hidden state — because retrieval wants a *configurable*,
-    decision-relevant layer (e.g. the pre-classifier pooled vector), not a fixed one.
+    Caching embeddings needs strictly more than :class:`SupportsEmbeddings`: besides ``embed`` and
+    ``resolve_space`` it needs ``model_id``, which lives on :class:`TextModel`. Neither ABC alone
+    describes that, and merging them would make ``model_id`` a capability concern or ``embed`` a
+    base-model one — both wrong. This ``Protocol`` names the intersection without moving anything.
+
+    It is a *typing* aid, not a gate. Components still admit a model by capability
+    (``has_capabilities(model, SupportsEmbeddings)``); every adapter that passes that check is a
+    ``TextModel`` too, so it satisfies this protocol by construction.
     """
 
     @property
-    @abstractmethod
-    def default_activation_layer(self) -> str:
-        """Fully-qualified name of the layer used when :meth:`activations` is called with ``layer=None``."""
+    def model_id(self) -> str:
+        """Stable identity of the model and its configuration (see :attr:`TextModel.model_id`)."""
+        ...
 
-    @abstractmethod
-    def activations(self, texts: list[str], layer: str | None = None) -> np.ndarray:
-        """Return one activation vector per text at ``layer``, shape ``(n_texts, hidden_dim)``.
+    def resolve_space(self, space: str | None = None) -> str:
+        """Name of the space :meth:`embed` will actually use (see :meth:`SupportsEmbeddings.resolve_space`)."""
+        ...
 
-        Parameters
-        ----------
-        texts : list of str
-            Input strings.
-        layer : str or None
-            Fully-qualified module name whose output is captured. When ``None``,
-            :attr:`default_activation_layer` is used. A token-level ``(n_tokens, hidden)`` layer
-            output is mean-pooled (respecting the attention mask) down to one vector per text.
-
-        Returns
-        -------
-        np.ndarray, shape (n_texts, hidden_dim)
-            Dense activation vectors aligned to ``texts``.
-        """
+    def embed(self, texts: list[str], space: str | None = None) -> np.ndarray:
+        """One dense vector per text (see :meth:`SupportsEmbeddings.embed`)."""
+        ...
 
 
 def has_capabilities(model: object, *capabilities: type) -> bool:
