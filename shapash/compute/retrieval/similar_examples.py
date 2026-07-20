@@ -1,15 +1,16 @@
-"""Similar-example retrieval: nearest reference examples in a layer's activation space.
+"""Similar-example retrieval: nearest reference examples in a model's representation space.
 
 For a prediction, this retrieves the reference-corpus examples whose internal representation is most
 similar to the query's — the examples the model treats most alike. It is the in-house counterpart of
 Captum's ``SimilarityInfluence``, reimplemented over the capability-based model layer
-(:class:`~shapash.model.base.SupportsActivations`) so it needs no per-model wiring and carries none of
+(:class:`~shapash.model.base.SupportsEmbeddings`) so it needs no per-model wiring and carries none of
 Captum 0.9.0's single-layer / short-final-batch quirks. The cost splits cleanly:
 
-* **Bank** — one activation vector per reference example, computed once and cached to a single ``.npy``
-  matrix (keyed by the corpus hash, layer, and model id). This is the expensive, amortizable part.
-* **Query** — one activation vector for the query text, then cosine similarity against the bank and a
-  top-k selection. Milliseconds, so it runs live per selection in the webapp.
+* **Bank** — one vector per reference example, computed once and cached by
+  :class:`~shapash.compute.embedding_store.EmbeddingStore` (keyed by the corpus hash, space, and model
+  id). This is the expensive, amortizable part, and the same cache the 2-D scatter draws from.
+* **Query** — one vector for the query text, then cosine similarity against the bank and a top-k
+  selection. Milliseconds, so it runs live per selection in the webapp.
 
 This is a *representation-similarity* (nearest-neighbour) method, **not** a leave-one-out / influence-
 function measure: it surfaces the examples most alike in decision space, a cheap and faithful proxy for
@@ -18,13 +19,16 @@ function measure: it surfaces the examples most alike in decision space, a cheap
 
 from __future__ import annotations
 
-import hashlib
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from shapash.model.base import SupportsActivations, has_capabilities
+from shapash.compute.embedding_store import EmbeddingStore
+from shapash.model.base import EmbeddingSource, SupportsEmbeddings, has_capabilities
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,7 +40,7 @@ class Neighbor:
     index : int
         Position of the example within the reference corpus.
     score : float
-        Cosine similarity to the query in the chosen layer's activation space (higher = more similar).
+        Cosine similarity to the query in the model's representation space (higher = more similar).
     text : str
         The reference example's text.
     label : str or None
@@ -49,33 +53,37 @@ class Neighbor:
     label: str | None = None
 
 
-def _hash_corpus(texts: list[str], layer: str, model_id: str) -> str:
-    """Stable cache key over the corpus texts + layer + model id (order-sensitive)."""
-    h = hashlib.md5(usedforsecurity=False)
-    h.update(f"{model_id}\0{layer}\0".encode())
-    for t in texts:
-        h.update(t.encode())
-        h.update(b"\0")
-    return h.hexdigest()
-
-
 class SimilarExampleRetriever:
-    """Retrieve the reference examples most similar to a query in a model layer's activation space.
+    """Retrieve the reference examples most similar to a query in the model's representation space.
 
     Parameters
     ----------
-    model : SupportsActivations
-        A model exposing :meth:`~shapash.model.base.SupportsActivations.activations`.
+    model : EmbeddingSource
+        A model exposing :meth:`~shapash.model.base.SupportsEmbeddings.embed` plus the identity and
+        space resolution the embedding cache keys on (see
+        :class:`~shapash.model.base.EmbeddingSource`). Admission is still checked by *capability*
+        (``SupportsEmbeddings``) below.
     reference_texts : list[str]
         The corpus to retrieve from (typically the model's training set).
     reference_labels : list[str] or None, optional
         Labels aligned with ``reference_texts`` — surfaced on each :class:`Neighbor` when present.
-    layer : str or None, optional
-        Fully-qualified layer name to compare in. Defaults to the model's
-        :attr:`~shapash.model.base.SupportsActivations.default_activation_layer`.
     cache_dir : str or Path or None, optional
-        When given, the activation bank is persisted to ``<cache_dir>/<hash>.sim.npy`` and reloaded
-        on later runs (keyed by the corpus + layer + model id), so only the first build pays the cost.
+        When given, the reference embeddings are persisted here by
+        :class:`~shapash.compute.embedding_store.EmbeddingStore` and reloaded on later runs, so only
+        the first build pays the cost.
+
+    Notes
+    -----
+    The comparison space is deliberately **not** a parameter here: it is whatever the model's
+    :attr:`~shapash.model.encoder.EncoderClassifierModel.embedding_space` currently is. Letting a
+    caller override it per-retriever allowed the scatter and the neighbours to sit in different spaces
+    — you would select a cluster in one space and rank neighbours in another, with nothing saying so.
+    Change the model's space to move both together.
+
+    This matches the 2-D scatter *when the scatter is built by*
+    :meth:`~shapash.explainer.nlp_explainer.NlpExplainer.compute_projection`, which reads the same
+    space through the same :class:`~shapash.compute.embedding_store.EmbeddingStore`. Coordinates passed
+    in by hand via ``run_app(scatter_xy=...)`` are outside that guarantee.
 
     Examples
     --------
@@ -86,16 +94,15 @@ class SimilarExampleRetriever:
 
     def __init__(
         self,
-        model: SupportsActivations,
+        model: EmbeddingSource,
         reference_texts: list[str],
         reference_labels: list[str] | None = None,
-        layer: str | None = None,
         cache_dir: str | Path | None = None,
     ) -> None:
-        if not has_capabilities(model, SupportsActivations):
+        if not has_capabilities(model, SupportsEmbeddings):
             raise TypeError(
-                f"{type(model).__name__} does not support layer activations "
-                "(SupportsActivations); similar-example retrieval is unavailable."
+                f"{type(model).__name__} does not support embeddings (SupportsEmbeddings); "
+                "similar-example retrieval is unavailable."
             )
         if reference_labels is not None and len(reference_labels) != len(reference_texts):
             raise ValueError(
@@ -105,8 +112,7 @@ class SimilarExampleRetriever:
         self.model = model
         self.reference_texts = list(reference_texts)
         self.reference_labels = list(reference_labels) if reference_labels is not None else None
-        self.layer = layer or model.default_activation_layer
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.store = EmbeddingStore(model, self.reference_texts, cache_dir=cache_dir)
         self._bank: np.ndarray | None = None  # (n_reference, hidden), L2-normalized rows
 
     @property
@@ -114,31 +120,23 @@ class SimilarExampleRetriever:
         """Number of reference examples."""
         return len(self.reference_texts)
 
-    def _cache_file(self) -> Path | None:
-        """Path of the on-disk bank for this corpus/layer/model, or ``None`` when caching is off."""
-        if self.cache_dir is None:
-            return None
-        model_id = getattr(self.model, "model_id", None) or type(self.model).__name__
-        return self.cache_dir / f"{_hash_corpus(self.reference_texts, self.layer, str(model_id))}.sim.npy"
-
     def build(self) -> None:
-        """Compute (or load) and L2-normalize the reference activation bank.
+        """Compute (or load) and L2-normalize the reference embedding bank.
 
         Called automatically on the first :meth:`query`; call it up front to pay the cost eagerly
-        (e.g. at app start). Rows are stored L2-normalized so a query becomes a single matrix-vector
-        product. Idempotent — a second call is a no-op once the bank is in memory.
+        (e.g. at app start). The raw vectors come from the shared
+        :class:`~shapash.compute.embedding_store.EmbeddingStore`; normalization is applied here rather
+        than cached, since it is a single cheap pass and keeps the stored artifact the plain embeddings
+        that other consumers (e.g. the scatter projection) can reuse. Rows end up unit-norm so a query
+        is a single matrix-vector product. Idempotent.
         """
         if self._bank is not None:
             return
-        cache_file = self._cache_file()
-        if cache_file is not None and cache_file.exists():
-            self._bank = np.load(cache_file)
-            return
-        raw = self.model.activations(self.reference_texts, self.layer)
-        self._bank = _l2_normalize(raw)
-        if cache_file is not None:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            np.save(cache_file, self._bank)
+        self._bank = _l2_normalize(self.store.vectors())
+
+    def _encode(self, texts: list[str]) -> np.ndarray:
+        """Embed ``texts`` in the model's configured space — the same one the scatter projects."""
+        return self.model.embed(texts)
 
     def query(self, text: str, top_k: int = 5) -> list[Neighbor]:
         """Return the ``top_k`` reference examples most similar to ``text``, most-similar first.
@@ -157,7 +155,7 @@ class SimilarExampleRetriever:
         """
         self.build()
         assert self._bank is not None  # noqa: S101 - build() guarantees this
-        query_vec = _l2_normalize(self.model.activations([text], self.layer))[0]
+        query_vec = _l2_normalize(self._encode([text]))[0]
         sims = self._bank @ query_vec  # cosine, rows already unit-norm
         k = max(1, min(top_k, self.size))
         # argpartition for the top-k, then sort just those descending.
