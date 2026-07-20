@@ -7,6 +7,7 @@ not required — synthetic NlpContributions data is used throughout so the suite
 runs in CI without transformers/datasets.
 """
 
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -441,6 +442,121 @@ class TestNlpExplainer(unittest.TestCase):
     def test_y_true_is_none_by_default(self):
         xpl = _make_explainer(compiled=True)
         self.assertIsNone(xpl.y_true)
+
+
+class _ProjectableModel(TextModel, SupportsEmbeddings):
+    """Embeds each text to a deterministic 3-D point; counts calls so cache hits are observable."""
+
+    def __init__(self, space="decision"):
+        super().__init__(label_names=LABEL_NAMES[:2])
+        self.space = space
+        self.calls = 0
+
+    def resolve_space(self, space=None):
+        return space if space is not None else self.space
+
+    def predict(self, texts):
+        return np.tile([0.4, 0.6], (len(texts), 1))
+
+    def get_embedding_table(self):
+        return (["a"], np.zeros((1, 3)))
+
+    def embed(self, texts, space=None):
+        self.calls += 1
+        return np.array([[float(len(t)), float(t.count("a")), 1.0] for t in texts])
+
+    @property
+    def shap_callable(self):
+        return self.predict
+
+
+class _CountingReducer:
+    """A reducer with sklearn's ``get_params`` surface, so its settings reach the cache tag."""
+
+    def __init__(self, scale=1.0):
+        self.scale = scale
+        self.fits = 0
+
+    def get_params(self, deep=True):
+        return {"scale": self.scale}
+
+    def fit_transform(self, x):
+        self.fits += 1
+        return np.asarray(x)[:, :2] * self.scale
+
+
+class TestComputeProjection(unittest.TestCase):
+    """The library owns the space + the caching; the caller injects only the reducer."""
+
+    def setUp(self):
+        self.model = _ProjectableModel()
+        self.xpl = NlpExplainer(self.model, backend=object())
+        self.xpl.texts = pd.Series(["alpha", "beta banana", "gamma"])
+
+    def test_returns_two_columns_aligned_with_the_texts(self):
+        xy = self.xpl.compute_projection()
+        self.assertEqual(xy.shape, (3, 2))
+
+    def test_defaults_to_pca_without_any_extra_dependency(self):
+        """The default reducer must be something a core install already has — sklearn's PCA."""
+        xy = self.xpl.compute_projection()
+        self.assertEqual(xy.shape, (3, 2))
+        self.assertEqual(self.model.calls, 1)
+
+    def test_injected_reducer_is_used(self):
+        reducer = _CountingReducer(scale=2.0)
+        xy = self.xpl.compute_projection(reducer=reducer)
+        self.assertEqual(reducer.fits, 1)
+        np.testing.assert_allclose(xy[0], [10.0, 4.0])  # "alpha": len 5, 2 a's, doubled
+
+    def test_raises_before_compile(self):
+        xpl = NlpExplainer(_ProjectableModel(), backend=object())
+        with self.assertRaises(RuntimeError):
+            xpl.compute_projection()
+
+    def test_raises_for_a_model_that_cannot_embed(self):
+        """A prediction-only model gets a clear error pointing at the escape hatch, not an AttributeError."""
+        xpl = NlpExplainer(_TokenizeOnlyModel(), backend=object())
+        xpl.texts = pd.Series(["alpha", "beta"])
+        with self.assertRaises(TypeError):
+            xpl.compute_projection()
+
+    def test_cached_across_instances(self):
+        with tempfile.TemporaryDirectory() as d:
+            reducer = _CountingReducer()
+            self.xpl.compute_projection(reducer=reducer, cache_dir=d)
+
+            fresh_model = _ProjectableModel()
+            fresh = NlpExplainer(fresh_model, backend=object())
+            fresh.texts = self.xpl.texts
+            fresh.compute_projection(reducer=reducer, cache_dir=d)
+            self.assertEqual(fresh_model.calls, 0)  # neither embedded
+            self.assertEqual(reducer.fits, 1)  # nor re-fitted
+
+    def test_reducer_settings_take_part_in_the_key(self):
+        """Re-tuning a reducer must not silently reload the previous scatter."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self.xpl.compute_projection(reducer=_CountingReducer(scale=1.0), cache_dir=d)
+            b = self.xpl.compute_projection(reducer=_CountingReducer(scale=3.0), cache_dir=d)
+            np.testing.assert_allclose(b, a * 3.0)
+
+    def test_model_space_takes_part_in_the_key(self):
+        """Moving the model's space must re-project, not reload the other space's coordinates."""
+        with tempfile.TemporaryDirectory() as d:
+            self.xpl.compute_projection(reducer=_CountingReducer(), cache_dir=d)
+            self.model.space = "pooled"
+            self.model.calls = 0
+            self.xpl.compute_projection(reducer=_CountingReducer(), cache_dir=d)
+            self.assertEqual(self.model.calls, 1)  # re-embedded under the new space
+
+    def test_recompute_forces_a_fresh_fit(self):
+        with tempfile.TemporaryDirectory() as d:
+            reducer = _CountingReducer()
+            self.xpl.compute_projection(reducer=reducer, cache_dir=d)
+            self.model.calls = 0
+            self.xpl.compute_projection(reducer=reducer, cache_dir=d, recompute=True)
+            self.assertEqual(self.model.calls, 1)
+            self.assertEqual(reducer.fits, 2)
 
 
 # ---------------------------------------------------------------------------

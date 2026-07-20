@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -124,43 +125,59 @@ class _TinyClassifier(nn.Module):
     def device(self):
         return torch.device("cpu")
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
         h = self.emb(input_ids)  # (B, S, 4) — a token-level layer output
         pooled = torch.relu(self.pre_classifier(h.mean(dim=1)))  # (B, 4) — a pooled layer output
-        return SimpleNamespace(logits=self.classifier(pooled))
+        out = SimpleNamespace(logits=self.classifier(pooled))
+        if output_hidden_states:
+            out.hidden_states = (h,)
+        return out
 
 
-class TestHFClassifierActivations(unittest.TestCase):
+class TestHFClassifierEmbedSpaces(unittest.TestCase):
+    """``embed`` is the single entry point for every representation space."""
+
     def setUp(self):
         self.model = HFClassifierModel(_TinyClassifier(), _FakeTokenizer(), label_names=["neg", "pos"], batch_size=2)
 
-    def test_default_layer_is_pre_classifier(self):
-        self.assertEqual(self.model.default_activation_layer, "pre_classifier")
+    def test_decision_is_the_default_space(self):
+        self.assertEqual(self.model.embedding_space, "decision")
+        # Decision space = input to the final Linear(4, 2), i.e. 4 features, one vector per text.
+        self.assertEqual(self.model.embed(["hello world", "a b c", "single"]).shape, (3, 4))
 
-    def test_pooled_layer_activations_shape(self):
-        acts = self.model.activations(["hello world", "a b c", "single"])
-        self.assertEqual(acts.shape, (3, 4))  # pre_classifier output used as-is, one vector per text
+    def test_pooled_space(self):
+        self.assertEqual(self.model.embed(["hello world", "x"], "pooled").shape, (2, 4))
 
-    def test_token_level_layer_is_mean_pooled(self):
+    def test_named_submodule_space_is_pooled_when_token_level(self):
         # The embedding output is (B, S, 4); the hook path must mask-mean-pool it to (B, 4).
-        acts = self.model.activations(["hello world", "x"], layer="emb")
-        self.assertEqual(acts.shape, (2, 4))
+        self.assertEqual(self.model.embed(["hello world", "x"], "emb").shape, (2, 4))
 
-    def test_masking_makes_activation_padding_invariant(self):
+    def test_masking_makes_embedding_padding_invariant(self):
         # A text embedded alone vs. batched with a longer text (so it gets padded) must match,
         # proving padding tokens are excluded via the attention mask.
-        alone = self.model.activations(["hi"], layer="emb")
-        batched = self.model.activations(["hi", "one two three four"], layer="emb")
+        alone = self.model.embed(["hi"], "emb")
+        batched = self.model.embed(["hi", "one two three four"], "emb")
         np.testing.assert_allclose(alone[0], batched[0], rtol=1e-5, atol=1e-6)
 
-    def test_unknown_layer_raises_keyerror(self):
-        with self.assertRaises(KeyError):
-            self.model.activations(["hello"], layer="does_not_exist")
+    def test_unknown_space_raises_valueerror_eagerly(self):
+        # At construction: a typo must not wait for the first forward pass to surface.
+        with self.assertRaises(ValueError):
+            HFClassifierModel(_TinyClassifier(), _FakeTokenizer(), label_names=["neg", "pos"], embedding_space="nope")
+        # And on an explicit per-call space.
+        with self.assertRaises(ValueError):
+            self.model.embed(["hello"], "does_not_exist")
 
     def test_hook_removed_after_call(self):
         before = len(self.model.classifier.pre_classifier._forward_hooks)
-        self.model.activations(["hello world"])
+        self.model.embed(["hello world"], "pre_classifier")
         self.assertEqual(len(self.model.classifier.pre_classifier._forward_hooks), before)
+
+    def test_model_id_tracks_configuration(self):
+        # Two models differing only in pooling must not share a cache key.
+        other = HFClassifierModel(
+            _TinyClassifier(), _FakeTokenizer(), label_names=["neg", "pos"], batch_size=2, pool="cls"
+        )
+        self.assertNotEqual(self.model.model_id, other.model_id)
 
 
 class _PoolerClassifier(nn.Module):
@@ -176,9 +193,13 @@ class _PoolerClassifier(nn.Module):
     def device(self):
         return torch.device("cpu")
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        pooled = torch.relu(self.pooler(self.emb(input_ids).mean(dim=1)))
-        return SimpleNamespace(logits=self.classifier(pooled))
+    def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+        h = self.emb(input_ids)  # (B, S, 4)
+        pooled = torch.relu(self.pooler(h.mean(dim=1)))
+        out = SimpleNamespace(logits=self.classifier(pooled))
+        if output_hidden_states:
+            out.hidden_states = (h,)
+        return out
 
 
 class _NoPooledClassifier(nn.Module):
@@ -205,28 +226,79 @@ class _NoPooledClassifier(nn.Module):
         return out
 
 
-class TestDefaultActivationLayerResolution(unittest.TestCase):
-    """``default_activation_layer`` adapts to the architecture's head, per-model, not a hard-code."""
+class TestEmbedSpacesAcrossArchitectures(unittest.TestCase):
+    """Both keyword spaces work on every head shape — no per-architecture configuration."""
 
     @staticmethod
-    def _model(classifier):
-        return HFClassifierModel(classifier, _FakeTokenizer(), label_names=["neg", "pos"], batch_size=2)
+    def _model(classifier, **kwargs):
+        return HFClassifierModel(classifier, _FakeTokenizer(), label_names=["neg", "pos"], batch_size=2, **kwargs)
 
-    def test_prefers_pre_classifier_when_present(self):
-        self.assertEqual(self._model(_TinyClassifier()).default_activation_layer, "pre_classifier")
+    def test_decision_space_on_pre_classifier_head(self):
+        self.assertEqual(self._model(_TinyClassifier()).embed(["hello world", "x"]).shape, (2, 4))
 
-    def test_falls_back_to_pooler(self):
-        self.assertEqual(self._model(_PoolerClassifier()).default_activation_layer, "pooler")
+    def test_decision_space_on_pooler_head(self):
+        self.assertEqual(self._model(_PoolerClassifier()).embed(["hello world", "x"]).shape, (2, 4))
 
-    def test_sentinel_when_no_pooled_module(self):
-        model = self._model(_NoPooledClassifier())
-        self.assertEqual(model.default_activation_layer, "__last_hidden_state__")
+    def test_decision_space_on_headless_architecture(self):
+        # No pre_classifier/pooler (RoBERTa/XLM-R shape): the final Linear is still resolvable.
+        self.assertEqual(self._model(_NoPooledClassifier()).embed(["hello world", "a b c"]).shape, (2, 4))
 
-    def test_activations_use_mean_pooled_last_hidden_state_fallback(self):
-        # With no pooled head, activations() must still return one vector per text (via embed()).
-        model = self._model(_NoPooledClassifier())
-        acts = model.activations(["hello world", "a b c", "single"])
-        self.assertEqual(acts.shape, (3, 4))
+    def test_pooled_space_on_every_architecture(self):
+        for classifier in (_TinyClassifier(), _PoolerClassifier(), _NoPooledClassifier()):
+            with self.subTest(classifier=type(classifier).__name__):
+                self.assertEqual(self._model(classifier).embed(["hello world", "x"], "pooled").shape, (2, 4))
+
+    def test_decision_space_does_not_require_label_names(self):
+        # The final Linear is located structurally (the head module -> its last Linear), so label_names —
+        # a display concern — must not decide which representation a caller gets.
+        model = HFClassifierModel(_NoPooledClassifier(), _FakeTokenizer(), label_names=None, batch_size=2)
+        self.assertIs(model._resolve_decision_linear(), model.classifier.classifier)
+        self.assertEqual(model.embed(["hello world", "a b c"]).shape, (2, 4))
+
+    def test_decision_space_falls_back_audibly_when_no_head_is_found(self):
+        # A backbone naming its head outside the known conventions leaves nothing to read a decision
+        # space off; the caller asked for "decision" and gets "pooled", so this must be audible.
+        model = HFClassifierModel(_OddlyNamedHeadClassifier(), _FakeTokenizer(), batch_size=2)
+        self.assertIsNone(model._resolve_decision_linear())
+        # pytest.warns, not unittest's assertWarns: the latter walks sys.modules reading
+        # __warningregistry__, which blows up on any lazily-imported module (transformers) that a
+        # sibling test suite may have loaded into the same session.
+        with pytest.warns(UserWarning):
+            self.assertEqual(model.embed(["hello world", "a b c"]).shape, (2, 4))
+
+    def test_odd_head_name_is_recoverable_by_overriding_head_module(self):
+        # The documented escape hatch for an unconventional layout: two lines on the adapter, and the
+        # decision space works again — no change to the base class.
+        class _Adapter(HFClassifierModel):
+            def _head_module(self):
+                return self.backbone.decision_layer
+
+        model = _Adapter(_OddlyNamedHeadClassifier(), _FakeTokenizer(), batch_size=2)
+        self.assertIs(model._resolve_decision_linear(), model.backbone.decision_layer)
+
+
+class _OddlyNamedHeadClassifier(nn.Module):
+    """A classifier whose head is named outside the ``head``/``classifier``/``score`` conventions.
+
+    Exercises the structural resolution's miss path: no head can be located, so the decision space must
+    degrade audibly to pooled rather than silently returning the wrong representation.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(9, 4)
+        self.decision_layer = nn.Linear(4, 2)
+
+    @property
+    def device(self):
+        return torch.device("cpu")
+
+    def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+        h = self.emb(input_ids)
+        out = SimpleNamespace(logits=self.decision_layer(h.mean(dim=1)))
+        if output_hidden_states:
+            out.hidden_states = (h,)
+        return out
 
 
 class _Enc(dict):
