@@ -132,9 +132,21 @@ def build_encoder_head_backbone(body, head, pool: Any, normalize: bool = False):
     Returns
     -------
     _EncoderHeadBackbone
-        A backbone instance ready to pass to :class:`~shapash.model.encoder.EncoderClassifierModel`.
+        A backbone instance in **eval mode**, ready to pass to
+        :class:`~shapash.model.encoder.EncoderClassifierModel`.
+
+    Notes
+    -----
+    The returned module is switched to eval mode here. Assigning a submodule to an ``nn.Module`` does
+    not change that submodule's ``training`` flag, so a head the caller built fresh (``nn.Sequential``
+    with a ``Dropout``/``BatchNorm``) would otherwise stay in *training* mode and randomise every
+    forward pass — silently, since nothing raises: predictions, contributions, embeddings and
+    counterfactual flips would all differ run to run. ``eval()`` recurses into body and head, so one
+    call pins the whole path. These adapters are inference wrappers; there is no path that wants
+    training mode.
     """
-    return _EncoderHeadBackbone(body, head, pool, normalize)
+    backbone = _EncoderHeadBackbone(body, head, pool, normalize)
+    return backbone.eval()
 
 
 class TorchClassifierModel(EncoderClassifierModel):
