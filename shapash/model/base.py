@@ -64,6 +64,18 @@ class TextModel(ABC):
         return len(self.label_names) if self.label_names is not None else None
 
     @property
+    def shap_callable(self) -> Any:
+        """Scoring callable SHAP's text explainer wraps. Defaults to :meth:`predict`.
+
+        Part of the base contract rather than an undeclared convention: an adapter that overrides
+        nothing still works with the SHAP backend, and :attr:`shap_masker` (which documents itself in
+        terms of this property) can no longer refer to something that may not exist. Adapters wrapping
+        an object SHAP understands natively — a ``transformers`` pipeline, from which it infers a
+        ``Text`` masker — override this to return that object instead.
+        """
+        return self.predict
+
+    @property
     def shap_masker(self) -> Any:
         """Masker SHAP should use, or ``None`` to let SHAP infer one from :attr:`shap_callable`.
 
@@ -86,8 +98,35 @@ class TextModel(ABC):
         return type(self).__name__
 
 
+# Word-*start* markers: byte-level BPE (``Ġ``, RoBERTa/XLM-R/GPT-2) and SentencePiece (``▁``,
+# DeBERTa-v2/v3, T5, most multilingual checkpoints) prefix the token that *begins* a word. WordPiece
+# (BERT/DistilBERT) uses the opposite convention — it marks *continuations* with ``##`` and leaves word
+# starts bare. See :meth:`SupportsTokenization.word_start_marker`.
+WORD_START_MARKERS = ("Ġ", "▁")  # "Ġ", "▁"
+
+# Two ordinary lowercase words, tokenized once to detect the convention above. Deliberately trivial:
+# any tokenizer segments this into whole words, so a marker appears if and only if the scheme uses one.
+_MARKER_PROBE_TEXT = "hello world"
+
+_UNRESOLVED = object()  # sentinel distinguishing "not probed yet" from a probed ``None``
+
+
+def is_word_token(token: str) -> bool:
+    """True for a plausible standalone word token under a **marker-free** tokenizer.
+
+    Rejects WordPiece continuations (``##ing``), special/placeholder tokens (``[CLS]``), punctuation and
+    numerics — substituting or removing any of these yields malformed text once detokenized.
+    ``str.isalpha`` handles all of them in one check.
+
+    This is the *default* rule only. It is wrong for a tokenizer that marks word starts, where every
+    content token carries a ``Ġ``/``▁`` prefix; use :meth:`SupportsTokenization.is_substitutable`, which
+    dispatches on the model's own tokenization scheme, rather than calling this directly.
+    """
+    return token.isalpha()
+
+
 class SupportsTokenization(ABC):
-    """Capability: split text into tokens and rebuild text from tokens."""
+    """Capability: split text into tokens, rebuild text from tokens, and judge token word-hood."""
 
     @abstractmethod
     def tokenize(self, text: str) -> list[str]:
@@ -96,6 +135,67 @@ class SupportsTokenization(ABC):
     @abstractmethod
     def detokenize(self, tokens: list[str]) -> str:
         """Rebuild a display string from a list of tokens."""
+
+    def word_start_marker(self) -> str | None:
+        """Return this tokenizer's word-*start* marker, or ``None`` when it marks continuations.
+
+        Probed once from :meth:`tokenize` (not from a tokenizer class name or a hard-coded model list),
+        so a scheme this code has never seen is classified by what it actually emits, and the result is
+        memoized on the instance.
+
+        Returns
+        -------
+        str or None
+            ``"Ġ"`` (byte-level BPE) or ``"▁"`` (SentencePiece) when word starts are marked; ``None``
+            for WordPiece-style continuation marking or a plain whitespace tokenizer.
+        """
+        marker = getattr(self, "_word_start_marker_cache", _UNRESOLVED)
+        if marker is _UNRESOLVED:
+            marker = self._probe_word_start_marker()
+            self._word_start_marker_cache = marker
+        return marker
+
+    def _probe_word_start_marker(self) -> str | None:
+        """Tokenize :data:`_MARKER_PROBE_TEXT` and report the marker its tokens carry, if any."""
+        try:
+            probe = self.tokenize(_MARKER_PROBE_TEXT)
+        except Exception:  # noqa: BLE001 - a tokenizer that cannot run the probe simply has no marker
+            return None
+        for token in probe:
+            for marker in WORD_START_MARKERS:
+                if token.startswith(marker):
+                    return marker
+        return None
+
+    def is_substitutable(self, token: str) -> bool:
+        """Whether ``token`` is a standalone word that can be swapped or removed cleanly.
+
+        Counterfactual generators use this to decide which positions they may perturb and which vocab
+        entries are usable replacements. Word-hood is a property of the *tokenization scheme*, so it is
+        answered here rather than by string-guessing in ``compute/``:
+
+        * **Continuation-marking** tokenizers (WordPiece, or a plain whitespace split) leave word starts
+          bare, so a bare alphabetic token is a word and ``##ing`` is not — :func:`is_word_token`.
+        * **Word-start-marking** tokenizers (byte-BPE ``Ġ``, SentencePiece ``▁``) invert that: only a
+          *marked* token begins a word, and a bare one is a mid-word piece. Judging these with
+          :func:`is_word_token` rejects every content token of a SentencePiece model (``"▁good"`` is not
+          alphabetic) and accepts every mid-word BPE fragment — leaving both generators silently unable
+          to find any candidate at all.
+
+        Parameters
+        ----------
+        token : str
+            A token string from this model's tokenizer or vocabulary.
+
+        Returns
+        -------
+        bool
+            ``True`` when the token is a whole word this tokenizer can round-trip on its own.
+        """
+        marker = self.word_start_marker()
+        if marker is None:
+            return is_word_token(token)
+        return token.startswith(marker) and is_word_token(token[len(marker) :])
 
 
 class SupportsEmbeddings(ABC):

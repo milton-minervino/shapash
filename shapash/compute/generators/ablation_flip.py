@@ -31,7 +31,7 @@ from shapash.compute.generators.base import (
     IntField,
     TokenListField,
 )
-from shapash.compute.generators.cf_utils import is_prediction_flip, is_word_token
+from shapash.compute.generators.cf_utils import display_form, is_prediction_flip
 from shapash.model.base import SupportsTokenization, TextModel, has_capabilities
 
 if TYPE_CHECKING:
@@ -78,7 +78,14 @@ class AblationFlipGenerator(CounterfactualGenerator):
         target_class = label_names.index(target_label) if (target_label and target_label in label_names) else None
 
         tokens = model.tokenize(text)
-        content_positions = [i for i, t in enumerate(tokens) if is_word_token(t) and t.lower() not in ignore]
+        # Removable positions are decided by the *model's* tokenization scheme (``is_substitutable``),
+        # not by a string rule here: under SentencePiece/byte-BPE every content token carries a
+        # ``▁``/``Ġ`` word-start marker, which a bare ``isalpha`` check rejects wholesale. ``ignore``
+        # holds user-typed words, so it is matched against each token's display form for the same
+        # reason — ``"great"`` must match the token ``"▁great"``.
+        content_positions = [
+            i for i, t in enumerate(tokens) if model.is_substitutable(t) and display_form(model, t) not in ignore
+        ]
         if not content_positions:
             return []
 
