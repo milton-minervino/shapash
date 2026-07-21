@@ -389,7 +389,7 @@ class EncoderClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings
             return self._decision_embed(texts)
         # A named backbone submodule: capture its output on the forward pass.
         module = dict(self.backbone.named_modules())[space]
-        return self._hooked_embed(texts, module, pre=False)
+        return self._hooked_embed(texts, module, pre=False, space=space)
 
     def _pooled_embed(self, texts: list[str]) -> np.ndarray:
         """Return the mask-pooled last hidden state, shape ``(n_texts, hidden_dim)``.
@@ -418,13 +418,18 @@ class EncoderClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings
             out.append(emb.cpu().numpy())
         return np.vstack(out)
 
-    def _hooked_embed(self, texts: list[str], module: Any, pre: bool) -> np.ndarray:
+    def _hooked_embed(self, texts: list[str], module: Any, pre: bool, space: str) -> np.ndarray:
         """Return one vector per text captured at ``module``, shape ``(n_texts, hidden_dim)``.
 
         With ``pre=False`` a forward hook captures the module's *output*; with ``pre=True`` a forward
         pre-hook captures its first *input* (how the decision space is read off the final linear). A
         pooled ``(batch, hidden)`` capture is used as-is; a token-level ``(batch, seq, hidden)`` one is
         reduced with the configured :attr:`pool`. The backbone runs under ``no_grad`` — inference only.
+
+        ``space`` names the requested space for error reporting only. It is needed because a module can
+        exist on the backbone without lying on the path a forward pass takes — :meth:`_validate_space`
+        checks a submodule name *exists*, not that it *runs* — and the resulting empty capture must say
+        which space is unreachable rather than surface as a bare ``IndexError``.
         """
         captured: list = []
         if pre:
@@ -436,6 +441,14 @@ class EncoderClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings
             for batch, _ in self._batches(texts):
                 # The hook fires during the forward pass above; take the first capture of this batch and
                 # clear so a module invoked more than once cannot leak captures across batches.
+                if not captured:
+                    raise RuntimeError(
+                        f"embedding space {space!r} resolved to a {type(module).__name__} that did not "
+                        f"run during {type(self.backbone).__name__}'s forward pass, so no representation "
+                        "was captured. The module exists on the backbone but is not on the path this "
+                        f"input takes. Use a keyword space {_KEYWORD_SPACES}, or name a submodule the "
+                        "forward pass actually calls."
+                    )
                 vec = self._pool_batch(captured[0], batch)
                 out.append(vec.cpu().numpy())
                 captured.clear()
@@ -516,7 +529,7 @@ class EncoderClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings
             )
             logger.info("Decision space unavailable — falling back to the pooled last hidden state.")
             return self._pooled_embed(texts)
-        return self._hooked_embed(texts, linear, pre=True)
+        return self._hooked_embed(texts, linear, pre=True, space=_DECISION_SPACE)
 
     # ------------------------------------------------------------------
     # Gradients

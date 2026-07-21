@@ -254,6 +254,26 @@ class TestEmbeddingSpace(unittest.TestCase):
         with pytest.warns(UserWarning):
             self.assertEqual(model.embed(["hello world"]).shape, (1, 4))  # pooled encoder hidden size
 
+    def test_unreachable_submodule_space_raises_a_named_error(self):
+        # Space validation only checks that a submodule *name exists* — a module can exist on the
+        # backbone and still never run (a dead branch, or one this input routes around). The hook then
+        # captures nothing, and the failure has to name the unreachable space rather than surface as a
+        # bare IndexError off the empty capture list.
+        class _BodyWithDeadBranch(_Body):
+            def __init__(self):
+                super().__init__()
+                self.dead = nn.Linear(4, 4)  # registered, but _Body.forward never calls it
+
+        model = TorchClassifierModel(
+            _BodyWithDeadBranch(),
+            nn.Linear(4, 2),
+            _FakeTokenizer(),
+            label_names=["neg", "pos"],
+            embedding_space="body.dead",  # accepted at construction: the name does exist
+        )
+        with self.assertRaisesRegex(RuntimeError, "body.dead"):
+            model.embed(["hello world"])
+
     def test_resolution_is_memoized(self):
         model = self._deep_head_model()
         self.assertIs(model._resolve_decision_linear(), model._resolve_decision_linear())
