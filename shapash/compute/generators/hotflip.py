@@ -10,9 +10,10 @@ single backward pass to estimate each token's impact:
    estimate alone is an unreliable proxy — its single best pick often does not flip at all — so
    model verification is what surfaces genuine substitutions. Sub-word (``##``) and non-word tokens
    are excluded so rebuilt text stays well-formed.
-3. Try flip combinations of increasing size (1..``max_flips``), rebuild the text, re-predict, and
-   keep those that flip the prediction — enforcing **minimality** (never return a combination that
-   is a superset of an already-successful one).
+3. Hand the chosen substitutions to the shared minimal search
+   (:meth:`~shapash.compute.generators.base.CounterfactualGenerator.search_minimal`), which tries flip
+   combinations of increasing size (1..``max_flips``) in batched ``predict`` calls and keeps the
+   minimal ones that flip.
 
 Requires a model exposing :class:`~shapash.model.base.SupportsGradients` and
 :class:`~shapash.model.base.SupportsEmbeddings`.
@@ -20,7 +21,6 @@ Requires a model exposing :class:`~shapash.model.base.SupportsGradients` and
 
 from __future__ import annotations
 
-from itertools import combinations
 from typing import Protocol, cast
 
 import numpy as np
@@ -32,7 +32,7 @@ from shapash.compute.generators.base import (
     IntField,
     TokenListField,
 )
-from shapash.compute.generators.cf_utils import display_form, is_prediction_flip
+from shapash.compute.generators.cf_utils import display_form
 from shapash.model.base import (
     SupportsEmbeddings,
     SupportsGradients,
@@ -98,7 +98,6 @@ class HotFlipGenerator(CounterfactualGenerator):
 
         orig_probs = model.predict([text])[0]
         orig_class = int(np.argmax(orig_probs))
-        orig_label = label_names[orig_class] if orig_class < len(label_names) else str(orig_class)
         target_class = label_names.index(target_label) if (target_label and target_label in label_names) else None
 
         tokens, grads = model.token_gradients(text, orig_class)
@@ -139,38 +138,13 @@ class HotFlipGenerator(CounterfactualGenerator):
             replacement[pos] = shortlist[int(np.argmin(cand_orig_probs))]
 
         flippable = [p for p in flippable if p in replacement]
-
-        results: list[Counterfactual] = []
-        successful: list[frozenset[int]] = []
-        for size in range(1, max_flips + 1):
-            for combo in combinations(flippable, size):
-                combo_set = frozenset(combo)
-                if any(prev <= combo_set for prev in successful):
-                    continue  # minimality: skip supersets of a smaller success
-                new_tokens = list(tokens)
-                subs: list[tuple[int, str, str]] = []
-                for pos in combo:
-                    subs.append((pos, tokens[pos], replacement[pos]))
-                    new_tokens[pos] = replacement[pos]
-                new_text = model.detokenize(new_tokens)
-                cf_probs = model.predict([new_text])[0]
-                if is_prediction_flip(orig_probs, cf_probs, target_class):
-                    cf_class = int(np.argmax(cf_probs))
-                    results.append(
-                        Counterfactual(
-                            original_text=text,
-                            new_text=new_text,
-                            tokens=list(tokens),
-                            flipped_positions=list(combo),
-                            substitutions=subs,
-                            orig_label=orig_label,
-                            new_label=label_names[cf_class] if cf_class < len(label_names) else str(cf_class),
-                            orig_prob=float(orig_probs[orig_class]),
-                            new_prob=float(cf_probs[cf_class]),
-                            prob_delta=float(orig_probs[orig_class] - cf_probs[orig_class]),
-                        )
-                    )
-                    successful.append(combo_set)
-                    if len(results) >= num_examples:
-                        return results
-        return results
+        return self.search_minimal(
+            text,
+            tokens,
+            flippable,
+            replacement.__getitem__,
+            max_size=max_flips,
+            num_examples=num_examples,
+            orig_probs=orig_probs,
+            target_class=target_class,
+        )

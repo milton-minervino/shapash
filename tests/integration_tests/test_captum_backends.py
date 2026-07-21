@@ -1,9 +1,13 @@
 """Integration tests for the Captum-backed NLP features against a real transformer.
 
 Exercises the LayerIntegratedGradients attribution backend (:class:`NlpCaptumLigBackend`) and the
-FeatureAblation counterfactual generator (:class:`AblationFlipGenerator`) end to end on the emotion
+token-removal counterfactual generator (:class:`AblationFlipGenerator`) end to end on the emotion
 distilbert model used by the demos. Skipped automatically when ``transformers`` / ``torch`` / ``captum``
 are not installed (or the model is unavailable).
+
+``AblationFlipGenerator`` no longer needs captum (it scores leave-one-out through the model's own
+``predict``), so its tests are gated more tightly here than they strictly need to be — they share this
+module's real-transformer fixture.
 """
 
 import numpy as np

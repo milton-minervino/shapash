@@ -157,6 +157,56 @@ class SentencePieceModel(BagOfWordsModel):
         return " ".join(t.removeprefix("▁") for t in tokens)
 
 
+class CountingBagOfWordsModel(BagOfWordsModel):
+    """Bag-of-words model recording each ``predict`` call, for asserting how the search batches."""
+
+    batch_size = 32
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[list[str]] = []
+
+    def predict(self, texts):
+        texts = list(texts)
+        self.calls.append(texts)
+        return super().predict(texts)
+
+
+class TestAblationScores(unittest.TestCase):
+    """The scorer is plain leave-one-out now, so it is testable directly — captum is not involved."""
+
+    def setUp(self):
+        self.model = CountingBagOfWordsModel()
+        self.gen = AblationFlipGenerator(self.model)
+
+    def test_matches_exact_leave_one_out(self):
+        tokens = self.model.tokenize("this is great good")
+        positions = list(range(len(tokens)))
+        expected = _exact_ablation_scores(self.gen, tokens, positions, orig_class=1)
+        np.testing.assert_allclose(self.gen._ablation_scores(tokens, positions, orig_class=1), expected)
+
+    def test_supportive_tokens_score_higher(self):
+        tokens = self.model.tokenize("this is great")
+        scores = self.gen._ablation_scores(tokens, [0, 1, 2], orig_class=1)
+        # Removing "great" costs the positive class far more than removing "this".
+        self.assertGreater(scores[2], scores[0])
+
+    def test_scores_every_token_in_one_predict_call(self):
+        tokens = self.model.tokenize("this is great good")
+        self.gen._ablation_scores(tokens, [0, 1, 2, 3], orig_class=1)
+        # One call carrying the baseline plus one perturbation per token, not one call per token.
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(len(self.model.calls[0]), 5)
+
+    def test_generate_works_without_stubbing_the_scorer(self):
+        # End-to-end on a plain predict-only model: the whole generator now runs on numpy alone.
+        cfs = self.gen.generate("this is great", config={"num_examples": 3, "max_ablations": 2})
+        self.assertTrue(cfs)
+        self.assertEqual(cfs[0].new_label, "neg")
+        # Scoring (1 call) plus one call per combination *chunk* — a handful, not one call per combo.
+        self.assertLessEqual(len(self.model.calls), 4)
+
+
 class TestAblationFlipOnMarkedTokenizer(unittest.TestCase):
     """Regression: a word-start-marking tokenizer used to yield zero removal candidates.
 
