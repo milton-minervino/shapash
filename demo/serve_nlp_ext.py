@@ -25,10 +25,10 @@ The model runs on CPU when no GPU is present, so this serves fine on a plain box
 Model and dataset are configurable (see ``ServeConfig``): swap ``--model-name`` for any HF
 sequence-classification checkpoint (its label names are read from the model's own config) and
 ``--dataset-name`` for any HF ``datasets`` classification dataset (point ``--text-column`` /
-``--label-column`` at the right fields if they aren't ``text`` / ``label``). The on-disk cache is
-keyed by a hash of the input texts only (not the model), so each ``--model-name`` gets its own
-subdirectory under ``--cache-dir`` — otherwise switching models with the same dataset/``--n``
-would silently reload another model's cached contributions/embeddings.
+``--label-column`` at the right fields if they aren't ``text`` / ``label``). Cache keys cover the model
+and the attribution backend as well as the texts, so switching ``--model-name`` can never reload another
+model's contributions; the per-model/per-dataset subdirectories under ``--cache-dir`` below are for
+human legibility (and easy pruning), not for correctness.
 
 Dataset and model label strings aren't guaranteed to match even when their class order does (e.g.
 a dataset's ``ClassLabel`` names ``"neg"``/``"pos"`` vs. a model's ``config.id2label`` values
@@ -121,10 +121,7 @@ import transformers
 from torch import nn
 
 from shapash.backend import NlpCaptumLigBackend
-from shapash.explainer.nlp_explainer import (
-    NlpExplainer,
-    _hash_texts,  # same keying as the compile cache
-)
+from shapash.explainer.nlp_explainer import NlpExplainer
 from shapash.model import HFClassifierModel, SentenceTransformerModel, TextModel
 
 _HERE = Path(__file__).parent
@@ -175,11 +172,11 @@ def _dataset_slug(config: ServeConfig) -> str:
 def _dataset_cache_dir(config: ServeConfig) -> Path:
     """Return ``cache_dir/<model>/<dataset>__<split>`` — the level the projection is cached at.
 
-    The compile/projection caches are keyed by a hash of the input texts only (see ``_hash_texts``),
-    so different models or datasets would otherwise collide on the same cache file; the ``<model>`` and
-    ``<dataset>`` path levels keep them apart. The PaCMAP projection embeds the texts with
-    ``model.embed`` and never touches the attribution backend, so every ``--attribution`` choice shares
-    one projection cache at *this* level (below it, contributions split per backend).
+    The compile and projection caches both key on the model (and, for contributions, the backend), so
+    these path levels are organisational rather than load-bearing: they keep a ``--cache-dir`` readable
+    and prunable per model/dataset. The PaCMAP projection embeds the texts with ``model.embed`` and
+    never touches the attribution backend, so every ``--attribution`` choice shares one projection cache
+    at *this* level (below it, contributions split per backend).
     """
     return config.cache_dir / config.model_name.replace("/", "__") / _dataset_slug(config)
 
@@ -451,15 +448,6 @@ def main() -> None:
     dataset_dir = _dataset_cache_dir(config)  # projection lives here (shared across attribution backends)
     compile_dir = _compile_cache_dir(config)  # contributions live here (one subdir per attribution backend)
 
-    text_hash = _hash_texts(list(sentences))
-    if config.recompute:
-        # Drop this text set's cached artifacts so the steps below recompute + overwrite. Only the
-        # selected backend's contributions are dropped; other backends' caches are left intact.
-        logger.info("--recompute: dropping cached %s contributions + projection for these texts", config.attribution)
-        (compile_dir / f"{text_hash}.pkl").unlink(missing_ok=True)
-        # The embeddings + projection are dropped by compute_projection(recompute=True) below, which
-        # knows their key; only the contributions pickle is this script's to manage.
-
     model = load_model(config)
     if config.embedding_space is not None:
         # One setting drives both the scatter projection and similar-example retrieval. Assigning it
@@ -483,9 +471,17 @@ def main() -> None:
         reference_corpus=reference_corpus,
         reference_cache_dir=similar_cache_dir,
     )
+    if config.recompute:
+        # Drop this text set's cached contributions so the steps below recompute + overwrite. The
+        # explainer owns the key (it covers the model and backend), so it also owns the deletion —
+        # only *this* model+backend's entry goes, other backends' caches are left intact. The
+        # embeddings + projection are dropped by compute_projection(recompute=True) below.
+        logger.info("--recompute: dropping cached %s contributions + projection for these texts", config.attribution)
+        xpl.clear_cache(sentences, compile_dir)
+
     # Both steps load from cache if one exists for these exact texts, otherwise they compute and write
     # it. So the first run is slow; later runs only pay the model load.
-    compile_cache = compile_dir / f"{text_hash}.pkl"
+    compile_cache = xpl.cache_path(sentences, compile_dir)
     if compile_cache.exists():
         logger.info("Contributions cache hit (%s) — loading %s", config.attribution, compile_cache)
     else:

@@ -25,7 +25,7 @@ from sklearn.decomposition import PCA
 
 from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 from shapash.backend.nlp_shap_backend import NlpShapBackend
-from shapash.compute.embedding_store import EmbeddingStore
+from shapash.compute.embedding_store import EmbeddingStore, hash_corpus
 from shapash.compute.generators.ablation_flip import AblationFlipGenerator
 from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
 from shapash.compute.generators.hotflip import HotFlipGenerator
@@ -44,13 +44,6 @@ _BUILTIN_CF_GENERATORS: tuple[type[CounterfactualGenerator], ...] = (HotFlipGene
 def _looks_like_pipeline(model: object) -> bool:
     """Heuristic: a HuggingFace ``text-classification`` pipeline is callable and has a tokenizer."""
     return callable(model) and hasattr(model, "tokenizer")
-
-
-def _hash_texts(text_list: list[str]) -> str:
-    h = hashlib.md5(usedforsecurity=False)
-    for t in text_list:
-        h.update(t.encode())
-    return h.hexdigest()
 
 
 def _cache_file(data_hash: str, cache_dir: Path) -> Path:
@@ -75,12 +68,13 @@ def _reducer_tag(reducer: object) -> str:
 
 @dataclass
 class InferenceResults:
-    """Model + explainer output for a batch — a pure function of the input texts.
+    """Model + explainer output for a batch — a pure function of *(texts, model, backend)*.
 
     This is exactly the payload the disk cache persists: recomputing it is the
-    expensive step ``compile`` memoizes.  It deliberately excludes anything that
-    is *not* a function of the input-text hash — ground truth, class names, the
-    2-D projection — so a hash-keyed cache file can never carry a stale ``y_true``.
+    expensive step ``compile`` memoizes, and all three of its inputs are in the
+    cache key (see :meth:`NlpExplainer._compute_key`).  It deliberately excludes
+    anything that is *not* determined by those — ground truth, class names, the
+    2-D projection — so a keyed cache file can never carry a stale ``y_true``.
 
     Attributes
     ----------
@@ -199,18 +193,21 @@ class NlpExplainer:
         else:
             self._text_model = None
 
-        # The SHAP/LIME backend consumes a plain callable; a TextModel exposes it via shap_callable and
-        # its companion masker via shap_masker (``None`` for a pipeline-backed model, which SHAP can
-        # infer a Text masker from; an explicit one when shap_callable is a bare scoring function).
-        shap_model = self._text_model.shap_callable if self._text_model is not None else model
-        shap_masker = self._text_model.shap_masker if self._text_model is not None else None
-        self.backend: NlpBackend = backend or NlpShapBackend(
-            model=shap_model,
-            label_names=self.label_names,
-            masker=shap_masker,
-            explainer_args=explainer_args or {},
-            explainer_compute_args=explainer_compute_args or {},
-        )
+        # Default backend only when the caller brought none. Building it reads the model's SHAP surface
+        # (``shap_callable`` + its companion ``shap_masker``: ``None`` for a pipeline-backed model, which
+        # SHAP can infer a Text masker from; explicit when the callable is a bare scoring function) —
+        # which must not happen when an explicit backend makes those values unused, or an adapter that
+        # never intends to be explained by SHAP could not be used at all.
+        if backend is not None:
+            self.backend: NlpBackend = backend
+        else:
+            self.backend = NlpShapBackend(
+                model=self._text_model.shap_callable if self._text_model is not None else model,
+                label_names=self.label_names,
+                masker=self._text_model.shap_masker if self._text_model is not None else None,
+                explainer_args=explainer_args or {},
+                explainer_compute_args=explainer_compute_args or {},
+            )
 
         # Counterfactual generators: explicit > auto-discovered > none. An explicit ``cf_generator``
         # is used verbatim (no surprise additions). Otherwise every built-in compatible with the model
@@ -261,11 +258,12 @@ class NlpExplainer:
     ) -> None:
         """Compute token-level contributions and model predictions.
 
-        Results are cached in memory keyed by a hash of the input texts, so
-        re-calling ``compile`` with the same data on the same instance skips the
-        expensive explainer run.  Passing only ``y_true`` (same ``x``) is always
-        a lightweight metadata update.  For persistence across kernel restarts,
-        pass a ``cache_dir`` path to enable an opt-in disk cache.
+        Results are cached in memory keyed by the input texts *together with the model and backend
+        that score them* (see :meth:`_compute_key`), so re-calling ``compile`` with the same data on
+        the same instance skips the expensive explainer run — while changing the model, the backend or
+        ``label_names`` correctly recomputes.  Passing only ``y_true`` (same ``x``) is always a
+        lightweight metadata update.  For persistence across kernel restarts, pass a ``cache_dir``
+        path to enable an opt-in disk cache.
 
         Parameters
         ----------
@@ -278,11 +276,13 @@ class NlpExplainer:
         cache_dir : str or Path, optional
             If provided, contributions and predictions are also persisted to
             ``<cache_dir>/<hash>.pkl`` and reloaded on subsequent calls — even
-            after a kernel restart.  Disabled by default.
+            after a kernel restart.  Disabled by default.  One directory can be
+            shared across models and backends: the hash identifies them, so
+            entries cannot collide.
         """
         texts = x if isinstance(x, pd.Series) else pd.Series(x)
         text_list = texts.tolist()
-        new_hash = _hash_texts(text_list)
+        new_hash = self._compute_key(text_list)
 
         if new_hash != self._data_hash:
             self.texts = texts
@@ -319,6 +319,37 @@ class NlpExplainer:
                 if isinstance(y_true, pd.Series)
                 else pd.Series(y_true, index=self.texts.index, name="ground_truth")
             )
+
+    def cache_path(self, x: list[str] | pd.Series, cache_dir: str | Path) -> Path:
+        """Return the file :meth:`compile` would read/write for ``x`` under ``cache_dir``.
+
+        Lets a caller report a cache hit or drop a stale entry without reconstructing the key, which
+        depends on the bound model and backend and is the explainer's to own (see :meth:`_compute_key`).
+
+        Parameters
+        ----------
+        x : list[str] or pd.Series
+            The same texts that would be passed to :meth:`compile`.
+        cache_dir : str or Path
+            The same directory that would be passed to :meth:`compile`.
+
+        Returns
+        -------
+        Path
+            The cache file's location. It need not exist.
+        """
+        text_list = x.tolist() if isinstance(x, pd.Series) else list(x)
+        return _cache_file(self._compute_key(text_list), Path(cache_dir))
+
+    def clear_cache(self, x: list[str] | pd.Series, cache_dir: str | Path) -> None:
+        """Drop the cached :meth:`compile` result for ``x``, in memory and on disk.
+
+        The counterpart of :meth:`~shapash.compute.embedding_store.EmbeddingStore.clear` for
+        contributions: use it to force a fresh explainer run. Only *this* model+backend's entry is
+        removed — another backend's cache for the same texts is left intact.
+        """
+        self.cache_path(x, cache_dir).unlink(missing_ok=True)
+        self._data_hash = None
 
     def text_plot(self, pos: int = 0, label_idx: int = 0, max_tokens: int | None = None) -> go.Figure:
         """Plot token-level contributions for one sample and one class.
@@ -622,6 +653,33 @@ class NlpExplainer:
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
+
+    def _compute_key(self, text_list: list[str]) -> str:
+        """Return the cache key for explaining ``text_list`` with *this* model and backend.
+
+        :class:`InferenceResults` is a function of the texts **and** of everything that scores them, so
+        all of it belongs in the key: the model's own identity declaration
+        (:attr:`~shapash.model.base.TextModel.model_id` — checkpoint, pooling, normalization, head
+        weights), the backend's registered ``name``, its explainer settings, and ``label_names`` (which
+        fixes the column order of ``y_prob``).
+
+        Keying on the texts alone — as this once did — means swapping the backend (SHAP -> LIG),
+        the model, or the label order and pointing at the same ``cache_dir`` silently reloads the
+        previous run's contributions. It also defeats the in-memory guard in :meth:`compile`, so even
+        without a ``cache_dir`` a re-``compile`` after changing the backend was a no-op. Callers
+        currently work around this by hand-partitioning ``cache_dir`` per model and per backend; with
+        the identity in the key that is no longer necessary or possible to get wrong.
+        """
+        text_model = getattr(self, "_text_model", None)
+        model_id = text_model.model_id if text_model is not None else type(self.model).__name__
+        backend = getattr(self, "backend", None)
+        backend_id = "none"
+        if backend is not None:
+            # Sorted repr, so two logically identical configs written in a different order agree.
+            args = sorted(getattr(backend, "explainer_args", {}).items())
+            compute_args = sorted(getattr(backend, "explainer_compute_args", {}).items())
+            backend_id = f"{type(backend).name}:{args!r}:{compute_args!r}"
+        return hash_corpus(text_list, f"{model_id}|{backend_id}|{self.label_names!r}")
 
     def _require_text_model(self) -> TextModel:
         text_model = getattr(self, "_text_model", None)
