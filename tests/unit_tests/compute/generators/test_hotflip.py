@@ -139,5 +139,83 @@ class TestHotFlipGenerate(unittest.TestCase):
         self.assertEqual(cfs, [])
 
 
+class SentencePieceLinearModel(LinearFakeModel):
+    """The same linear classifier, tokenized SentencePiece-style: ``▁`` marks every word *start*.
+
+    Both the tokens *and the vocabulary* carry the marker, as they do for a real DeBERTa-v3 / XLM-R
+    tokenizer — which is what makes HotFlip's candidate shortlists empty under the old word test.
+    """
+
+    def tokenize(self, text):
+        return [f"▁{w}" for w in text.split()]
+
+    def detokenize(self, tokens):
+        return " ".join(t.removeprefix("▁") for t in tokens)
+
+    def get_embedding_table(self):
+        return [f"▁{t}" for t in _VOCAB], self._matrix
+
+    def token_gradients(self, text, target_class):
+        tokens, grads = super().token_gradients(text, target_class)
+        return [f"▁{t}" for t in tokens], grads
+
+
+class TestHotFlipOnMarkedTokenizer(unittest.TestCase):
+    """Regression: a word-start-marking tokenizer used to produce no candidates at all.
+
+    Every vocabulary entry is ``"▁word"``, which is not alphabetic, so the old bare ``isalpha`` test
+    rejected all of them: every shortlist came back empty, ``replacement`` stayed empty, and
+    ``generate`` returned ``[]`` for every input on every SentencePiece model — silently.
+    """
+
+    def setUp(self):
+        self.model = SentencePieceLinearModel()
+        self.gen = HotFlipGenerator(self.model)
+
+    def test_still_compatible(self):
+        self.assertTrue(HotFlipGenerator.is_compatible(self.model))
+
+    def test_marked_vocab_entries_are_candidates(self):
+        vocab, _ = self.model.get_embedding_table()
+        self.assertTrue(all(self.model.is_substitutable(t) for t in vocab))
+
+    def test_generates_flip(self):
+        cfs = self.gen.generate("this is great", config={"num_examples": 3, "max_flips": 1})
+        self.assertTrue(cfs, "no counterfactual on a SentencePiece tokenizer — the C2 regression")
+        cf = cfs[0]
+        self.assertEqual((cf.orig_label, cf.new_label), ("pos", "neg"))
+        self.assertTrue(all(new in {"▁terrible", "▁awful"} for _, _, new in cf.substitutions))
+        # The rebuilt text detokenizes cleanly, and the reported flip holds under the model.
+        self.assertNotIn("▁", cf.new_text)
+        self.assertTrue(
+            is_prediction_flip(self.model.predict([cf.original_text])[0], self.model.predict([cf.new_text])[0])
+        )
+
+    def test_tokens_to_ignore_matches_the_bare_word_a_user_types(self):
+        cfs = self.gen.generate(
+            "this is great", config={"tokens_to_ignore": ["this", "is", "great"], "max_flips": 2}
+        )
+        self.assertEqual(cfs, [])
+
+
+class TestHotFlipRequiresTokenization(unittest.TestCase):
+    def test_incompatible_without_tokenization(self):
+        # HotFlip calls detokenize/is_substitutable, so the capability must be declared, not assumed.
+        class GradientsOnly(TextModel, SupportsEmbeddings, SupportsGradients):
+            def predict(self, texts):
+                return np.tile([0.5, 0.5], (len(texts), 1))
+
+            def get_embedding_table(self):
+                return ["a"], np.zeros((1, 2))
+
+            def embed(self, texts):
+                return np.zeros((len(texts), 2))
+
+            def token_gradients(self, text, target_class):
+                return ["a"], np.zeros((1, 2))
+
+        self.assertFalse(HotFlipGenerator.is_compatible(GradientsOnly()))
+
+
 if __name__ == "__main__":
     unittest.main()

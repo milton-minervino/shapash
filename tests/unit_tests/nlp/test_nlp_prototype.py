@@ -1100,5 +1100,189 @@ class TestNlpExplainerWithLimeBackend(unittest.TestCase):
         self.assertEqual(xpl._data_hash, hash_after_first)
 
 
+# ---------------------------------------------------------------------------
+# compile() cache key
+# ---------------------------------------------------------------------------
+
+
+class _KeyModel(TextModel):
+    """Prediction-only model with a caller-chosen ``model_id``, so keys can be varied deliberately."""
+
+    def __init__(self, ident="model-a"):
+        super().__init__(label_names=LABEL_NAMES)
+        self._ident = ident
+
+    @property
+    def model_id(self):
+        return self._ident
+
+    def predict(self, texts):
+        probs = np.full((len(texts), N_CLASSES), 1.0 / N_CLASSES)
+        return probs
+
+
+class _MarkerBackend(NlpBackend):
+    """Returns a constant contribution equal to ``marker``, and counts its explainer runs.
+
+    The constant makes it visible *whose* result a cache served: a value of 1.0 can only have come
+    from the backend built with ``marker=1.0``.
+    """
+
+    name = "marker_backend"
+
+    def __init__(self, marker=1.0, **kwargs):
+        super().__init__(model=None, label_names=LABEL_NAMES, **kwargs)
+        self.marker = marker
+        self.calls = 0
+
+    def run_explainer(self, x):
+        self.calls += 1
+        texts = list(x)
+        return NlpRawExplanation(
+            contributions=[np.full((2, N_CLASSES), self.marker) for _ in texts],
+            base_values=np.zeros((len(texts), N_CLASSES)),
+            data=[["a", "b"] for _ in texts],
+        )
+
+
+class _OtherMarkerBackend(_MarkerBackend):
+    """Same behaviour under a different registered ``name`` — a distinct attribution method."""
+
+    name = "other_marker_backend"
+
+
+def _explainer(model=None, backend=None, label_names=LABEL_NAMES):
+    return NlpExplainer(
+        model or _KeyModel(),
+        label_names=label_names,
+        backend=backend or _MarkerBackend(),
+    )
+
+
+class TestCompileCacheKey(unittest.TestCase):
+    """``compile`` results depend on *(texts, model, backend)* — so all three must be in the key.
+
+    Keying on the texts alone means swapping the model or the attribution backend and pointing at the
+    same ``cache_dir`` silently reloads the previous run's contributions, and even without a
+    ``cache_dir`` the in-memory guard turns a re-``compile`` into a no-op.
+    """
+
+    def test_identical_inputs_still_hit_the_in_memory_cache(self):
+        backend = _MarkerBackend()
+        xpl = _explainer(backend=backend)
+        xpl.compile(_SAMPLE_TEXTS)
+        xpl.compile(_SAMPLE_TEXTS)
+        self.assertEqual(backend.calls, 1, "memoization must survive the richer key")
+
+    def test_swapping_the_backend_recomputes(self):
+        xpl = _explainer(backend=_MarkerBackend(marker=1.0))
+        xpl.compile(_SAMPLE_TEXTS)
+        replacement = _OtherMarkerBackend(marker=2.0)
+        xpl.backend = replacement
+        xpl.compile(_SAMPLE_TEXTS)
+        self.assertEqual(replacement.calls, 1, "in-memory guard served a stale, other-backend result")
+        np.testing.assert_allclose(xpl.contributions.values[0], 2.0)
+
+    def test_backend_compute_args_are_part_of_the_key(self):
+        xpl = _explainer(backend=_MarkerBackend(explainer_compute_args={"n_steps": 50}))
+        first = xpl._compute_key(_SAMPLE_TEXTS)
+        xpl.backend = _MarkerBackend(explainer_compute_args={"n_steps": 200})
+        self.assertNotEqual(first, xpl._compute_key(_SAMPLE_TEXTS))
+
+    def test_compute_args_key_is_order_insensitive(self):
+        # Same settings written in a different order are the same configuration.
+        a = _explainer(backend=_MarkerBackend(explainer_compute_args={"x": 1, "y": 2}))
+        b = _explainer(backend=_MarkerBackend(explainer_compute_args={"y": 2, "x": 1}))
+        self.assertEqual(a._compute_key(_SAMPLE_TEXTS), b._compute_key(_SAMPLE_TEXTS))
+
+    def test_model_identity_is_part_of_the_key(self):
+        a = _explainer(model=_KeyModel("model-a"))
+        b = _explainer(model=_KeyModel("model-b"))
+        self.assertNotEqual(a._compute_key(_SAMPLE_TEXTS), b._compute_key(_SAMPLE_TEXTS))
+
+    def test_label_names_are_part_of_the_key(self):
+        # label_names fixes the column order of y_prob, so it changes the cached payload.
+        a = _explainer(label_names=LABEL_NAMES)
+        b = _explainer(label_names=list(reversed(LABEL_NAMES)))
+        self.assertNotEqual(a._compute_key(_SAMPLE_TEXTS), b._compute_key(_SAMPLE_TEXTS))
+
+    def test_key_is_collision_safe_across_text_boundaries(self):
+        # Without a separator between texts these two corpora hash identically.
+        xpl = _explainer()
+        self.assertNotEqual(xpl._compute_key(["ab", "c"]), xpl._compute_key(["a", "bc"]))
+
+    def test_key_is_order_sensitive(self):
+        xpl = _explainer()
+        self.assertNotEqual(xpl._compute_key(["a", "b"]), xpl._compute_key(["b", "a"]))
+
+
+class TestCompileDiskCacheIsolation(unittest.TestCase):
+    """The disk cache is the dangerous case: a stale entry survives the process that wrote it."""
+
+    def test_two_backends_share_a_cache_dir_without_collision(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            first = _MarkerBackend(marker=1.0)
+            _explainer(backend=first).compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+
+            second = _OtherMarkerBackend(marker=2.0)
+            xpl = _explainer(backend=second)
+            xpl.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+
+            self.assertEqual(second.calls, 1, "loaded the other backend's cached contributions")
+            np.testing.assert_allclose(xpl.contributions.values[0], 2.0)
+
+    def test_two_models_share_a_cache_dir_without_collision(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _explainer(model=_KeyModel("model-a"), backend=_MarkerBackend(marker=1.0)).compile(
+                _SAMPLE_TEXTS, cache_dir=cache_dir
+            )
+            backend_b = _MarkerBackend(marker=2.0)
+            xpl = _explainer(model=_KeyModel("model-b"), backend=backend_b)
+            xpl.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+
+            self.assertEqual(backend_b.calls, 1, "loaded the other model's cached contributions")
+            np.testing.assert_allclose(xpl.contributions.values[0], 2.0)
+
+    def test_same_model_and_backend_reload_from_disk(self):
+        # The cache must still *work* — a fresh instance skips the expensive run.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _explainer(backend=_MarkerBackend(marker=3.0)).compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            reloaded_backend = _MarkerBackend(marker=3.0)
+            xpl = _explainer(backend=reloaded_backend)
+            xpl.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            self.assertEqual(reloaded_backend.calls, 0, "disk cache did not hit for identical inputs")
+            np.testing.assert_allclose(xpl.contributions.values[0], 3.0)
+
+    def test_cache_path_points_at_the_file_compile_writes(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            xpl = _explainer()
+            path = xpl.cache_path(_SAMPLE_TEXTS, cache_dir)
+            self.assertFalse(path.exists())
+            xpl.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            self.assertTrue(path.exists(), "cache_path disagrees with where compile() wrote")
+
+    def test_clear_cache_forces_a_recompute(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            backend = _MarkerBackend()
+            xpl = _explainer(backend=backend)
+            xpl.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            xpl.clear_cache(_SAMPLE_TEXTS, cache_dir)
+            self.assertFalse(xpl.cache_path(_SAMPLE_TEXTS, cache_dir).exists())
+            xpl.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            self.assertEqual(backend.calls, 2, "clear_cache must defeat the in-memory guard too")
+
+    def test_clear_cache_leaves_other_backends_entries_intact(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            keeper = _MarkerBackend(marker=1.0)
+            _explainer(backend=keeper).compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            keeper_path = _explainer(backend=_MarkerBackend(marker=1.0)).cache_path(_SAMPLE_TEXTS, cache_dir)
+
+            other = _explainer(backend=_OtherMarkerBackend(marker=2.0))
+            other.compile(_SAMPLE_TEXTS, cache_dir=cache_dir)
+            other.clear_cache(_SAMPLE_TEXTS, cache_dir)
+
+            self.assertTrue(keeper_path.exists(), "clearing one backend dropped another's cache")
+
+
 if __name__ == "__main__":
     unittest.main()
