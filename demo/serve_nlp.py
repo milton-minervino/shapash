@@ -40,6 +40,9 @@ see the ``[nlp]`` extra):
 * ``--attribution {shap,lig}`` — sentence-highlight method: ``shap`` (KernelSHAP, default) or ``lig``
   (Captum ``LayerIntegratedGradients``). The two are cached in **separate** subdirectories, so you can
   flip between them freely without ``--recompute``.
+* ``--lig-batch-size`` — only used by ``lig``: Captum's ``internal_batch_size``, chunking each sample's
+  50-step integration instead of running it through the model in one shot. Lower it (e.g. ``2`` or
+  ``1``) if you hit a CUDA out-of-memory error, especially on memory-hungry architectures like DeBERTa.
 
 Both counterfactual generators are offered live in the What-if Lab — ``hotflip`` (gradient-based token
 substitution) and ``ablation`` (leave-one-out token removal) — and are switched from a
@@ -144,6 +147,11 @@ class ServeConfig:
     label_map: dict[str, str] = field(default_factory=dict)
     n: int = 500
     attribution: str = "shap"  # sentence-highlight method: "shap" | "lig" (Captum LayerIntegratedGradients)
+    # Captum's LayerIntegratedGradients expands one sample into ``n_steps`` (50) scaled copies and runs
+    # them through the model as a single batch unless told otherwise — on a memory-hungry architecture
+    # (e.g. DeBERTa-v2/v3's disentangled attention) that batch of 50 can blow past a small GPU's memory.
+    # ``internal_batch_size`` makes Captum chunk that batch instead; lower it further if you still OOM.
+    lig_batch_size: int = 8
     # Similar-examples reference corpus: the split neighbours are retrieved from (the model's own
     # training split) and how many rows of it to bank. Set ``n_reference=0`` to disable the "Similar
     # Examples" panel.
@@ -219,6 +227,16 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
         help=(
             "Sentence-highlight attribution method: 'shap' (KernelSHAP, the default) or 'lig' "
             "(Captum LayerIntegratedGradients). Cached separately, so switching needs no --recompute."
+        ),
+    )
+    parser.add_argument(
+        "--lig-batch-size",
+        type=int,
+        default=defaults.lig_batch_size,
+        help=(
+            "Captum internal_batch_size for --attribution lig: chunks each sample's n_steps=50 "
+            "integration batch instead of running it through the model in one shot. Lower this "
+            "(e.g. 2 or 1) if LIG hits a CUDA out-of-memory error."
         ),
     )
     parser.add_argument(
@@ -417,7 +435,14 @@ def build_backend(config: ServeConfig, model: TextModel) -> NlpCaptumLigBackend 
     """
     if config.attribution == "lig":
         # LIG runs one integration per class per sample — show a progress bar over the batch.
-        return NlpCaptumLigBackend(model, label_names=model.label_names, show_progress=True)
+        # internal_batch_size chunks each sample's n_steps=50 scaled-copies batch so it doesn't OOM
+        # memory-hungry architectures (e.g. DeBERTa) on a small GPU — see ServeConfig.lig_batch_size.
+        return NlpCaptumLigBackend(
+            model,
+            label_names=model.label_names,
+            explainer_compute_args={"internal_batch_size": config.lig_batch_size},
+            show_progress=True,
+        )
     return None
 
 
