@@ -32,15 +32,21 @@ from shapash.compute.generators.base import (
     IntField,
     TokenListField,
 )
-from shapash.compute.generators.cf_utils import is_prediction_flip, is_word_token
-from shapash.model.base import SupportsEmbeddings, SupportsGradients, TextModel, has_capabilities
+from shapash.compute.generators.cf_utils import display_form, is_prediction_flip
+from shapash.model.base import (
+    SupportsEmbeddings,
+    SupportsGradients,
+    SupportsTokenization,
+    TextModel,
+    has_capabilities,
+)
 
 _MAX_FLIPPABLE_TOKENS = 10
 _CANDIDATES_PER_POSITION = 50
 
 
 class _GradientModel(Protocol):
-    """The exact capability surface HotFlip uses (predict + gradients + embeddings + detokenize)."""
+    """The exact capability surface HotFlip uses (predict + gradients + embeddings + tokenization)."""
 
     label_names: list[str] | None
 
@@ -51,6 +57,8 @@ class _GradientModel(Protocol):
     def get_embedding_table(self) -> tuple[list[str], np.ndarray]: ...
 
     def detokenize(self, tokens: list[str]) -> str: ...
+
+    def is_substitutable(self, token: str) -> bool: ...
 
 
 class HotFlipGenerator(CounterfactualGenerator):
@@ -69,8 +77,14 @@ class HotFlipGenerator(CounterfactualGenerator):
 
     @classmethod
     def is_compatible(cls, model: TextModel) -> bool:
-        """Compatible only with models that expose gradients *and* an embedding table."""
-        return has_capabilities(model, SupportsGradients, SupportsEmbeddings)
+        """Compatible only with models exposing gradients, an embedding table *and* tokenization.
+
+        ``SupportsTokenization`` is required because rebuilding a flipped sentence goes through
+        ``detokenize``, and choosing which vocab entries are usable replacements goes through
+        ``is_substitutable`` — both live on that capability. It was previously used without being
+        declared, which happened to work only because every gradient-capable adapter also tokenizes.
+        """
+        return has_capabilities(model, SupportsGradients, SupportsEmbeddings, SupportsTokenization)
 
     def generate(self, text: str, target_label: str | None = None, config: dict | None = None) -> list[Counterfactual]:
         """Generate minimal HotFlip counterfactuals for ``text`` (see module docstring)."""
@@ -91,20 +105,28 @@ class HotFlipGenerator(CounterfactualGenerator):
         if not tokens:
             return []
 
-        # Rank content tokens by gradient L2 norm; keep the top-K flippable positions.
+        # Rank content tokens by gradient L2 norm; keep the top-K flippable positions. Positions are
+        # filtered by word-hood as well as candidates: substituting a whole word into a *mid-word*
+        # position rebuilds malformed text, which is what the module docstring already promises to
+        # avoid — it was previously enforced on candidates only.
         grad_l2 = np.sum(grads * grads, axis=-1)
         ranked = np.argsort(-grad_l2).tolist()
-        flippable = [p for p in ranked if tokens[p].strip().lower() not in ignore][:_MAX_FLIPPABLE_TOKENS]
+        flippable = [
+            p for p in ranked if model.is_substitutable(tokens[p]) and display_form(model, tokens[p]) not in ignore
+        ][:_MAX_FLIPPABLE_TOKENS]
 
         vocab, matrix = model.get_embedding_table()
         replacement: dict[int, str] = {}
         for pos in flippable:
-            # Shortlist the top-K word candidates by the first-order estimate (most-negative first)...
+            # Shortlist the top-K word candidates by the first-order estimate (most-negative first).
+            # Candidate word-hood is judged by the model (``is_substitutable``) because the vocab
+            # carries the tokenizer's own markers — under SentencePiece/byte-BPE every usable word is
+            # ``▁word``/``Ġword``, which a bare ``isalpha`` check would reject, emptying every shortlist.
             scores = matrix @ grads[pos]
             shortlist: list[str] = []
             for cand in np.argsort(scores):
                 cand_tok = vocab[int(cand)]
-                if cand_tok != tokens[pos] and is_word_token(cand_tok):
+                if cand_tok != tokens[pos] and model.is_substitutable(cand_tok):
                     shortlist.append(cand_tok)
                     if len(shortlist) >= _CANDIDATES_PER_POSITION:
                         break

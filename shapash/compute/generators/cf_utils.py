@@ -2,6 +2,11 @@
 
 Small, pure helpers shared by generators: detecting a prediction flip and measuring how far a
 counterfactual moved the original class probability.
+
+Token word-hood used to live here too, as a bare ``token.isalpha()``. It now lives in the model layer
+(:func:`~shapash.model.base.is_word_token` and the scheme-aware
+:meth:`~shapash.model.base.SupportsTokenization.is_substitutable`), because the answer depends on the
+tokenization scheme and only the model knows which one it uses.
 """
 
 from __future__ import annotations
@@ -39,12 +44,25 @@ def prediction_difference(orig_probs: np.ndarray, cf_probs: np.ndarray, class_id
     return float(orig_probs[class_idx] - cf_probs[class_idx])
 
 
-def is_word_token(token: str) -> bool:
-    """True for plausible standalone word tokens.
+def display_form(model, token: str) -> str:
+    """Return the user-facing spelling of ``token`` — markers stripped, lowercased.
 
-    Rejects sub-word continuations (``##ing``), special/placeholder tokens (``[CLS]``), punctuation
-    and numerics — substituting or removing any of these yields malformed text once detokenized.
-    ``str.isalpha`` handles all of these in one check (``##ing``/``[CLS]``/``1b`` are not alphabetic).
-    Shared by the token-substitution (HotFlip) and token-removal (ablation) generators.
+    Generators match tokens against user-typed word lists (``tokens_to_ignore``, typed into the
+    webapp), which hold plain words — while a token may carry a ``▁``/``Ġ`` word-start marker. Comparing
+    the two directly means ``"great"`` never matches the token ``"▁great"``, so the ignore list silently
+    does nothing on SentencePiece and byte-BPE models. Round-tripping through the model's own
+    ``detokenize`` yields the display spelling for any tokenization scheme, with no marker table here.
+
+    Parameters
+    ----------
+    model : SupportsTokenization
+        The model whose tokenizer produced ``token``.
+    token : str
+        A single token string.
+
+    Returns
+    -------
+    str
+        The token as a user would write it.
     """
-    return token.isalpha()
+    return model.detokenize([token]).strip().lower()
