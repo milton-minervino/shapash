@@ -25,8 +25,18 @@ from shapash.model.base import EmbeddingSource
 logger = logging.getLogger(__name__)
 
 
-def _hash_corpus(texts: Sequence[str], key: str) -> str:
-    """Stable digest over a model/space key plus the corpus texts (order-sensitive)."""
+def hash_corpus(texts: Sequence[str], key: str) -> str:
+    """Stable digest over an identity ``key`` plus the corpus texts (order-sensitive).
+
+    The ``\\0`` separator after every text is what makes this collision-safe: without it
+    ``["ab", "c"]`` and ``["a", "bc"]`` hash identically, so two different corpora would share a cache
+    entry. ``key`` carries whatever else changes the cached artifact (model identity, representation
+    space, explanation backend) and is separated the same way.
+
+    Shared by every disk cache in the NLP path — the embedding/projection artifacts here and the
+    contribution pickle in :meth:`~shapash.explainer.nlp_explainer.NlpExplainer.compile` — so all of
+    them key on the same, collision-safe rule.
+    """
     h = hashlib.md5(usedforsecurity=False)
     h.update(f"{key}\0".encode())
     for text in texts:
@@ -81,7 +91,7 @@ class EmbeddingStore:
     @property
     def key(self) -> str:
         """The cache key: model identity, effective space, and corpus digest."""
-        return _hash_corpus(self.texts, self.space_key)
+        return hash_corpus(self.texts, self.space_key)
 
     def path(self, tag: str) -> Path | None:
         """On-disk location of the ``tag`` artifact, or ``None`` when caching is off."""
