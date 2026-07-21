@@ -174,6 +174,14 @@ class EncoderClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings
         if not callable(pool) and pool not in _POOL_MODES:
             raise ValueError(f"pool must be one of {_POOL_MODES} or a callable; got {pool!r}.")
         super().__init__(label_names=label_names)
+        # Pin the backbone to inference mode. Every method here is a forward (or a backward *through* a
+        # forward) for analysis — none trains — so a live Dropout/BatchNorm can only randomise results,
+        # and it does so silently. ``from_pretrained`` happens to return eval-mode models, but a
+        # hand-assembled backbone (see ``build_encoder_head_backbone``) does not; relying on the caller
+        # makes correctness a convention. ``eval()`` recurses, so this covers body and head at once.
+        eval_mode = getattr(backbone, "eval", None)
+        if callable(eval_mode):
+            eval_mode()
         self.backbone = backbone
         self.tokenizer = tokenizer
         self.batch_size = batch_size
