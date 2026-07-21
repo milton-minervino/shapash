@@ -4,15 +4,29 @@ Design mirrors both LIT's ``Generator`` (``generate`` + ``config_spec`` + compat
 the shapash ``NlpBackend`` ABC style. The tiny :class:`Field` spec types let a generator declare its
 tunable parameters once; the webapp renders controls from that declaration automatically, so adding
 a new knob or a new generator needs no UI changes.
+
+The ABC also owns the **minimal-perturbation search** (:meth:`CounterfactualGenerator.search_minimal`)
+that every generator ends in: try perturbation sets of increasing size, rebuild the text, re-predict,
+keep the flips, never return a superset of a smaller success. Concrete generators differ only in
+*which* positions they nominate and *what* they put there, so they supply a ranked candidate list and
+a per-position replacement, and the search is written once — batched.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Any
 
-from shapash.model.base import TextModel
+import numpy as np
+
+from shapash.compute.generators.cf_utils import is_prediction_flip
+from shapash.model.base import SupportsTokenization, TextModel
+
+#: Candidate texts scored per ``predict`` call when the model declares no batch size of its own.
+DEFAULT_PREDICT_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -127,3 +141,137 @@ class CounterfactualGenerator(ABC):
         if config:
             resolved.update({k: v for k, v in config.items() if k in resolved})
         return resolved
+
+    @property
+    def predict_batch_size(self) -> int:
+        """Number of candidate texts to score per :meth:`~shapash.model.base.TextModel.predict` call.
+
+        Read from the model, which is the only layer that knows its device and how much it can hold in
+        one forward pass: a CPU adapter configured with a small ``batch_size`` keeps its small batches,
+        a GPU one keeps its large ones, and neither is second-guessed here. Models that batch
+        internally and expose nothing (e.g. a pipeline adapter) get
+        :data:`DEFAULT_PREDICT_BATCH_SIZE`.
+        """
+        return max(1, int(getattr(self.model, "batch_size", DEFAULT_PREDICT_BATCH_SIZE)))
+
+    def search_minimal(
+        self,
+        text: str,
+        tokens: Sequence[str],
+        candidates: Sequence[int],
+        replacement: Callable[[int], str],
+        *,
+        max_size: int,
+        num_examples: int,
+        orig_probs: np.ndarray,
+        target_class: int | None = None,
+    ) -> list[Counterfactual]:
+        """Search for minimal perturbation sets over ``candidates`` that flip the prediction.
+
+        Tries every combination of 1..``max_size`` candidate positions, rebuilds the text by applying
+        ``replacement`` at each chosen position, re-predicts, and keeps the combinations that flip.
+        A combination that is a superset of an already-successful one is never evaluated, so results
+        are minimal and ordered by increasing perturbation size.
+
+        Candidates within one size are scored in **batches**, not one text per ``predict`` call. This
+        is exact, not an approximation: two distinct combinations of the same size can never be
+        supersets of one another, so nothing inside a size level can prune anything else inside it —
+        only smaller sizes can, and those are already resolved when the level starts. Batches are
+        capped at :attr:`predict_batch_size` rather than run per level, so ``num_examples`` still
+        stops the search promptly instead of after a whole level has been scored.
+
+        Parameters
+        ----------
+        text : str
+            The original input text (recorded on each returned counterfactual).
+        tokens : Sequence[str]
+            Tokenization of ``text``; positions in ``candidates`` index into it.
+        candidates : Sequence[int]
+            Perturbable positions, best first. The caller is responsible for ranking and for
+            capping how many are offered — the combination count grows steeply with this length.
+        replacement : Callable[[int], str]
+            The token to substitute at a given position. Returning ``""`` removes the token, which
+            is how removal-based generators express an ablation.
+        max_size : int
+            Largest number of positions to perturb simultaneously.
+        num_examples : int
+            Stop once this many counterfactuals have been found.
+        orig_probs : np.ndarray, shape (n_classes,)
+            Class probabilities of ``text``, used as the flip reference.
+        target_class : int or None
+            When given, only a flip *to* that class counts as success.
+
+        Returns
+        -------
+        list[Counterfactual]
+            Minimal successful counterfactuals, ordered by increasing perturbation size.
+        """
+        model = self.model
+        if not isinstance(model, SupportsTokenization):  # rebuilding perturbed text needs detokenize
+            raise TypeError(f"{type(self).__name__} requires a model implementing SupportsTokenization.")
+        label_names = model.label_names or []
+        orig_class = int(np.argmax(orig_probs))
+        orig_label = _label_at(label_names, orig_class)
+        token_list = list(tokens)
+        batch_size = self.predict_batch_size
+
+        results: list[Counterfactual] = []
+        successful: list[frozenset[int]] = []
+        for size in range(1, max_size + 1):
+            # Prune supersets of smaller successes up front — same-size combinations cannot prune
+            # each other, so this is the complete pruning available at this level.
+            combos = [c for c in combinations(candidates, size) if not any(prev <= set(c) for prev in successful)]
+            for start in range(0, len(combos), batch_size):
+                chunk = combos[start : start + batch_size]
+                built = [_apply_replacements(token_list, combo, replacement) for combo in chunk]
+                texts = [model.detokenize(new_tokens) for new_tokens, _ in built]
+                cf_probs = model.predict(texts)
+                for combo, new_text, (_, subs), probs in zip(chunk, texts, built, cf_probs, strict=True):
+                    if not is_prediction_flip(orig_probs, probs, target_class):
+                        continue
+                    cf_class = int(np.argmax(probs))
+                    results.append(
+                        Counterfactual(
+                            original_text=text,
+                            new_text=new_text,
+                            tokens=token_list,
+                            flipped_positions=list(combo),
+                            substitutions=subs,
+                            orig_label=orig_label,
+                            new_label=_label_at(label_names, cf_class),
+                            orig_prob=float(orig_probs[orig_class]),
+                            new_prob=float(probs[cf_class]),
+                            prob_delta=float(orig_probs[orig_class] - probs[orig_class]),
+                        )
+                    )
+                    successful.append(frozenset(combo))
+                    if len(results) >= num_examples:
+                        return results
+        return results
+
+
+def _label_at(label_names: list[str], index: int) -> str:
+    """Return ``label_names[index]``, falling back to the bare index for an unnamed class."""
+    return label_names[index] if index < len(label_names) else str(index)
+
+
+def _apply_replacements(
+    tokens: list[str], combo: Sequence[int], replacement: Callable[[int], str]
+) -> tuple[list[str], list[tuple[int, str, str]]]:
+    """Apply ``replacement`` at every position of ``combo``, returning ``(new_tokens, substitutions)``.
+
+    An empty replacement drops the token instead of substituting it, which is what makes one search
+    serve both substitution-based and removal-based generators.
+    """
+    chosen = set(combo)
+    new_tokens: list[str] = []
+    subs: list[tuple[int, str, str]] = []
+    for i, token in enumerate(tokens):
+        if i not in chosen:
+            new_tokens.append(token)
+            continue
+        new_token = replacement(i)
+        subs.append((i, token, new_token))
+        if new_token:
+            new_tokens.append(new_token)
+    return new_tokens, subs

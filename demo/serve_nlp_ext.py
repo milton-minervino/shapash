@@ -43,7 +43,7 @@ see the ``[nlp]`` extra):
   flip between them freely without ``--recompute``.
 
 Both counterfactual generators are offered live in the What-if Lab — ``hotflip`` (gradient-based token
-substitution) and ``ablation`` (Captum ``FeatureAblation`` token removal) — and are switched from a
+substitution) and ``ablation`` (leave-one-out token removal) — and are switched from a
 **method dropdown in the webapp**, so there is no CLI flag for them. They run live and are not cached.
 
 The on-disk cache mirrors these dependencies as a hierarchy under ``--cache-dir``:

@@ -139,6 +139,32 @@ class TestHotFlipGenerate(unittest.TestCase):
         self.assertEqual(cfs, [])
 
 
+class CountingLinearModel(LinearFakeModel):
+    """Linear fake model recording each ``predict`` call, for asserting how the search batches."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[list[str]] = []
+
+    def predict(self, texts):
+        texts = list(texts)
+        self.calls.append(texts)
+        return super().predict(texts)
+
+
+class TestHotFlipBatching(unittest.TestCase):
+    def test_combination_search_is_batched(self):
+        model = CountingLinearModel()
+        gen = HotFlipGenerator(model)
+        # Five flippable positions and max_flips=2 means 5 + C(5,2) = 20 candidate combinations.
+        cfs = gen.generate("this is great good ok", config={"num_examples": 20, "max_flips": 2})
+        self.assertTrue(cfs)
+        # Budget: one call for the original, one shortlist re-scoring per position, and one per
+        # combination *size level* — not one per combination, which is what dominated the cost.
+        self.assertLessEqual(len(model.calls), 1 + 5 + 2)
+        self.assertGreater(max(len(c) for c in model.calls), 1)
+
+
 class SentencePieceLinearModel(LinearFakeModel):
     """The same linear classifier, tokenized SentencePiece-style: ``▁`` marks every word *start*.
 
