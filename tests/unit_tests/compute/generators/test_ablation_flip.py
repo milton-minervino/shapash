@@ -11,8 +11,8 @@ import unittest
 import numpy as np
 
 from shapash.compute.generators import AblationFlipGenerator, Counterfactual
-from shapash.compute.generators.cf_utils import is_prediction_flip, is_word_token
-from shapash.model.base import SupportsTokenization, TextModel
+from shapash.compute.generators.cf_utils import is_prediction_flip
+from shapash.model.base import SupportsTokenization, TextModel, is_word_token
 
 # Per-token [neg_logit, pos_logit] contributions; logits = sum over content tokens.
 _EMB = {
@@ -141,6 +141,57 @@ class TestAblationFlipGenerate(unittest.TestCase):
 
     def test_no_content_tokens_returns_empty(self):
         cfs = self.gen.generate("! ? .", config={"max_ablations": 2})
+        self.assertEqual(cfs, [])
+
+
+class SentencePieceModel(BagOfWordsModel):
+    """The same classifier, tokenized SentencePiece-style: ``▁`` marks every word *start*.
+
+    Used by DeBERTa-v2/v3, XLM-R, T5 and most multilingual checkpoints.
+    """
+
+    def tokenize(self, text):
+        return [f"▁{w}" for w in text.split()]
+
+    def detokenize(self, tokens):
+        return " ".join(t.removeprefix("▁") for t in tokens)
+
+
+class TestAblationFlipOnMarkedTokenizer(unittest.TestCase):
+    """Regression: a word-start-marking tokenizer used to yield zero removal candidates.
+
+    Content tokens are ``"▁great"``, which is not alphabetic, so the old bare ``isalpha`` word test
+    rejected all of them — ``content_positions`` came back empty and ``generate`` returned ``[]`` for
+    *every* input. Nothing raised; the webapp just reported "No counterfactual found".
+    """
+
+    def setUp(self):
+        self.gen = AblationFlipGenerator(SentencePieceModel())
+        self.gen._ablation_scores = _exact_ablation_scores.__get__(self.gen, AblationFlipGenerator)
+
+    def test_marked_tokens_are_removal_candidates(self):
+        model = self.gen.model
+        tokens = model.tokenize("this is great")
+        self.assertEqual(tokens, ["▁this", "▁is", "▁great"])
+        self.assertTrue(all(model.is_substitutable(t) for t in tokens))
+
+    def test_generates_flip(self):
+        cfs = self.gen.generate("this is great", config={"num_examples": 3, "max_ablations": 1})
+        self.assertTrue(cfs, "no counterfactual on a SentencePiece tokenizer — the C2 regression")
+        cf = cfs[0]
+        self.assertEqual((cf.orig_label, cf.new_label), ("pos", "neg"))
+        self.assertIn("▁great", [old for _, old, _ in cf.substitutions])
+        # The rebuilt text is detokenized cleanly (no stray markers) and the flip really holds.
+        self.assertNotIn("▁", cf.new_text)
+        self.assertTrue(
+            is_prediction_flip(self.gen.model.predict([cf.original_text])[0], self.gen.model.predict([cf.new_text])[0])
+        )
+
+    def test_tokens_to_ignore_matches_the_bare_word_a_user_types(self):
+        # ``tokens_to_ignore`` is typed into the webapp, so it holds plain words. Comparing them
+        # against raw tokens means "great" never matches "▁great" and the ignore list silently does
+        # nothing; the comparison goes through the token's display form instead.
+        cfs = self.gen.generate("this is great", config={"tokens_to_ignore": ["great"], "max_ablations": 1})
         self.assertEqual(cfs, [])
 
 

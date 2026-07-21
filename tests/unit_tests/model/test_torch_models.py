@@ -416,5 +416,69 @@ class TestEncoderModelValidation(unittest.TestCase):
             EncoderClassifierModel(_Body(), _FakeTokenizer(), embedding_space="no_such_space")
 
 
+def _dropout_head(p=0.5):
+    """A head that is *not* a no-op in training mode, so eval/train is observable in the output."""
+    return nn.Sequential(nn.Linear(4, 4), nn.Dropout(p), nn.Linear(4, 2))
+
+
+class TestInferenceMode(unittest.TestCase):
+    """Adapters must pin their backbone to eval mode — dropout/batchnorm can only corrupt analysis.
+
+    Assigning a submodule to an ``nn.Module`` does not touch that submodule's ``training`` flag, so a
+    head the caller built fresh stays in *training* mode and silently randomises every forward pass:
+    predictions, contributions, embeddings and counterfactual flips all differ run to run, with nothing
+    raising. ``from_pretrained`` returns eval-mode models, which made this look fine on the HF path only.
+    """
+
+    def test_fused_backbone_is_eval_mode(self):
+        backbone = build_encoder_head_backbone(_Body(), _dropout_head(), "mean")
+        self.assertFalse(backbone.training)
+        self.assertFalse(backbone.head.training)  # eval() recurses into head...
+        self.assertFalse(backbone.body.training)  # ...and body
+
+    def test_fused_backbone_forward_is_deterministic(self):
+        backbone = build_encoder_head_backbone(_Body(), _dropout_head(), "mean")
+        ids = torch.tensor([[1, 2, 3]])
+        mask = torch.ones(1, 3, dtype=torch.long)
+        first = backbone(input_ids=ids, attention_mask=mask).logits.detach().numpy()
+        for _ in range(4):
+            repeat = backbone(input_ids=ids, attention_mask=mask).logits.detach().numpy()
+            np.testing.assert_allclose(repeat, first, rtol=1e-7)
+
+    def test_torch_classifier_predict_is_deterministic_with_dropout_head(self):
+        # The end-to-end symptom: identical text, different probabilities on every call.
+        model = TorchClassifierModel(_Body(), _dropout_head(), _FakeTokenizer(), label_names=["neg", "pos"])
+        first = model.predict(["hello world"])
+        for _ in range(4):
+            np.testing.assert_allclose(model.predict(["hello world"]), first, rtol=1e-7)
+
+    def test_embed_is_deterministic_with_dropout_head(self):
+        # Non-determinism here would also destabilise the scatter and similar-example neighbours.
+        model = TorchClassifierModel(_Body(), _dropout_head(), _FakeTokenizer(), label_names=["neg", "pos"])
+        first = model.embed(["hello world"])
+        np.testing.assert_allclose(model.embed(["hello world"]), first, rtol=1e-7)
+
+    def test_encoder_model_evals_any_backbone(self):
+        # The guard lives in EncoderClassifierModel too, so it covers a hand-passed backbone that did
+        # not come from build_encoder_head_backbone.
+        backbone = _Body()
+        backbone.train()
+        EncoderClassifierModel(backbone, _FakeTokenizer(), embedding_space="pooled")
+        self.assertFalse(backbone.training)
+
+    def test_backbone_without_eval_is_tolerated(self):
+        # The guard is best-effort: a non-nn.Module backbone honouring the contract must still build.
+        class _PlainBackbone:
+            device = torch.device("cpu")
+
+            def named_modules(self):
+                return []
+
+            def get_input_embeddings(self):
+                return nn.Embedding(9, 4)
+
+        EncoderClassifierModel(_PlainBackbone(), _FakeTokenizer(), embedding_space="pooled")
+
+
 if __name__ == "__main__":
     unittest.main()
