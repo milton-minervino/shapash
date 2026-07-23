@@ -70,6 +70,41 @@ _POOL_MODES = ("mean", "cls", "max")
 _HEAD_ATTRS = ("head", "classifier", "score")
 
 
+def _encoded_length(encoding: Any) -> int | None:
+    """Return the sequence length of a tokenizer ``encoding``, or ``None`` if it cannot be read.
+
+    Handles every shape :meth:`EncoderClassifierModel._tokenize` can produce: a ``return_tensors="pt"``
+    ``(batch, seq)`` tensor, a batched list of id lists, and a single un-tensorised list of ids.
+    """
+    ids = encoding["input_ids"]
+    shape = getattr(ids, "shape", None)
+    if shape is not None:
+        return int(shape[-1])
+    if not len(ids):
+        return 0
+    if isinstance(ids[0], (list, tuple)):
+        return max(len(row) for row in ids)
+    return len(ids)
+
+
+def _position_capacity(backbone: Any) -> int | None:
+    """Return how many *absolute* position ids ``backbone`` can index, or ``None`` when not knowable.
+
+    ``None`` means "do not check" and is returned generously — this feeds a hard error, so a missed
+    check (status quo) is far cheaper than a wrong one. Two cases yield ``None``:
+
+    * no ``config.max_position_embeddings`` — a rotary/ALiBi model has no such table;
+    * ``config.position_biased_input`` is ``False`` — DeBERTa v1/v2/v3 add no absolute position
+      embeddings at all, so their ``max_position_embeddings`` is not an indexing bound and comparing
+      against it would reject sequences the model handles fine.
+    """
+    config = getattr(backbone, "config", None)
+    if config is None or getattr(config, "position_biased_input", True) is False:
+        return None
+    capacity = getattr(config, "max_position_embeddings", None)
+    return capacity if isinstance(capacity, int) and not isinstance(capacity, bool) and capacity > 0 else None
+
+
 def _pool_hidden(hidden: Any, attention_mask: Any, pool: Any) -> Any:
     """Reduce a token-level ``(batch, seq, hidden)`` tensor to ``(batch, hidden)``, mask-aware.
 
@@ -262,12 +297,59 @@ class EncoderClassifierModel(TextModel, SupportsTokenization, SupportsEmbeddings
         just tidiness: :meth:`word_alignment` returns positions into the same subword axis as
         :meth:`encode`, so if the two truncated differently the attribution highlights would silently
         misalign on any text long enough to be cut.
+
+        Also the single place the result is checked against what the backbone can actually index — see
+        :meth:`_check_encoded_length`.
         """
         kwargs: dict[str, Any] = {"truncation": True}
         if self.max_length is not None:
             kwargs["max_length"] = self.max_length
         kwargs.update(overrides)
-        return self.tokenizer(texts, **kwargs)
+        encoding = self.tokenizer(texts, **kwargs)
+        self._check_encoded_length(encoding)
+        return encoding
+
+    def _check_encoded_length(self, encoding: Any) -> None:
+        """Raise if ``encoding`` is longer than the backbone can index absolute positions for.
+
+        This is a *diagnostic*, not a limiter: it never truncates and never fires for input the model
+        could have handled. It exists because the failure it pre-empts is close to undebuggable. A
+        sequence longer than ``max_position_embeddings`` makes the model's own embedding layer gather
+        position ids past the end of its buffer, which trips a device-side assert; on CUDA that abort is
+        *asynchronous*, so it surfaces at whatever unrelated line next synchronises — with a traceback
+        pointing at innocent code, often thousands of samples into a batch job. Failing here instead
+        names the real cause and the fix.
+
+        The usual trigger is a checkpoint whose tokenizer config never set ``model_max_length``:
+        ``transformers`` then reports a ~1e30 sentinel, ``truncation=True`` becomes a silent no-op, and a
+        long text tokenizes unbounded. Passing an explicit ``max_length`` is the fix.
+
+        Deliberately conservative — it compares against ``max_position_embeddings`` itself, so it cannot
+        reject a sequence the model would have accepted. The cost is that it under-catches RoBERTa-style
+        models by a couple of tokens: those offset position ids by ``pad_token_id + 1`` (which is why
+        roberta-base pairs a 514-wide buffer with a real 512-token limit), so a sequence in that narrow
+        band still reaches the original CUDA abort. Catching most cases with no false positives is worth
+        more here than catching all of them at the risk of rejecting valid input.
+
+        Raises
+        ------
+        ValueError
+            If the encoded sequence exceeds the backbone's absolute-position capacity.
+        """
+        capacity = _position_capacity(self.backbone)
+        if capacity is None:
+            return
+        length = _encoded_length(encoding)
+        if length is None or length <= capacity:
+            return
+        raise ValueError(
+            f"Text tokenized to {length} tokens, but {type(self.backbone).__name__} can only index "
+            f"{capacity} absolute positions — running it would abort the CUDA context with a "
+            f"device-side assert far from this call. Pass an explicit max_length (<= {capacity}) to "
+            f"{type(self).__name__}. This usually means the tokenizer reports no model_max_length "
+            f"(currently {getattr(self.tokenizer, 'model_max_length', None)!r}), which silently makes "
+            "truncation=True a no-op."
+        )
 
     def _encode_one(self, text: str):
         """Return ``(input_ids, attention_mask)`` batch-size-1 tensors on the backbone device."""
