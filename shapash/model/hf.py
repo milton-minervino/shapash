@@ -136,6 +136,14 @@ class HFClassifierModel(EncoderClassifierModel):
         How a token-level output is reduced to one vector per text in :meth:`embed`. Default ``"mean"``.
         Note this affects the *analysis* representation only — an ``AutoModelForSequenceClassification``
         does its own pooling internally, so :meth:`predict` is unaffected.
+    max_length : int or None, optional
+        Truncation length applied to every tokenizer call — see
+        :class:`~shapash.model.encoder.EncoderClassifierModel`. When ``None`` (default) the tokenizer's
+        own ``model_max_length`` applies; note some checkpoints ship a tokenizer whose config never sets
+        this, so ``transformers`` reports its "unset" sentinel (~1e30) instead of a real limit — with
+        ``max_length=None`` that makes truncation a no-op, so a gradient-based attribution method (e.g.
+        ``NlpCaptumLigBackend``) can exhaust GPU memory on a long enough text. Pass an explicit
+        ``max_length`` for such checkpoints.
     """
 
     def __init__(
@@ -148,6 +156,7 @@ class HFClassifierModel(EncoderClassifierModel):
         *,
         embedding_space: str = _DECISION_SPACE,
         pool: Any = "mean",
+        max_length: int | None = None,
     ) -> None:
         if label_names is None:
             id2label = getattr(getattr(classifier, "config", None), "id2label", None)
@@ -161,6 +170,7 @@ class HFClassifierModel(EncoderClassifierModel):
             device=device,
             pool=pool,
             embedding_space=embedding_space,
+            max_length=max_length,
         )
         # ``classifier`` is the backbone; keep the historical alias for introspection and tests.
         self.classifier = classifier

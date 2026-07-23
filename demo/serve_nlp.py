@@ -32,7 +32,9 @@ human legibility (and easy pruning), not for correctness.
 Dataset and model label strings aren't guaranteed to match even when their class order does (e.g.
 a dataset's ``ClassLabel`` names ``"neg"``/``"pos"`` vs. a model's ``config.id2label`` values
 ``"NEGATIVE"``/``"POSITIVE"``) — pass ``--label-map`` to rename ground-truth labels onto the
-model's spelling so predicted vs. ground-truth comparisons in the webapp line up.
+model's spelling so predicted vs. ground-truth comparisons in the webapp line up. See "Serving a custom
+dataset" below for label spaces ``--label-map`` can't fix (bucketing, dropping rows), and ``--seed`` for
+how rows are sampled.
 
 The sentence-highlight attribution method is selectable (a Captum-backed alternative to the default,
 see the ``[nlp]`` extra):
@@ -43,6 +45,9 @@ see the ``[nlp]`` extra):
 * ``--lig-batch-size`` — only used by ``lig``: Captum's ``internal_batch_size``, chunking each sample's
   50-step integration instead of running it through the model in one shot. Lower it (e.g. ``2`` or
   ``1``) if you hit a CUDA out-of-memory error, especially on memory-hungry architectures like DeBERTa.
+
+``lig`` is also the method most sensitive to *truncation* actually being configured — see
+``_hf_classifier_model`` for why every HF classifier here resolves an explicit ``max_length``.
 
 Both counterfactual generators are offered live in the What-if Lab — ``hotflip`` (gradient-based token
 substitution) and ``ablation`` (leave-one-out token removal) — and are switched from a
@@ -80,6 +85,14 @@ one:
    * **standard classifier that merely needs ``trust_remote_code``** → just call
      ``HFClassifierModel(AutoModelForSequenceClassification.from_pretrained(name, trust_remote_code=True),
      tokenizer)``.
+   * **standard classifier whose config's labels can't be trusted** (missing ``id2label``, or a
+     ``label2id`` that turns out backwards from the model's real behaviour) → same call as the generic
+     path, but pass ``label_names=[...]`` explicitly instead of leaving it to be read from
+     ``config.id2label``. Verify the ordering against a real labeled sample (dozens+, not a handful) —
+     ``almanach/camembertv2-base-cls`` was first "fixed" from a 10-example hand check that (wrongly)
+     looked decisive; a proper sanity check (``demo/check_camembertv2_amazon_fr.py``) later showed
+     *neither* ordering is trustworthy on that checkpoint at all. A handful of examples can't tell a
+     genuinely swapped label from a model that just doesn't work.
 
 2. Register it: ``MODEL_BUILDERS["org/your-model"] = build_x``. Nothing else changes — caching, the
    What-if Lab, both attribution backends, counterfactuals, and similar-examples all work through the
@@ -89,7 +102,42 @@ one:
 ``shhossain/all-MiniLM-L6-v2-sentiment-classifier``) is the worked example: a MiniLM ST body + a trained
 ``fc1 -> relu -> fc2 -> relu -> out`` MLP head, ``trust_remote_code`` with no HF tokenizer, so the generic
 path can't touch it — but ``SentenceTransformerModel`` serves it faithfully (it reproduces the source
-model's predictions exactly).
+model's predictions exactly). ``_build_camembertv2_cls_model`` (registered for
+``almanach/camembertv2-base-cls``) is the worked example of the label-names-can't-be-trusted case: an
+architecturally plain ``RobertaForSequenceClassification`` whose checkpoint config omits ``id2label``.
+**Its config's labels can't be trusted, but neither can the checkpoint's own predictions** — see the
+builder's docstring and ``demo/check_camembertv2_amazon_fr.py`` for a sanity check showing neither label
+ordering beats a trivial majority-class baseline on gold in-domain data. It stays registered only as a
+worked example of this builder pattern, not as a model whose predictions should be trusted.
+
+Serving a *custom* dataset (label logic that isn't a 1:1 rename)
+------------------------------------------------------------------
+Any standard HF classification dataset loads automatically from ``--dataset-name`` alone: point
+``--text-column``/``--label-column`` at the right fields if they aren't ``text``/``label``, and (rows are
+shuffled with ``--seed`` before ``--n``/``--n-reference`` are taken, so this is representative even when
+the dataset's on-disk order groups rows by label). Ground-truth strings come from the dataset's own
+``ClassLabel`` names when present, else the raw values stringified; ``--label-map`` renames them 1:1 onto
+the model's own spelling when the two disagree on casing/wording despite sharing the same class order
+(e.g. dataset ``"neg"`` vs. model ``"NEGATIVE"``).
+
+A dataset whose ground truth needs **more** than a rename — bucketing several raw values into one class,
+dropping rows with no mapping, or any other dataset-specific logic — is served through the
+``DATASET_LOADERS`` registry: a ``{--dataset-name: loader}`` map consulted *before* the generic path
+(the exact ``MODEL_BUILDERS`` pattern above, applied to data instead of the model). To add one:
+
+1. Write a loader ``def load_x(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]``
+   that returns ``(texts, label_strings)``. Put **all** dataset-specific code inside it, including which
+   raw columns it reads — a bucketing loader's logic is tied to that dataset's exact label semantics, so
+   there is no generic ``--text-column``/``--label-column`` to thread through; the core ``_load_split``
+   never changes.
+2. Register it: ``DATASET_LOADERS["org/your-dataset"] = load_x``. Nothing else changes — caching, the
+   webapp, and the reference corpus all call ``_load_split`` regardless of which path served it.
+
+``_load_amazon_reviews_multi_binary`` (registered for ``mteb/amazon_reviews_multi``) is the worked
+example: its ``label`` is a 5-star rating minus one (0-4), not the binary sentiment space a binary
+classifier like ``almanach/camembertv2-base-cls`` predicts into, so it buckets rating > 3 -> ``"positive"``,
+rating < 3 -> ``"negative"``, and drops the neutral 3-star (a ground-truth convention only — see
+``demo/check_camembertv2_amazon_fr.py`` for whether this specific model's predictions are trustworthy).
 
 Usage
 -----
@@ -98,6 +146,10 @@ Usage
     python demo/serve_nlp.py --attribution lig   # Captum LayerIntegratedGradients highlights
     python demo/serve_nlp.py --model-name distilbert-base-uncased-finetuned-sst-2-english \\
         --dataset-name sst2 --dataset-split validation --text-column sentence
+    # A registered custom model against a registered dataset loader (bucketed 5-star -> binary
+    # sentiment ground truth; --text-column/--label-column don't apply here, see DATASET_LOADERS):
+    python demo/serve_nlp.py --model-name almanach/camembertv2-base-cls \\
+        --dataset-name mteb/amazon_reviews_multi --dataset-config fr --dataset-split test
     python demo/serve_nlp.py --model-name lvwerra/distilbert-imdb --dataset-name stanfordnlp/imdb \\
         --label-column label --label-map '{"neg": "NEGATIVE", "pos": "POSITIVE"}'
     # A registered custom (external-head) model — served via MODEL_BUILDERS, no other flags needed:
@@ -141,11 +193,16 @@ class ServeConfig:
 
     model_name: str = "bhadresh-savani/distilbert-base-uncased-emotion"
     dataset_name: str = "dair-ai/emotion"
+    dataset_config: str | None = None  # HF dataset config/subset (e.g. a language); None = dataset's default
     dataset_split: str = "test"
     text_column: str = "text"
     label_column: str = "label"
     label_map: dict[str, str] = field(default_factory=dict)
     n: int = 500
+    # Rows are shuffled with this seed before taking --n / --n-reference (see _load_split) — several
+    # HF dataset repos (e.g. mteb/amazon_reviews_multi) store rows grouped by label, so an unshuffled
+    # "first n" slice can be entirely one class.
+    seed: int = 0
     attribution: str = "shap"  # sentence-highlight method: "shap" | "lig" (Captum LayerIntegratedGradients)
     # Captum's LayerIntegratedGradients expands one sample into ``n_steps`` (50) scaled copies and runs
     # them through the model as a single batch unless told otherwise — on a memory-hungry architecture
@@ -172,8 +229,14 @@ _ATTRIBUTION_BACKENDS = {"shap": "nlp_shap", "lig": "nlp_captum_lig"}
 
 
 def _dataset_slug(config: ServeConfig) -> str:
-    """Filesystem-safe ``<dataset>__<split>`` tag for the cache hierarchy."""
-    return f"{config.dataset_name}__{config.dataset_split}".replace("/", "__")
+    """Filesystem-safe ``<dataset>__[<config>__]<split>`` tag for the cache hierarchy.
+
+    The config segment is only included when ``--dataset-config`` is actually set, so existing cache
+    directories built before that flag existed (``<dataset>__<split>``, no config with no HF dataset
+    config) still resolve to the same path.
+    """
+    parts = [config.dataset_name, *([config.dataset_config] if config.dataset_config else []), config.dataset_split]
+    return "__".join(parts).replace("/", "__")
 
 
 def _dataset_cache_dir(config: ServeConfig) -> Path:
@@ -206,6 +269,12 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
         "--model-name", default=defaults.model_name, help="HF model id (label names are read from its config)."
     )
     parser.add_argument("--dataset-name", default=defaults.dataset_name, help="HF datasets id.")
+    parser.add_argument(
+        "--dataset-config",
+        default=defaults.dataset_config,
+        help="HF dataset config/subset (e.g. a language) — needed when the dataset has more than one, "
+        "such as mteb/amazon_reviews_multi (pass 'fr', 'en', ...).",
+    )
     parser.add_argument("--dataset-split", default=defaults.dataset_split)
     parser.add_argument("--text-column", default=defaults.text_column, help="Column holding the raw text.")
     parser.add_argument("--label-column", default=defaults.label_column, help="Column holding the ground-truth label.")
@@ -220,6 +289,13 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
         ),
     )
     parser.add_argument("--n", type=int, default=defaults.n, help="Number of samples to load.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=defaults.seed,
+        help="Shuffle seed applied before taking --n / --n-reference rows, so sampling is representative "
+        "rather than whatever the dataset's on-disk row order puts first.",
+    )
     parser.add_argument(
         "--attribution",
         choices=list(_ATTRIBUTION_BACKENDS),
@@ -271,16 +347,91 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
     return ServeConfig(**vars(args))
 
 
-def _load_split(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
-    """Load the first ``n`` ``(texts, label_strings)`` of ``split`` from the configured dataset.
+def _load_hf_dataset(name: str, dataset_config: str | None, split: str) -> datasets.Dataset:
+    """Load one split of a HF dataset, falling back to raw per-split JSONL for legacy-script repos.
 
-    Ground-truth label strings come from the dataset's own ``ClassLabel`` feature names when
-    present (the usual shape for HF classification datasets); otherwise the raw values are
-    stringified as-is. ``config.label_map`` then renames them to match the model's label
-    names when the two disagree on spelling/casing (e.g. dataset ``"neg"`` vs. model
-    ``"NEGATIVE"``) despite sharing the same class order.
+    Some older dataset repos (e.g. ``mteb/amazon_reviews_multi``) still ship a ``<name>.py`` loading
+    script, which ``datasets>=4.0`` refuses to execute (``RuntimeError: Dataset scripts are no longer
+    supported``). Their raw ``<config>/<split>.jsonl`` files are usually still present in the repo, so on
+    exactly that error this retries against them directly via the generic ``json`` builder, bypassing the
+    broken script. Any other failure (missing dataset, bad split name, ...) is not masked.
     """
-    dataset = datasets.load_dataset(config.dataset_name, split=split)
+    try:
+        return datasets.load_dataset(name, dataset_config, split=split)
+    except RuntimeError as exc:
+        if "Dataset scripts are no longer supported" not in str(exc) or dataset_config is None:
+            raise
+        logger.warning("%s ships a legacy loading script; falling back to raw %s/%s.jsonl", name, dataset_config, split)
+        return datasets.load_dataset(
+            "json", data_files=f"hf://datasets/{name}/{dataset_config}/{split}.jsonl", split="train"
+        )
+
+
+def _load_amazon_reviews_multi_binary(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
+    """``mteb/amazon_reviews_multi`` — bucket its 5-star ``label`` (0-4) onto binary sentiment.
+
+    The raw ``label`` is a star rating minus one (0 = 1-star, ..., 4 = 5-star) — not the binary
+    positive/negative space a binary sentiment model (e.g. ``almanach/camembertv2-base-cls``) predicts
+    into, and not something ``--label-map`` can fix: that flag only renames labels 1:1, it can't collapse
+    five classes into two or drop one. Its ``label_text`` column doesn't help either — it's just
+    ``str(label)`` ("0".."4"), not a description.
+
+    Standard star-rating bucketing: rating > 3 -> ``"positive"``, rating < 3 -> ``"negative"``; the
+    3-star (rating == 3) review is neutral, has no binary ground truth, and is dropped — so this can
+    return fewer than ``n`` rows. This is a *ground-truth* convention only — it says nothing about
+    whether ``almanach/camembertv2-base-cls`` (or any other model served against this data) predicts
+    accurately; see ``demo/check_camembertv2_amazon_fr.py`` for that question answered against a
+    cleaner, in-domain gold set.
+
+    Also fixes the "all one label" symptom on this dataset specifically: the raw file is sorted by
+    ``label`` in blocks of 1000 identical values, so an unshuffled ``[:n]`` slice for any ``n`` <= 1000
+    is entirely 1-star. Shuffling with ``config.seed`` before selecting fixes that regardless of ``n``.
+    """
+    dataset = _load_hf_dataset(config.dataset_name, config.dataset_config, split)
+    dataset = dataset.shuffle(seed=config.seed).select(range(min(n, len(dataset))))
+    texts, labels = [], []
+    for row in dataset:
+        rating = row["label"] + 1
+        if rating == 3:
+            continue
+        texts.append(row["text"])
+        labels.append("positive" if rating > 3 else "negative")
+    return texts, labels
+
+
+# ``--dataset-name`` -> a custom loader for a dataset whose ground-truth labels need dataset-specific
+# logic (bucketing, dropping rows, ...) that the generic ``--label-column``/``--label-map`` path can't
+# express. Anything not listed takes the generic path in ``_load_split``. Mirrors ``MODEL_BUILDERS``: put
+# all dataset-specific code inside the loader and register it here — ``_load_split`` itself never changes.
+DATASET_LOADERS: dict[str, Callable[[ServeConfig, str, int], tuple[list[str], list[str]]]] = {
+    "mteb/amazon_reviews_multi": _load_amazon_reviews_multi_binary,
+}
+
+
+def _load_split(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
+    """Load ``n`` ``(texts, label_strings)`` of ``split`` from the configured dataset.
+
+    A dataset registered in :data:`DATASET_LOADERS` is delegated to its loader entirely (see there for
+    why ``mteb/amazon_reviews_multi`` needs one). Otherwise, the generic path applies: rows are shuffled
+    with ``config.seed`` before taking the first ``n`` — so samples are representative even when the
+    dataset's on-disk order groups rows by label — and ground-truth label strings come from the
+    dataset's own ``ClassLabel`` feature names when present (the usual shape for HF classification
+    datasets), otherwise the raw values are stringified as-is. ``config.label_map`` then renames them to
+    match the model's label names when the two disagree on spelling/casing (e.g. dataset ``"neg"`` vs.
+    model ``"NEGATIVE"``) despite sharing the same class order.
+    """
+    loader = DATASET_LOADERS.get(config.dataset_name)
+    if loader is not None:
+        sentences, labels = loader(config, split, n)
+        logger.info(
+            "Loaded %d samples from %s (split=%s) via its registered dataset loader",
+            len(sentences),
+            config.dataset_name,
+            split,
+        )
+        return sentences, labels
+
+    dataset = _load_hf_dataset(config.dataset_name, config.dataset_config, split).shuffle(seed=config.seed)
     sentences = dataset[config.text_column][:n]
     raw_labels = dataset[config.label_column][:n]
     names = getattr(dataset.features.get(config.label_column), "names", None)
@@ -337,6 +488,53 @@ def _load_tokenizer(model_name: str):
             ) from slow_err
 
 
+# transformers' sentinel for "tokenizer_config.json never set model_max_length" — effectively means
+# "no limit", not a real length. Passing it straight through makes truncation=True a no-op.
+_UNSET_TOKENIZER_MAX_LENGTH = 100_000
+
+
+def _safe_max_length(tokenizer, default: int = 512) -> int | None:
+    """The tokenizer's own truncation length, unless it's the "unset" sentinel — then ``default``.
+
+    A checkpoint whose tokenizer config never set ``model_max_length`` reports ``~1e30`` instead, so
+    ``truncation=True`` with no explicit ``max_length`` silently does nothing and a long text tokenizes
+    **unbounded**. That is not merely slow or memory-hungry: once a sequence is longer than the model's
+    ``max_position_embeddings``, its position ids index past the position/token-type buffers, and the
+    resulting out-of-bounds gather aborts the CUDA context outright (``device-side assert triggered``).
+    The abort is asynchronous, so it surfaces at whatever unrelated line next synchronises — see
+    ``_hf_classifier_model``, which is why every HF classifier here is built through one place.
+    """
+    model_max_length = getattr(tokenizer, "model_max_length", None)
+    if model_max_length is None or model_max_length > _UNSET_TOKENIZER_MAX_LENGTH:
+        return default
+    return model_max_length
+
+
+def _hf_classifier_model(config: ServeConfig, device: str, **kwargs) -> HFClassifierModel:
+    """Build an ``HFClassifierModel`` with truncation always resolved — the single construction point.
+
+    Every path that produces an ``HFClassifierModel`` (the generic loader *and* every custom builder in
+    :data:`MODEL_BUILDERS`) goes through here, so ``max_length`` can never be left unset by an author who
+    only meant to override something else, such as ``label_names``. That is not hypothetical: this helper
+    exists because a custom builder once constructed the model directly and inherited
+    ``max_length=None``, which silently disabled truncation for a tokenizer reporting the "unset"
+    sentinel and made any input longer than the model's position buffer abort the CUDA context.
+
+    ``kwargs`` are forwarded to :class:`~shapash.model.HFClassifierModel` (e.g. ``label_names=``).
+    """
+    tokenizer = _load_tokenizer(config.model_name)
+    classifier = transformers.AutoModelForSequenceClassification.from_pretrained(config.model_name).to(device)
+    logger.info("Loaded %s as HFClassifierModel on device: %s", config.model_name, next(classifier.parameters()).device)
+    max_length = _safe_max_length(tokenizer)
+    if max_length != tokenizer.model_max_length:
+        logger.info(
+            "%s's tokenizer reports no configured model_max_length — truncating at %d tokens instead.",
+            config.model_name,
+            max_length,
+        )
+    return HFClassifierModel(classifier, tokenizer, max_length=max_length, **kwargs)
+
+
 def _load_hf_classifier(config: ServeConfig, device: str) -> HFClassifierModel:
     """The generic default: any standard ``AutoModelForSequenceClassification`` checkpoint.
 
@@ -344,10 +542,7 @@ def _load_hf_classifier(config: ServeConfig, device: str) -> HFClassifierModel:
     packaged as a sequence classifier). Label names come from the model's own ``config.id2label``, so a
     new ``--model-name`` brings its own classes with no extra flags.
     """
-    tokenizer = _load_tokenizer(config.model_name)
-    classifier = transformers.AutoModelForSequenceClassification.from_pretrained(config.model_name).to(device)
-    logger.info("Loaded %s as HFClassifierModel on device: %s", config.model_name, next(classifier.parameters()).device)
-    return HFClassifierModel(classifier, tokenizer)
+    return _hf_classifier_model(config, device)
 
 
 # Reconcile the shhossain checkpoint's own class label spelling with the dair-ai/emotion dataset it is
@@ -400,12 +595,49 @@ def _build_shhossain_sentiment_model(config: ServeConfig, device: str) -> Senten
     return SentenceTransformerModel(st_model, head.to(device).eval(), label_names=labels, pool="mean")
 
 
+def _build_camembertv2_cls_model(config: ServeConfig, device: str) -> HFClassifierModel:
+    """``almanach/camembertv2-base-cls`` — standard checkpoint, but don't trust its predictions either.
+
+    Architecturally this is a plain ``RobertaForSequenceClassification`` (CamemBERT v2) that would load
+    fine through the generic path — the config problem is only ``label_names``. Its ``config.json`` ships
+    ``label2id`` but no ``id2label``; when only one of the pair is present, transformers regenerates the
+    missing side (and *overwrites* the other) via a ``num_labels`` setter, so ``config.id2label`` resolves
+    to meaningless ``{0: "LABEL_0", 1: "LABEL_1"}`` at load time — the generic ``_load_hf_classifier``
+    path (which reads ``label_names`` from exactly that) would show those in the webapp.
+
+    Passing ``label_names`` explicitly only fixes the *display* problem, not the model. A first attempt
+    at picking the right order used a 10-example hand-written probe (documented order 2/10, flipped
+    8/10) and shipped the flip — that was wrong to trust: ``demo/check_camembertv2_amazon_fr.py`` scores
+    both orderings against 388 gold-labeled reviews from this checkpoint's own FLUE-CLS fine-tuning
+    domain and finds **neither beats the trivial majority-class baseline**, and the model is confidently
+    wrong about as often as confidently right (mean top-class probability ~0.79 regardless of
+    correctness). The 10-example probe was noise, not signal — a small hand check can't tell a genuinely
+    swapped label from a model that just doesn't work. ``label_names`` below keeps the checkpoint's own
+    documented convention (no evidence favours the flip over it); treat every prediction from this model
+    as illustrative, not accurate — this builder exists as a worked example of the
+    label-names-can't-be-trusted registration pattern, not as a working sentiment classifier.
+
+    Only ``label_names`` is overridden — everything else, truncation included, comes from
+    :func:`_hf_classifier_model`. This checkpoint's tokenizer reports no ``model_max_length`` and its
+    ``max_position_embeddings`` is 1025, so building the model directly (as this once did) left
+    truncation disabled and let any review over 1024 tokens abort the CUDA context.
+    """
+    logger.warning(
+        "%s: this checkpoint's predictions are near chance-level and confidently wrong on gold in-domain "
+        "data (neither label ordering beats the majority-class baseline) — see "
+        "demo/check_camembertv2_amazon_fr.py. Treat its output in this demo as illustrative only.",
+        config.model_name,
+    )
+    return _hf_classifier_model(config, device, label_names=["negative", "positive"])
+
+
 # ``--model-name`` -> a custom builder for a checkpoint whose head can't be introspected from its name.
 # Anything not listed takes the generic ``_load_hf_classifier`` path. To serve a new custom model, add a
 # ``build(config, device) -> TextModel`` function above and one entry here — the core loader is untouched.
 # See the module docstring's "Serving a custom model" section for the per-adapter recipe.
 MODEL_BUILDERS: dict[str, Callable[[ServeConfig, str], TextModel]] = {
     "shhossain/all-MiniLM-L6-v2-sentiment-classifier": _build_shhossain_sentiment_model,
+    "almanach/camembertv2-base-cls": _build_camembertv2_cls_model,
 }
 
 
