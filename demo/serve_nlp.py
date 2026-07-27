@@ -46,8 +46,9 @@ see the ``[nlp]`` extra):
   50-step integration instead of running it through the model in one shot. Lower it (e.g. ``2`` or
   ``1``) if you hit a CUDA out-of-memory error, especially on memory-hungry architectures like DeBERTa.
 
-``lig`` is also the method most sensitive to *truncation* actually being configured — see
-``_hf_classifier_model`` for why every HF classifier here resolves an explicit ``max_length``.
+``lig`` is also the method most sensitive to *truncation* actually being configured — every HF
+classifier here is built through ``HFClassifierModel.from_pretrained(..., max_length="auto")``, which
+resolves a safe length even when the checkpoint's tokenizer reports none.
 
 Both counterfactual generators are offered live in the What-if Lab — ``hotflip`` (gradient-based token
 substitution) and ``ablation`` (leave-one-out token removal) — and are switched from a
@@ -58,12 +59,46 @@ The on-disk cache mirrors these dependencies as a hierarchy under ``--cache-dir`
 vectors and the projection derived from them — and a per-backend ``<...>/nlp_shap/`` or
 ``<...>/nlp_captum_lig/`` subdirectory holds that method's ``<hash>.pkl`` contributions.
 
+Serving a *private* model and dataset (both local, nothing on the hub)
+----------------------------------------------------------------------
+Neither ``--model-name`` nor the data has to come from the HuggingFace hub, and a local run gets the
+**full** capability surface — sentence highlights (both methods), the What-if Lab, both counterfactual
+generators, similar examples — exactly like a hub model, because everything is served through the same
+``HFClassifierModel`` adapter:
+
+* ``--model-name /path/to/checkpoint`` — a directory saved with ``model.save_pretrained(...)``. Weights
+  and ``config.json`` are enough; the *tokenizer* need not be there. When the directory ships no
+  tokenizer files, ``HFClassifierModel.from_pretrained`` falls back to the base model recorded in the
+  checkpoint's own ``config.json`` (``_name_or_path``) — right for any fine-tune that kept its base
+  tokenizer, which is the usual case. Pass ``--tokenizer-name`` (an id or a path) for a **customised**
+  tokenizer: nothing can detect that automatically.
+* ``--label-names NEGATIVE,POSITIVE`` — class names in output-column order, when the checkpoint's config
+  carries none. ``trainer.model.save_pretrained(...)`` records ``id2label`` only if training set it, so a
+  fine-tune often reports ``LABEL_0``/``LABEL_1``; this replaces them without needing a custom builder.
+  It is applied in ``_hf_classifier_model`` — the one place every *HF classifier* is built — so it also
+  overrides the hard-coded names of a ``MODEL_BUILDERS`` builder that goes through there
+  (``_build_camembertv2_cls_model``). A builder assembling some other adapter directly
+  (``_build_shhossain_sentiment_model``, a ``SentenceTransformerModel``) owns its label names outright
+  and this flag does not reach it. Get the *order* right — verify against real labeled rows, not a
+  handful (see ``--label-map`` below and the camembert cautionary tale further down).
+* ``--dataset-path /path/to/dir`` — local dataframes instead of ``--dataset-name`` (the two are mutually
+  exclusive; the CLI rejects both). A **directory** holds one file per split, ``<split>.parquet`` or
+  ``<split>.pkl``, so ``--dataset-split``/``--reference-split`` pick files exactly as they pick hub
+  splits. A **single file** works too, but only with ``--n-reference 0``: one file cannot also be the
+  reference corpus, and silently retrieving "similar examples" from the served rows would be a lie.
+  ``--text-column``/``--label-column`` name the columns; ``--label-map`` reconciles the dataframe's label
+  spelling with the model's, as for hub datasets. (``.pkl`` is read with ``pandas.read_pickle``, which
+  executes arbitrary code on load — point it only at files you produced yourself.)
+
+Caching works the same way: a local model or dataset is keyed in the cache hierarchy by its directory
+name plus a digest of its absolute path, so two checkpoints both named ``output/`` never share a cache.
+
 Serving a *custom* model (external-head checkpoints)
 ----------------------------------------------------
 Any standard ``AutoModelForSequenceClassification`` checkpoint loads automatically from ``--model-name``
-alone (``load_model`` builds an ``HFClassifierModel``; label names come from ``config.id2label``). That
-covers every certified encoder architecture — BERT, DistilBERT, RoBERTa, XLM-R, DeBERTa-v1, and a MiniLM
-packaged as a sequence classifier.
+alone — hub id or local path (``load_model`` builds an ``HFClassifierModel``; label names come from
+``config.id2label``). That covers every certified encoder architecture — BERT, DistilBERT, RoBERTa,
+XLM-R, DeBERTa-v1, and a MiniLM packaged as a sequence classifier.
 
 A model whose classification **head is custom** cannot be introspected from its name — its layer
 structure, weight-key convention, and input contract are non-standard (a sentence-transformer body + a
@@ -154,6 +189,11 @@ Usage
         --label-column label --label-map '{"neg": "NEGATIVE", "pos": "POSITIVE"}'
     # A registered custom (external-head) model — served via MODEL_BUILDERS, no other flags needed:
     python demo/serve_nlp.py --model-name shhossain/all-MiniLM-L6-v2-sentiment-classifier
+    # A private local checkpoint against local parquet dataframes (tokenizer resolved from the
+    # checkpoint's base model; --label-map reconciles the dataframe's labels with the model's):
+    python demo/serve_nlp.py --model-name demo/private_model \\
+        --dataset-path data/nlp_test_parquet --dataset-split test --reference-split train \\
+        --label-map '{"negative": "NEGATIVE", "positive": "POSITIVE"}'
 
 First run needs transformers, datasets and pacmap (the ``[nlp]`` extra). A ``SentenceTransformerModel``
 custom builder additionally needs the ``sentence-transformers`` package.
@@ -162,6 +202,7 @@ custom builder additionally needs the ``sentence-transformers`` package.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from collections.abc import Callable
@@ -170,8 +211,8 @@ from pathlib import Path
 
 import datasets
 import pacmap
+import pandas as pd
 import torch
-import transformers
 from torch import nn
 
 from shapash.backend import NlpCaptumLigBackend
@@ -192,7 +233,18 @@ class ServeConfig:
     """
 
     model_name: str = "bhadresh-savani/distilbert-base-uncased-emotion"
+    # Tokenizer source, when it isn't the checkpoint itself: a local ``save_pretrained`` artifact often
+    # ships weights + config only. ``None`` resolves it — see _resolve_tokenizer_source.
+    tokenizer_name: str | None = None
+    # Class names in output-column order, overriding the model config's ``id2label``. Needed for a
+    # fine-tune saved without label names (its config reports "LABEL_0"/"LABEL_1").
+    label_names: list[str] | None = None
     dataset_name: str = "dair-ai/emotion"
+    # Local dataframes instead of the HF hub: a directory of ``<split>.parquet`` / ``<split>.pkl``, or a
+    # single file (see _local_split_file). Mutually exclusive with ``dataset_name`` — the CLI rejects
+    # both, and every branch between the two goes through ``is_local_dataset`` so no code path can
+    # consult the unused one.
+    dataset_path: Path | None = None
     dataset_config: str | None = None  # HF dataset config/subset (e.g. a language); None = dataset's default
     dataset_split: str = "test"
     text_column: str = "text"
@@ -222,10 +274,68 @@ class ServeConfig:
     host: str = "0.0.0.0"  # noqa: S104
     recompute: bool = False
 
+    def __post_init__(self) -> None:
+        """Normalise ``dataset_path`` once, so every consumer sees the same path.
+
+        ``~`` is expanded by the *shell*, so a path only arrives here unexpanded when a caller built the
+        config directly (the REPL workflow this dataclass exists for) — and a literal ``~/...`` then
+        reads as a nonexistent *relative* directory, which silently defeats the ``is_file()`` tests that
+        decide whether a single file can also serve as the reference corpus. Doing it here means no
+        consumer has to remember to.
+        """
+        if self.dataset_path is not None:
+            self.dataset_path = self.dataset_path.expanduser()
+
+    @property
+    def model_path(self) -> Path | None:
+        """The local checkpoint directory ``model_name`` points at, or ``None`` when it is a hub id.
+
+        The single answer to "is this model local, and where?": the cache slug, the tokenizer fallback
+        and ``from_pretrained`` all ask *here* instead of each re-deriving it. They used to, and
+        disagreed — two expanded ``~`` and the loader did not, so a ``~/checkpoints/...`` model resolved
+        its tokenizer and its cache directory correctly and then failed to load.
+        """
+        path = Path(self.model_name).expanduser()
+        return path if path.is_dir() else None
+
+    @property
+    def is_local_dataset(self) -> bool:
+        """True when rows come from local dataframes (``--dataset-path``) rather than the HF hub.
+
+        ``dataset_name`` and ``dataset_path`` are mutually exclusive (the CLI rejects both), so exactly
+        one of them is meaningful on any given run. Every branch between the two tests *this* rather
+        than comparing fields, so a stale ``dataset_name`` default cannot leak into a local run — not
+        into its cache path (:func:`_dataset_slug`) and not into its loader (:func:`_load_split`).
+        """
+        return self.dataset_path is not None
+
 
 # Short ``--attribution`` choice → the attribution backend's registered ``.name`` (used as the cache
 # subdirectory *and* to pick the backend in ``build_backend``).
 _ATTRIBUTION_BACKENDS = {"shap": "nlp_shap", "lig": "nlp_captum_lig"}
+
+
+def _path_slug(path: Path) -> str:
+    """Filesystem-safe cache tag for a local path: its name plus a digest of its absolute location.
+
+    The name alone would collide across runs (every training run named ``output/`` or ``best_model/``
+    would share one cache directory); the absolute path alone is unreadable as a directory name. The
+    digest disambiguates, the name keeps ``--cache-dir`` browsable.
+    """
+    resolved = path.expanduser().resolve()
+    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+    return f"{resolved.name}__{digest}"
+
+
+def _model_slug(config: ServeConfig) -> str:
+    """Filesystem-safe tag for ``--model-name`` — an HF id or a local checkpoint directory.
+
+    HF ids keep the historical ``org__model`` spelling, so caches built before local checkpoints were
+    supported still resolve to the same directory; a local path goes through :func:`_path_slug`.
+    """
+    if config.model_path is not None:
+        return _path_slug(config.model_path)
+    return config.model_name.replace("/", "__")
 
 
 def _dataset_slug(config: ServeConfig) -> str:
@@ -233,8 +343,11 @@ def _dataset_slug(config: ServeConfig) -> str:
 
     The config segment is only included when ``--dataset-config`` is actually set, so existing cache
     directories built before that flag existed (``<dataset>__<split>``, no config with no HF dataset
-    config) still resolve to the same path.
+    config) still resolve to the same path. A local ``--dataset-path`` is tagged by
+    :func:`_path_slug` (an absolute path is neither readable nor unique as a directory name).
     """
+    if config.is_local_dataset:
+        return f"{_path_slug(config.dataset_path)}__{config.dataset_split}"
     parts = [config.dataset_name, *([config.dataset_config] if config.dataset_config else []), config.dataset_split]
     return "__".join(parts).replace("/", "__")
 
@@ -248,7 +361,7 @@ def _dataset_cache_dir(config: ServeConfig) -> Path:
     never touches the attribution backend, so every ``--attribution`` choice shares one projection cache
     at *this* level (below it, contributions split per backend).
     """
-    return config.cache_dir / config.model_name.replace("/", "__") / _dataset_slug(config)
+    return config.cache_dir / _model_slug(config) / _dataset_slug(config)
 
 
 def _compile_cache_dir(config: ServeConfig) -> Path:
@@ -266,9 +379,36 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
     defaults = ServeConfig()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--model-name", default=defaults.model_name, help="HF model id (label names are read from its config)."
+        "--model-name",
+        default=defaults.model_name,
+        help="HF model id, or a path to a local checkpoint directory saved with save_pretrained "
+        "(label names are read from its config unless --label-names is given).",
     )
-    parser.add_argument("--dataset-name", default=defaults.dataset_name, help="HF datasets id.")
+    parser.add_argument(
+        "--tokenizer-name",
+        default=defaults.tokenizer_name,
+        help="HF id or path of the tokenizer, when it isn't in the checkpoint itself. Default: resolved "
+        "from the checkpoint, falling back to the base model recorded in its config.",
+    )
+    parser.add_argument(
+        "--label-names",
+        default=None,
+        help="Comma-separated class names in output-column order, overriding the model config's "
+        "id2label — e.g. 'NEGATIVE,POSITIVE'. Needed for a fine-tune saved without label names "
+        "(its config reports LABEL_0/LABEL_1).",
+    )
+    # One dataset source per run: a stale --dataset-name alongside --dataset-path would otherwise decide
+    # the cache slug and the DATASET_LOADERS lookup for rows it did not provide.
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--dataset-name", default=defaults.dataset_name, help="HF datasets id.")
+    source.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=defaults.dataset_path,
+        help="Local dataframes instead of the HF hub: a directory holding <split>.parquet or "
+        "<split>.pkl (so --dataset-split / --reference-split select the file), or a single file "
+        "(which then requires --n-reference 0). Reads --text-column / --label-column.",
+    )
     parser.add_argument(
         "--dataset-config",
         default=defaults.dataset_config,
@@ -344,7 +484,31 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
         help="Ignore any cached results and recompute SHAP + projection (overwrites the cache).",
     )
     args = parser.parse_args(argv)
-    return ServeConfig(**vars(args))
+    # --label-names is a flat string on the CLI (one flag, no quoting rules to remember) but a list
+    # everywhere else, since that is what the model adapters take.
+    args.label_names = [name.strip() for name in args.label_names.split(",")] if args.label_names else None
+    # Validate the *config*, not the raw namespace: ``__post_init__`` has normalised ``dataset_path`` by
+    # then, so the ``is_file()`` test below sees the same path the loaders will (an unexpanded ``~/...``
+    # is a nonexistent relative directory, and would slip through this check).
+    config = ServeConfig(**vars(args))
+    if config.is_local_dataset and config.dataset_config is not None:
+        # --dataset-config only means anything to the hub loader; accepting it here would look like it
+        # selected something. (It isn't in the mutually exclusive group above: that pairs the two
+        # *sources*, and grouping three flags would reject the legitimate --dataset-name/--dataset-config
+        # combination too.)
+        parser.error(
+            "--dataset-config applies to --dataset-name (a hub dataset) and has no meaning for --dataset-path."
+        )
+    if config.is_local_dataset and config.dataset_path.is_file() and config.n_reference > 0:
+        # A single file can only serve one split; silently reusing it as the reference corpus would
+        # retrieve "similar examples" from the served rows themselves. Make the caller choose. The same
+        # invariant is re-checked in load_reference_corpus, which a REPL-built config does reach.
+        parser.error(
+            f"--dataset-path {config.dataset_path} is a single file, so there is no --reference-split "
+            f"{config.reference_split!r} to load: pass --n-reference 0 to disable the Similar Examples "
+            "panel, or point --dataset-path at a directory holding one file per split."
+        )
+    return config
 
 
 def _load_hf_dataset(name: str, dataset_config: str | None, split: str) -> datasets.Dataset:
@@ -365,6 +529,78 @@ def _load_hf_dataset(name: str, dataset_config: str | None, split: str) -> datas
         return datasets.load_dataset(
             "json", data_files=f"hf://datasets/{name}/{dataset_config}/{split}.jsonl", split="train"
         )
+
+
+# Local dataframe formats ``--dataset-path`` recognises, in the order a ``<split>.<ext>`` file is looked
+# up. ``read_pickle`` unpickles, which executes arbitrary code — only ever point ``--dataset-path`` at
+# files you produced yourself (the same trust assumption as loading your own model weights).
+_DATAFRAME_READERS: dict[str, Callable[[Path], pd.DataFrame]] = {
+    ".parquet": pd.read_parquet,
+    ".pkl": pd.read_pickle,  # noqa: S301
+    ".pickle": pd.read_pickle,  # noqa: S301
+}
+
+
+def _local_split_file(dataset_path: Path, split: str) -> Path:
+    """Resolve ``--dataset-path`` + a split name to one dataframe file.
+
+    A *file* is that split's data as given (the CLI only allows this when the reference corpus is
+    disabled, since one file cannot also be another split). A *directory* is searched for
+    ``<split>.<ext>`` over :data:`_DATAFRAME_READERS`, so ``--dataset-split``/``--reference-split``
+    select files the same way they select HF splits. Where a split exists in more than one format, that
+    dict's order decides (parquet first).
+
+    ``dataset_path`` is expected already normalised — ``ServeConfig.__post_init__`` expands ``~`` so
+    every caller tests the same path.
+    """
+    path = dataset_path
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        # Distinguish "the dataset root is wrong" from "this split is missing" — the message below
+        # would otherwise blame the split name for a mistyped --dataset-path.
+        raise FileNotFoundError(f"--dataset-path {path} is neither a file nor a directory.")
+    for suffix in _DATAFRAME_READERS:
+        candidate = path / f"{split}{suffix}"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"No '{split}' dataframe in {path}: expected one of "
+        f"{', '.join(f'{split}{suffix}' for suffix in _DATAFRAME_READERS)}."
+    )
+
+
+def _load_local_split(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
+    """Load ``n`` ``(texts, label_strings)`` rows of ``split`` from a local dataframe.
+
+    The dataframe counterpart of the generic HF path in :func:`_load_split`, and deliberately identical
+    downstream of the read: rows are shuffled with ``config.seed`` before the first ``n`` are taken,
+    labels are stringified, and ``config.label_map`` renames them onto the model's spelling. Rows with a
+    missing or blank text or label are dropped first — a real-world dataframe has them, an HF
+    ``ClassLabel`` column cannot.
+    """
+    file = _local_split_file(config.dataset_path, split)
+    frame = _DATAFRAME_READERS[file.suffix](file)
+    for column in (config.text_column, config.label_column):
+        if column not in frame.columns:
+            raise KeyError(
+                f"Column {column!r} not in {file} (columns: {list(frame.columns)}). "
+                "Point --text-column / --label-column at the right fields."
+            )
+    frame = frame[[config.text_column, config.label_column]].dropna()
+    # Blank-but-present is as unusable as missing, and a stray "" label would otherwise show up in the
+    # webapp as a ground-truth class of its own. dropna() above only catches NaN/None.
+    for column in (config.text_column, config.label_column):
+        frame = frame[frame[column].astype(str).str.strip().astype(bool)]
+    if frame.empty:
+        raise ValueError(f"{file} has no usable rows in columns {config.text_column!r}/{config.label_column!r}.")
+    frame = frame.sample(frac=1.0, random_state=config.seed).head(n)
+    sentences = [str(text) for text in frame[config.text_column]]
+    labels = [str(label) for label in frame[config.label_column]]
+    if config.label_map:
+        labels = [config.label_map.get(label, label) for label in labels]
+    logger.info("Loaded %d samples from %s (split=%s)", len(sentences), file, split)
+    return sentences, labels
 
 
 def _load_amazon_reviews_multi_binary(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
@@ -411,8 +647,11 @@ DATASET_LOADERS: dict[str, Callable[[ServeConfig, str, int], tuple[list[str], li
 def _load_split(config: ServeConfig, split: str, n: int) -> tuple[list[str], list[str]]:
     """Load ``n`` ``(texts, label_strings)`` of ``split`` from the configured dataset.
 
-    A dataset registered in :data:`DATASET_LOADERS` is delegated to its loader entirely (see there for
-    why ``mteb/amazon_reviews_multi`` needs one). Otherwise, the generic path applies: rows are shuffled
+    Three sources, checked in this order. ``--dataset-path`` (local dataframes) goes to
+    :func:`_load_local_split` — first, so a leftover ``--dataset-name`` default can never route local
+    rows through a hub loader. Otherwise a hub dataset registered in :data:`DATASET_LOADERS` is
+    delegated to its loader entirely (see there for why ``mteb/amazon_reviews_multi`` needs one).
+    Otherwise, the generic hub path applies: rows are shuffled
     with ``config.seed`` before taking the first ``n`` — so samples are representative even when the
     dataset's on-disk order groups rows by label — and ground-truth label strings come from the
     dataset's own ``ClassLabel`` feature names when present (the usual shape for HF classification
@@ -420,6 +659,9 @@ def _load_split(config: ServeConfig, split: str, n: int) -> tuple[list[str], lis
     match the model's label names when the two disagree on spelling/casing (e.g. dataset ``"neg"`` vs.
     model ``"NEGATIVE"``) despite sharing the same class order.
     """
+    if config.is_local_dataset:
+        return _load_local_split(config, split, n)
+
     loader = DATASET_LOADERS.get(config.dataset_name)
     if loader is not None:
         sentences, labels = loader(config, split, n)
@@ -453,94 +695,58 @@ def load_reference_corpus(config: ServeConfig) -> tuple[list[str], list[str]] | 
     Returns ``(texts, labels)`` from ``config.reference_split`` for the "Similar Examples" panel,
     or ``None`` when disabled (``n_reference <= 0``). This is the pool neighbours are retrieved from,
     so it is the model's *training* set rather than the served (test) split.
+
+    A single-file ``--dataset-path`` cannot supply it: :func:`_local_split_file` returns that one file
+    for *any* split name, so the bank would be built from the served rows themselves and every "similar
+    example" would be a lookalike of the corpus it came from. The CLI rejects that combination up front
+    with a friendlier message, but the invariant is enforced here as well — a ``ServeConfig`` built
+    directly (the REPL workflow this module is designed for) never goes through ``parse_args``.
     """
     if config.n_reference <= 0:
         return None
+    if config.is_local_dataset and config.dataset_path.is_file():
+        raise ValueError(
+            f"dataset_path {config.dataset_path} is a single file, so it cannot also provide the "
+            f"reference_split {config.reference_split!r}. Set n_reference=0, or point dataset_path at a "
+            "directory holding one file per split."
+        )
     return _load_split(config, config.reference_split, config.n_reference)
 
 
-def _load_tokenizer(model_name: str):
-    """Load the tokenizer, preferring a fast one but falling back to the slow implementation.
-
-    A fast tokenizer is best — it unlocks the exact ``word_ids()`` word-alignment the LIG highlights
-    use — but some checkpoints ship no ``tokenizer.json``, so the fast load raises. We then retry with
-    ``use_fast=False``; a slow tokenizer still works (the LIG backend degrades to its scheme-aware
-    string merge). When *both* fail, the checkpoint has no standard HF tokenizer at all — typically a
-    custom ``trust_remote_code`` architecture — which the ``HFClassifierModel`` adapter does not support;
-    surface that as a clear error rather than a deep tokenizer stack trace.
-    """
-    try:
-        return transformers.AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    except Exception as fast_err:  # noqa: BLE001 — retry slow, then re-raise with a usable hint
-        logger.warning(
-            "Fast tokenizer unavailable for %s (%s) — retrying with use_fast=False.",
-            model_name,
-            type(fast_err).__name__,
-        )
-        try:
-            return transformers.AutoTokenizer.from_pretrained(model_name, use_fast=False)
-        except Exception as slow_err:  # noqa: BLE001 — no standard tokenizer; give an actionable message
-            raise RuntimeError(
-                f"Could not load a tokenizer for {model_name!r} in fast or slow mode. This is usually a "
-                "checkpoint with a non-standard or custom (trust_remote_code) tokenizer/architecture, "
-                "which the HFClassifierModel adapter does not support. Use a standard "
-                "AutoModelForSequenceClassification checkpoint that ships a normal HF tokenizer."
-            ) from slow_err
-
-
-# transformers' sentinel for "tokenizer_config.json never set model_max_length" — effectively means
-# "no limit", not a real length. Passing it straight through makes truncation=True a no-op.
-_UNSET_TOKENIZER_MAX_LENGTH = 100_000
-
-
-def _safe_max_length(tokenizer, default: int = 512) -> int | None:
-    """The tokenizer's own truncation length, unless it's the "unset" sentinel — then ``default``.
-
-    A checkpoint whose tokenizer config never set ``model_max_length`` reports ``~1e30`` instead, so
-    ``truncation=True`` with no explicit ``max_length`` silently does nothing and a long text tokenizes
-    **unbounded**. That is not merely slow or memory-hungry: once a sequence is longer than the model's
-    ``max_position_embeddings``, its position ids index past the position/token-type buffers, and the
-    resulting out-of-bounds gather aborts the CUDA context outright (``device-side assert triggered``).
-    The abort is asynchronous, so it surfaces at whatever unrelated line next synchronises — see
-    ``_hf_classifier_model``, which is why every HF classifier here is built through one place.
-    """
-    model_max_length = getattr(tokenizer, "model_max_length", None)
-    if model_max_length is None or model_max_length > _UNSET_TOKENIZER_MAX_LENGTH:
-        return default
-    return model_max_length
-
-
 def _hf_classifier_model(config: ServeConfig, device: str, **kwargs) -> HFClassifierModel:
-    """Build an ``HFClassifierModel`` with truncation always resolved — the single construction point.
+    """Adapt this demo's ``ServeConfig`` onto :meth:`HFClassifierModel.from_pretrained`.
 
-    Every path that produces an ``HFClassifierModel`` (the generic loader *and* every custom builder in
-    :data:`MODEL_BUILDERS`) goes through here, so ``max_length`` can never be left unset by an author who
-    only meant to override something else, such as ``label_names``. That is not hypothetical: this helper
-    exists because a custom builder once constructed the model directly and inherited
-    ``max_length=None``, which silently disabled truncation for a tokenizer reporting the "unset"
-    sentinel and made any input longer than the model's position buffer abort the CUDA context.
+    A thin translation layer: the library classmethod owns everything that used to live here — resolving
+    a tokenizer (including the base-model fallback for a ``save_pretrained`` directory that shipped none),
+    defeating the ``model_max_length`` no-op trap (``max_length="auto"``), and the ``label_names`` arity
+    check. All this demo adds is its own conventions: ``--model-name`` may be a local path or a hub id,
+    ``--tokenizer-name`` maps to the ``tokenizer=`` override, and ``--label-names`` beats a builder's own
+    hard-coded ``label_names`` (passing the flag is a deliberate request to override).
 
-    ``kwargs`` are forwarded to :class:`~shapash.model.HFClassifierModel` (e.g. ``label_names=``).
+    Every path that produces an ``HFClassifierModel`` — the generic loader *and* every custom builder in
+    :data:`MODEL_BUILDERS` — goes through here, so no builder can bypass ``max_length`` resolution by
+    constructing the adapter directly. Other ``kwargs`` are forwarded untouched.
     """
-    tokenizer = _load_tokenizer(config.model_name)
-    classifier = transformers.AutoModelForSequenceClassification.from_pretrained(config.model_name).to(device)
-    logger.info("Loaded %s as HFClassifierModel on device: %s", config.model_name, next(classifier.parameters()).device)
-    max_length = _safe_max_length(tokenizer)
-    if max_length != tokenizer.model_max_length:
-        logger.info(
-            "%s's tokenizer reports no configured model_max_length — truncating at %d tokens instead.",
-            config.model_name,
-            max_length,
-        )
-    return HFClassifierModel(classifier, tokenizer, max_length=max_length, **kwargs)
+    label_names = config.label_names or kwargs.pop("label_names", None)
+    source = str(config.model_path) if config.model_path is not None else config.model_name
+    return HFClassifierModel.from_pretrained(
+        source,
+        tokenizer=config.tokenizer_name,
+        label_names=label_names,
+        device=device,
+        **kwargs,
+    )
 
 
 def _load_hf_classifier(config: ServeConfig, device: str) -> HFClassifierModel:
     """The generic default: any standard ``AutoModelForSequenceClassification`` checkpoint.
 
     Covers every certified encoder architecture (BERT/DistilBERT/RoBERTa/XLM-R/DeBERTa-v1, and MiniLM
-    packaged as a sequence classifier). Label names come from the model's own ``config.id2label``, so a
-    new ``--model-name`` brings its own classes with no extra flags.
+    packaged as a sequence classifier), whether ``--model-name`` is a hub id or a local checkpoint
+    directory. Label names come from the model's own ``config.id2label``, so a new ``--model-name``
+    brings its own classes with no extra flags — unless ``--label-names`` overrides them (applied in
+    :func:`_hf_classifier_model`, so builders honour it too), which a fine-tune saved without label
+    names needs (its config reports ``LABEL_0``/``LABEL_1``).
     """
     return _hf_classifier_model(config, device)
 

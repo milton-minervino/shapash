@@ -16,7 +16,13 @@ they never run SHAP themselves, they only copy in a cache built by running the s
 below). Model, dataset, split, columns, sample count, and a ground-truth label-renaming map are all
 configurable via `ServeConfig` in that file — see its module docstring for
 `--model-name`/`--dataset-name`/`--dataset-split`/`--text-column`/`--label-column`/`--label-map`/`--n`
-and worked examples (e.g. swapping in an IMDB sentiment model/dataset). `Dockerfile` itself stays
+and worked examples (e.g. swapping in an IMDB sentiment model/dataset). **Nothing has to come from the
+HuggingFace hub**: `--model-name /path/to/checkpoint` serves a local `save_pretrained` directory (its
+tokenizer is resolved from the checkpoint, falling back to the base model in its `config.json`; pass
+`--tokenizer-name` for a customised one, and `--label-names` when the config has no class names), and
+`--dataset-path` serves local `<split>.parquet` / `<split>.pkl` dataframes instead of `--dataset-name`.
+A private model + private data gets the full webapp — highlights, What-if Lab, counterfactuals,
+similar examples — like any hub model. `Dockerfile` itself stays
 hardcoded to the emotion example on purpose (it's meant to run out of the box for anyone cloning the
 repo) — its build-time warm-up (`RUN python -c "..."`) downloads exactly that model/dataset/split, so
 it always matches `ServeConfig`'s defaults. Serving a different model/dataset combo in Docker means
