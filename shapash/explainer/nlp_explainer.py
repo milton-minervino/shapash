@@ -315,9 +315,7 @@ class NlpExplainer:
 
         if y_true is not None:
             self.y_true = (
-                y_true
-                if isinstance(y_true, pd.Series)
-                else pd.Series(y_true, index=self.texts.index, name="ground_truth")
+                y_true if isinstance(y_true, pd.Series) else pd.Series(y_true, index=texts.index, name="ground_truth")
             )
 
     def cache_path(self, x: list[str] | pd.Series, cache_dir: str | Path) -> Path:
@@ -434,7 +432,11 @@ class NlpExplainer:
         if reducer is None:
             reducer = PCA(n_components=2)
 
-        store = EmbeddingStore(text_model, self.texts.tolist(), cache_dir=cache_dir)
+        store = EmbeddingStore(
+            text_model,  # type: ignore[arg-type]  # has_capabilities narrows the capability
+            self.texts.tolist(),
+            cache_dir=cache_dir,
+        )
         if recompute:
             store.clear()
         with self._compute_guard():  # embed() tokenizes — serialize against the live compute ops
@@ -488,7 +490,7 @@ class NlpExplainer:
         results: TextResults = state["results"]
         xpl = cls.__new__(cls)
         xpl.model = None
-        xpl.backend = None
+        xpl.backend = None  # type: ignore[assignment]  # snapshot instance never runs live compute
         xpl._text_model = None
         xpl.cf_generator = None
         xpl.cf_generators = {}
@@ -698,6 +700,7 @@ class NlpExplainer:
         Handles both ``return_all_scores=True`` (list of lists of dicts) and
         single-prediction (list of dicts) pipeline output formats.
         """
+        assert self.texts is not None  # noqa: S101 - compile() sets this before calling _predict
         text_model = getattr(self, "_text_model", None)
         if text_model is not None:
             probs = text_model.predict(text_list)

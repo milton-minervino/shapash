@@ -27,6 +27,7 @@ class SentenceHighlightComponent(WebappComponent):
     def layout(self, view, engine=None) -> html.Div:
         """Return the class picker + sentence-highlight placeholder div."""
         label_names = view.label_names or [str(i) for i in range(view.n_classes)]
+        class_options: list[dcc.Dropdown.Options] = [{"label": name, "value": i} for i, name in enumerate(label_names)]
         return html.Div(
             [
                 # One inline phrase instead of a title + a same-info dropdown: the class name would
@@ -36,7 +37,7 @@ class SentenceHighlightComponent(WebappComponent):
                         html.Span("Token Contributions for", className="fw-bold small me-2"),
                         dcc.Dropdown(
                             id="local-class-selector",
-                            options=[{"label": name, "value": i} for i, name in enumerate(label_names)],
+                            options=class_options,
                             value=self._default_class_idx,
                             clearable=False,
                             style={"width": "180px"},

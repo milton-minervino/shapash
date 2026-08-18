@@ -22,7 +22,7 @@ concrete class — this is what keeps HotFlip and friends model-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 
@@ -149,11 +149,12 @@ class SupportsTokenization(ABC):
             ``"Ġ"`` (byte-level BPE) or ``"▁"`` (SentencePiece) when word starts are marked; ``None``
             for WordPiece-style continuation marking or a plain whitespace tokenizer.
         """
-        marker = getattr(self, "_word_start_marker_cache", _UNRESOLVED)
-        if marker is _UNRESOLVED:
+        cached = getattr(self, "_word_start_marker_cache", _UNRESOLVED)
+        if cached is _UNRESOLVED:
             marker = self._probe_word_start_marker()
             self._word_start_marker_cache = marker
-        return marker
+            return marker
+        return cast("str | None", cached)
 
     def _probe_word_start_marker(self) -> str | None:
         """Tokenize :data:`_MARKER_PROBE_TEXT` and report the marker its tokens carry, if any."""
