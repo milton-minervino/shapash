@@ -196,9 +196,11 @@ class NlpWebApp:
         n = self._view.n_samples
 
         # ── Table records — always include _orig_idx for scatter filtering ──
+        texts = self._view.texts
+        assert texts is not None  # noqa: S101 - the webapp requires an already-compiled explainer
         records: dict[str, list] = {
             "_orig_idx": list(range(n)),
-            "text": self._view.texts.tolist(),
+            "text": texts.tolist(),
             "prediction": (self._view.y_pred.tolist() if self._view.y_pred is not None else [""] * n),
         }
         if self._view.y_true is not None:
@@ -247,11 +249,12 @@ class NlpWebApp:
                 if tok.strip() and not _SPECIAL_RE.match(tok.strip())
             }
         )
+        word_options: list[dcc.Dropdown.Options] = [{"label": w, "value": w} for w in all_words]
 
         # ── Scatter panel content (only when scatter_xy is provided) ──
         scatter_col_content = None
         if self._scatter_xy is not None:
-            color_options = [{"label": "Prediction", "value": "prediction"}]
+            color_options: list[dcc.Dropdown.Options] = [{"label": "Prediction", "value": "prediction"}]
             if self._view.y_true is not None:
                 color_options.append({"label": "Ground Truth", "value": "ground_truth"})
             color_options.append({"label": "Word contribution", "value": "word_contribution"})
@@ -278,7 +281,7 @@ class NlpWebApp:
                             dbc.Col(
                                 dcc.Dropdown(
                                     id="scatter-word-select",
-                                    options=[{"label": w, "value": w} for w in all_words],
+                                    options=word_options,
                                     value=[],
                                     multi=True,
                                     clearable=True,
@@ -319,9 +322,16 @@ class NlpWebApp:
         # per-cell word charts below (words toward the predicted vs. the true class).
         error_analysis_body = None
         if has_gt:
+            normalize_options: list[dcc.RadioItems.Options] = [
+                {"label": " Counts", "value": "count"},
+                {"label": " Recall", "value": "recall"},
+            ]
             idx_of = self._label_to_idx
-            true_arr = np.array([idx_of.get(str(v), -1) for v in self._view.y_true.tolist()])
-            pred_arr = np.array([idx_of.get(str(v), -1) for v in self._view.y_pred.tolist()])
+            y_true, y_pred = self._view.y_true, self._view.y_pred
+            # has_gt confirms y_true was compiled; y_pred always accompanies it.
+            assert y_true is not None and y_pred is not None  # noqa: S101
+            true_arr = np.array([idx_of.get(str(v), -1) for v in y_true.tolist()])
+            pred_arr = np.array([idx_of.get(str(v), -1) for v in y_pred.tolist()])
             k = len(label_names)
             cm = np.zeros((k, k), dtype=int)
             for t, p in zip(true_arr, pred_arr, strict=True):
@@ -346,10 +356,7 @@ class NlpWebApp:
                             dbc.Col(
                                 dcc.RadioItems(
                                     id="cm-normalize",
-                                    options=[
-                                        {"label": " Counts", "value": "count"},
-                                        {"label": " Recall", "value": "recall"},
-                                    ],
+                                    options=normalize_options,
                                     value="count",
                                     inline=True,
                                     inputStyle={"marginRight": "4px"},
@@ -418,6 +425,14 @@ class NlpWebApp:
         # independent from the local class picker in the Sentence Highlight panel below.)
         # The tab label already names the panel, so no H6; a tight controls row + a graph that
         # flex-grows to fill the panel means the whole chart is visible without scrolling.
+        global_class_options: list[dcc.Dropdown.Options] = [
+            {"label": name, "value": i} for i, name in enumerate(label_names)
+        ]
+        sign_filter_options: list[dcc.RadioItems.Options] = [
+            {"label": " All", "value": "all"},
+            {"label": " Positive", "value": "positive"},
+            {"label": " Negative", "value": "negative"},
+        ]
         word_importance_panel = html.Div(
             [
                 dbc.Row(
@@ -427,7 +442,7 @@ class NlpWebApp:
                                 html.Label("Class", className="fw-bold small mb-0"),
                                 dcc.Dropdown(
                                     id="global-class-selector",
-                                    options=[{"label": name, "value": i} for i, name in enumerate(label_names)],
+                                    options=global_class_options,
                                     value=0,
                                     clearable=False,
                                 ),
@@ -454,11 +469,7 @@ class NlpWebApp:
                                 html.Label("Contributions", className="fw-bold small mb-0"),
                                 dcc.RadioItems(
                                     id="sign-filter",
-                                    options=[
-                                        {"label": " All", "value": "all"},
-                                        {"label": " Positive", "value": "positive"},
-                                        {"label": " Negative", "value": "negative"},
-                                    ],
+                                    options=sign_filter_options,
                                     value="all",
                                     inline=True,
                                     inputStyle={"marginRight": "4px"},
@@ -473,7 +484,7 @@ class NlpWebApp:
                                 html.Label("Exclude words", className="fw-bold small mb-0"),
                                 dcc.Dropdown(
                                     id="word-filter",
-                                    options=[{"label": w, "value": w} for w in all_words],
+                                    options=word_options,
                                     value=[],
                                     multi=True,
                                     placeholder="Exclude…",
@@ -601,7 +612,7 @@ class NlpWebApp:
         )
 
         # ── Assemble the three panels as tab groups (all bodies stay mounted) ──
-        self._tab_groups = {}
+        self._tab_groups: dict[str, list[str]] = {}
 
         # Local class picker default: the predicted class of the initially selected row. It is reset
         # to the newly-selected text's prediction by a sync callback owned by
@@ -1188,12 +1199,15 @@ class NlpWebApp:
         """
         n = self._view.n_samples
         contrib = self._view.contributions
-        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in self._view.texts]
+        view_texts = self._view.texts
+        assert view_texts is not None  # noqa: S101 - the webapp requires an already-compiled explainer
+        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in view_texts]
         xy = self._scatter_xy
+        assert xy is not None  # noqa: S101 - only registered/called when scatter_xy was provided
         error_mask = self._error_mask() if errors_only else None
 
         if color_by == "word_contribution" and words:
-            contributions = sum(self._word_contributions(w, label_idx) for w in words)
+            contributions = np.sum([self._word_contributions(w, label_idx) for w in words], axis=0)
             max_abs = float(np.abs(contributions).max()) or 1.0
             present_mask = np.where(contributions != 0.0)[0]
             absent_mask = np.where(contributions == 0.0)[0]
