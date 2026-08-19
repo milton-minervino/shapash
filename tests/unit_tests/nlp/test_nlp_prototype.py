@@ -45,10 +45,7 @@ def _make_contributions() -> NlpContributions:
         ["", "this", "is", "terrible", "and", "sad", ""],
         ["", "what", "a", "wonderful", "day", ""],
     ]
-    values = [
-        rng.uniform(-0.4, 0.4, size=(len(t), N_CLASSES)).astype(np.float32)
-        for t in token_strings
-    ]
+    values = [rng.uniform(-0.4, 0.4, size=(len(t), N_CLASSES)).astype(np.float32) for t in token_strings]
     base_values = rng.uniform(-0.1, 0.1, size=(3, N_CLASSES)).astype(np.float32)
     return NlpContributions(
         token_strings=token_strings,
@@ -109,6 +106,118 @@ class TestNlpContributions(unittest.TestCase):
         # Empty strings (BOS/EOS) should now be present
         self.assertIn("", imp.index)
 
+    def test_word_importance_hides_punctuation_by_default(self):
+        contrib = NlpContributions(
+            token_strings=[["great", "!", "!", "movie", ".", ","]],
+            values=[np.array([[3.0], [9.0], [9.0], [2.0], [8.0], [7.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20)
+        self.assertEqual(sorted(imp.index), ["great", "movie"])
+
+    def test_word_importance_keeps_punctuation_when_asked(self):
+        contrib = NlpContributions(
+            token_strings=[["great", "!", "!"]],
+            values=[np.array([[3.0], [9.0], [9.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20, filter_punctuation=False)
+        self.assertIn("!", imp.index)
+        # Punctuation kept means it can outrank real words, which is why it is hidden by default.
+        self.assertEqual(imp.index[0], "!")
+
+    def test_word_importance_keeps_words_containing_punctuation(self):
+        # Only *pure* punctuation units are dropped — a hyphenated or apostrophised word stays.
+        contrib = NlpContributions(
+            token_strings=[["state-of-the-art", "don't", "-"]],
+            values=[np.array([[3.0], [2.0], [9.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20)
+        self.assertEqual(sorted(imp.index), ["don't", "state-of-the-art"])
+
+    def test_resolve_lowercase_follows_the_model(self):
+        contrib = _make_contributions()
+        for folds_case, expected in ((True, True), (False, False), (None, True)):
+            with self.subTest(folds_case=folds_case):
+                contrib.folds_case = folds_case
+                self.assertEqual(contrib.resolve_lowercase(), expected)
+
+    def test_resolve_lowercase_explicit_argument_wins(self):
+        contrib = _make_contributions()
+        contrib.folds_case = True
+        self.assertFalse(contrib.resolve_lowercase(False))
+        contrib.folds_case = False
+        self.assertTrue(contrib.resolve_lowercase(True))
+
+    def test_word_importance_keeps_case_on_a_cased_model(self):
+        # A cased tokenizer encodes AWFUL and awful to *different* ids, so they are different
+        # inputs with genuinely different attributions — merging them would hide that.
+        contrib = NlpContributions(
+            token_strings=[["AWFUL", "awful"]],
+            values=[np.array([[-9.0], [-3.0]])],
+            base_values=np.zeros((1, 1)),
+            folds_case=False,
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20)
+        self.assertEqual(sorted(imp.index), ["AWFUL", "awful"])
+
+    def test_word_importance_merges_case_on_an_uncased_model(self):
+        # An uncased tokenizer maps both spellings to one input id — the model cannot tell them
+        # apart, so they must not appear as two rows.
+        contrib = NlpContributions(
+            token_strings=[["AWFUL", "awful"]],
+            values=[np.array([[-9.0], [-3.0]])],
+            base_values=np.zeros((1, 1)),
+            folds_case=True,
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20)
+        self.assertEqual(list(imp.index), ["awful"])
+        self.assertAlmostEqual(imp["awful"], -6.0)
+
+    def test_word_importance_merges_case_variants_by_default(self):
+        # One row per word, averaged over every casing — not three rows of one occurrence each.
+        contrib = NlpContributions(
+            token_strings=[["AWFUL", "Awful", "awful", "good"]],
+            values=[np.array([[-9.0], [-3.0], [-3.0], [1.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20)
+        self.assertEqual(sorted(imp.index), ["awful", "good"])
+        self.assertAlmostEqual(imp["awful"], -5.0)
+
+    def test_word_importance_case_fragmentation_lets_rare_variants_outrank(self):
+        # The reason lowercasing is the default: a single capitalised occurrence keeps its own
+        # extreme value instead of being averaged into the 3 common ones, and tops the ranking.
+        contrib = NlpContributions(
+            token_strings=[["TERRIBLE", *["terrible"] * 9, "dull"]],
+            values=[np.array([[-9.0], *[[-0.1]] * 9, [-2.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        cased = contrib.word_importance(label_idx=0, n_top=20, lowercase=False)
+        self.assertEqual(cased.index[0], "TERRIBLE")
+        folded = contrib.word_importance(label_idx=0, n_top=20)
+        self.assertEqual(folded.index[0], "dull")
+
+    def test_word_importance_keeps_case_when_disabled(self):
+        contrib = NlpContributions(
+            token_strings=[["AWFUL", "awful"]],
+            values=[np.array([[-9.0], [-3.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20, lowercase=False)
+        self.assertEqual(sorted(imp.index), ["AWFUL", "awful"])
+
+    def test_word_importance_exclusion_is_case_insensitive_when_folding(self):
+        # The webapp's dropdown offers lowercase entries; excluding one must drop every casing.
+        contrib = NlpContributions(
+            token_strings=[["AWFUL", "awful", "good"]],
+            values=[np.array([[-9.0], [-3.0], [1.0]])],
+            base_values=np.zeros((1, 1)),
+        )
+        imp = contrib.word_importance(label_idx=0, n_top=20, exclude_words={"AwFuL"})
+        self.assertEqual(list(imp.index), ["good"])
+
     def test_word_importance_respects_n_top(self):
         imp = self.contrib.word_importance(label_idx=1, n_top=3)
         self.assertLessEqual(len(imp), 3)
@@ -146,9 +255,7 @@ class TestNlpContributions(unittest.TestCase):
         if len(imp_full) == 0:
             return
         word_to_exclude = imp_full.index[0]
-        imp_filtered = self.contrib.word_importance(
-            label_idx=1, filter_special=True, exclude_words={word_to_exclude}
-        )
+        imp_filtered = self.contrib.word_importance(label_idx=1, filter_special=True, exclude_words={word_to_exclude})
         self.assertNotIn(word_to_exclude, imp_filtered.index)
 
     def test_word_importance_exclude_words_empty_set(self):
@@ -407,6 +514,24 @@ class TestNlpExplainer(unittest.TestCase):
         fig = self.xpl.text_plot(pos=0, label_idx=1)
         self.assertIsInstance(fig, go.Figure)
 
+    def test_folds_case_is_none_without_a_tokenizing_model(self):
+        # A bare classifier_fn has no tokenizer to ask; None is the honest answer, not a guess.
+        self.assertIsNone(self.xpl._folds_case())
+
+    def test_folds_case_reads_the_model_capability(self):
+        class _Uncased(TextModel, SupportsTokenization):
+            def predict(self, texts):
+                return np.tile([0.5, 0.5], (len(texts), 1))
+
+            def tokenize(self, text):
+                return text.lower().split()
+
+            def detokenize(self, tokens):
+                return " ".join(tokens)
+
+        self.xpl._text_model = _Uncased(label_names=["neg", "pos"])
+        self.assertTrue(self.xpl._folds_case())
+
     def test_text_plot_all_samples(self):
         for pos in range(3):
             fig = self.xpl.text_plot(pos=pos, label_idx=0)
@@ -656,7 +781,9 @@ class TestNlpExplainerGenerators(unittest.TestCase):
 
     def test_no_generators_without_text_model(self):
         # A plain callable is neither a TextModel nor a pipeline → no generators, empty selector.
-        xpl = NlpExplainer(lambda texts: np.tile([0.5, 0.5], (len(texts), 1)), label_names=["neg", "pos"], backend=object())
+        xpl = NlpExplainer(
+            lambda texts: np.tile([0.5, 0.5], (len(texts), 1)), label_names=["neg", "pos"], backend=object()
+        )
         self.assertEqual(xpl.available_cf_generators(), [])
         self.assertEqual(xpl.cf_config_spec(), {})
         self.assertIsNone(xpl.cf_generator)
@@ -823,7 +950,6 @@ class TestNlpWebApp(unittest.TestCase):
         self.assertIsNone(_cell_from_click({"points": []}, name_to_idx))
         self.assertIsNone(_cell_from_click({"points": [{"x": "??", "y": "??"}]}, name_to_idx))
 
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -913,7 +1039,6 @@ def _make_lime_backend() -> NlpLimeBackend:
 
 
 class TestNlpLimeBackend(unittest.TestCase):
-
     def setUp(self):
         self.backend = _make_lime_backend()
 
@@ -970,10 +1095,7 @@ class TestNlpLimeBackend(unittest.TestCase):
     def test_classifier_fn_converts_hf_pipeline_format(self):
         # HuggingFace pipeline with return_all_scores=True returns list[list[dict]].
         def hf_model(texts):
-            return [
-                [{"label": name, "score": 1.0 / N_CLASSES} for name in LABEL_NAMES]
-                for _ in texts
-            ]
+            return [[{"label": name, "score": 1.0 / N_CLASSES} for name in LABEL_NAMES] for _ in texts]
 
         backend = NlpLimeBackend(hf_model, label_names=LABEL_NAMES)
         result = backend._classifier_fn(["hello", "world"])
@@ -1052,7 +1174,6 @@ class TestNlpLimeBackend(unittest.TestCase):
 
 
 class TestNlpExplainerWithLimeBackend(unittest.TestCase):
-
     def _make_explainer_lime(self, compiled: bool = True) -> NlpExplainer:
         """NlpExplainer backed by NlpLimeBackend, with synthetic contributions."""
         xpl = _make_explainer(compiled=compiled)

@@ -133,6 +133,46 @@ class TestWordStartMarker(unittest.TestCase):
         self.assertTrue(model.is_substitutable("happy"))
 
 
+class _CasingModel(_SchemeModel):
+    """Whitespace tokenizer that optionally case-folds, as an uncased checkpoint's normalizer does."""
+
+    def __init__(self, lowercase=False):
+        super().__init__()
+        self.lowercase = lowercase
+
+    def tokenize(self, text):
+        return super().tokenize(text.lower() if self.lowercase else text)
+
+
+class TestFoldsCase(unittest.TestCase):
+    """Casing is probed from what the tokenizer emits — no real family records it the same way.
+
+    RoBERTa and CamemBERTv2 both report ``normalizer=None`` while a BERT-family uncased checkpoint
+    hides it in ``BertNormalizer(lowercase=True)``, so reading attributes would misclassify them.
+    """
+
+    def test_detects_uncased_tokenizer(self):
+        self.assertTrue(_CasingModel(lowercase=True).folds_case())
+
+    def test_detects_cased_tokenizer(self):
+        self.assertFalse(_CasingModel(lowercase=False).folds_case())
+
+    def test_probe_runs_once_and_is_memoized(self):
+        model = _CasingModel(lowercase=True)
+        for _ in range(5):
+            model.folds_case()
+        # Two calls for the single probe (lower + upper), then memoized.
+        self.assertEqual(model.tokenize_calls, 2)
+
+    def test_unprobeable_tokenizer_is_treated_as_cased(self):
+        # Guessing "uncased" would merge units of a model we know nothing about; keep them apart.
+        class _Broken(_CasingModel):
+            def tokenize(self, text):
+                raise RuntimeError("tokenizer unavailable")
+
+        self.assertFalse(_Broken().folds_case())
+
+
 class TestIsSubstitutable(unittest.TestCase):
     """Word-hood must follow the model's own scheme — a single ``isalpha`` rule is wrong for two of three.
 

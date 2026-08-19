@@ -17,6 +17,7 @@ import pickle
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -30,7 +31,7 @@ from shapash.compute.generators.ablation_flip import AblationFlipGenerator
 from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
 from shapash.compute.generators.hotflip import HotFlipGenerator
 from shapash.compute.retrieval.similar_examples import Neighbor, SimilarExampleRetriever
-from shapash.model.base import SupportsEmbeddings, TextModel, has_capabilities
+from shapash.model.base import SupportsEmbeddings, SupportsTokenization, TextModel, has_capabilities
 from shapash.model.hf import HFPipelineModel
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.webapp.nlp_app import NlpWebApp
@@ -311,6 +312,10 @@ class NlpExplainer:
 
             self.contributions.label_names = self.label_names
             self.contributions.index = self.texts.index
+            # Set here rather than in the backend so a cache written before this existed still gets
+            # it (the branch above may have unpickled ``computed``), and so every backend inherits
+            # one answer — the question is about the *model*, not about how contributions were computed.
+            self.contributions.folds_case = self._folds_case()
             self._data_hash = new_hash
 
         if y_true is not None:
@@ -688,6 +693,18 @@ class NlpExplainer:
         if text_model is None:
             raise RuntimeError("Live prediction requires a TextModel-backed explainer (unavailable on a snapshot).")
         return text_model
+
+    def _folds_case(self) -> bool | None:
+        """Whether this model's tokenizer normalises case away, or ``None`` when it cannot be asked.
+
+        ``None`` for a model with no tokenization capability (a bare LIME ``classifier_fn``, or a
+        prediction-only adapter) — the honest answer, which
+        :meth:`~shapash.backend.nlp_backend.NlpContributions.resolve_lowercase` turns into a default.
+        """
+        text_model = getattr(self, "_text_model", None)
+        if text_model is None or not has_capabilities(text_model, SupportsTokenization):
+            return None
+        return cast("SupportsTokenization", text_model).folds_case()
 
     def _predict(self, text_list: list[str]) -> pd.DataFrame:
         """Run the pipeline and return a unified DataFrame of predictions and probabilities.

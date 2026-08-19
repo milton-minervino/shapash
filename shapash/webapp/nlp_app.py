@@ -20,6 +20,7 @@ import plotly.graph_objs as go
 from dash import Input, Output, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
 
+from shapash.backend.nlp_backend import is_punctuation
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
 from shapash.plots.plot_word_importance import plot_word_importance
 from shapash.webapp.nlp_components import (
@@ -241,12 +242,17 @@ class NlpWebApp:
             )
 
         # ── Corpus word list for the exclusion multi-select ────────────
+        # Normalised exactly as ``word_importance`` keys its units, via the same resolver, so an
+        # entry here always matches a bar in the chart. On an uncased model that folds
+        # AWFUL/Awful/awful into one entry; on a cased model it leaves all three, because there
+        # they are genuinely different inputs.
+        _fold_words = contrib.resolve_lowercase()
         all_words = sorted(
             {
-                tok.strip()
+                tok.strip().lower() if _fold_words else tok.strip()
                 for sample_tokens in contrib.token_strings
                 for tok in sample_tokens
-                if tok.strip() and not _SPECIAL_RE.match(tok.strip())
+                if tok.strip() and not _SPECIAL_RE.match(tok.strip()) and not is_punctuation(tok)
             }
         )
         word_options: list[dcc.Dropdown.Options] = [{"label": w, "value": w} for w in all_words]
@@ -794,7 +800,13 @@ class NlpWebApp:
             ],
         )
         def update_global_importance(
-            label_idx, topk, sign_filter, exclude_words_list, selected_indices, error_cell, errors_only
+            label_idx,
+            topk,
+            sign_filter,
+            exclude_words_list,
+            selected_indices,
+            error_cell,
+            errors_only,
         ):
             if label_idx is None:
                 raise PreventUpdate
@@ -803,6 +815,10 @@ class NlpWebApp:
                 label_idx=int(label_idx),
                 n_top=int(topk or 20),
                 filter_sign=sign_filter or "all",
+                # Punctuation is its own unit since word segmentation splits on word/non-word
+                # boundaries; corpus-wide its mean contribution averages to ~0, so it is noise here.
+                # Per-instance punctuation contributions stay visible in the Sentence Highlight panel.
+                filter_punctuation=True,
                 exclude_words=set(exclude_words_list or []) or None,
                 sample_indices=effective_indices,
             )

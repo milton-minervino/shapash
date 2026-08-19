@@ -168,6 +168,42 @@ class SupportsTokenization(ABC):
                     return marker
         return None
 
+    def folds_case(self) -> bool:
+        """Whether this tokenizer normalises case away before the model ever sees the text.
+
+        Probed once from :meth:`tokenize` (not from ``do_lower_case``, a normalizer class, or a
+        hard-coded model list) and memoized on the instance, for the same reason as
+        :meth:`word_start_marker`: the question is what the tokenizer *does*, and every family
+        records it somewhere different — ``BertNormalizer(lowercase=True)``, a ``Lowercase`` step
+        inside a normalizer ``Sequence``, or a legacy ``do_lower_case`` flag.
+
+        Callers use this to decide whether ``AWFUL`` and ``awful`` are one unit or two. On an
+        uncased model they encode to the *same input ids*, so the model cannot tell them apart and
+        any difference in their attributions comes from context alone — treating them as separate
+        units splits one word into rare variants. On a cased model they are genuinely different
+        inputs and must stay apart.
+
+        Returns
+        -------
+        bool
+            ``True`` when upper- and lower-case text tokenize identically.
+        """
+        cached = getattr(self, "_folds_case_cache", _UNRESOLVED)
+        if cached is _UNRESOLVED:
+            folds = self._probe_folds_case()
+            self._folds_case_cache = folds
+            return folds
+        return cast("bool", cached)
+
+    def _probe_folds_case(self) -> bool:
+        """Tokenize :data:`_MARKER_PROBE_TEXT` in both cases and report whether they agree."""
+        try:
+            lowered = self.tokenize(_MARKER_PROBE_TEXT)
+            uppered = self.tokenize(_MARKER_PROBE_TEXT.upper())
+        except Exception:  # noqa: BLE001 - a tokenizer that cannot run the probe is treated as cased
+            return False
+        return lowered == uppered
+
     def is_substitutable(self, token: str) -> bool:
         """Whether ``token`` is a standalone word that can be swapped or removed cleanly.
 
