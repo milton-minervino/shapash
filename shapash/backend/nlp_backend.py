@@ -25,6 +25,18 @@ import pandas as pd
 
 from shapash.backend.backend import Backend
 
+# A unit made entirely of punctuation/symbol characters — no letters, digits or underscore. Word
+# segmentation deliberately emits these as their own units (the model reads them, and "!!!" or "?"
+# genuinely moves a sentiment prediction), so they stay visible in a local highlight. They are noise
+# in a *corpus-level* ranking, though, which is why ``word_importance`` filters them by default.
+_PUNCTUATION_RE = re.compile(r"^[^\w\s]+$")
+
+
+def is_punctuation(word: str) -> bool:
+    """True when ``word`` consists solely of punctuation or symbol characters."""
+    stripped = word.strip()
+    return bool(stripped) and bool(_PUNCTUATION_RE.match(stripped))
+
 
 @dataclass
 class NlpRawExplanation:
@@ -71,6 +83,11 @@ class NlpContributions:
         Human-readable class names; set by the caller after construction.
     index : pd.Index or None
         Row index from the source ``pd.Series``; set by the caller after construction.
+    folds_case : bool or None
+        Whether the model's tokenizer normalises case away, from
+        :meth:`~shapash.model.base.SupportsTokenization.folds_case`; set by the caller after
+        construction. Decides the default unit grouping in :meth:`word_importance` — see
+        :meth:`resolve_lowercase`. ``None`` when the model exposes no tokenizer to ask.
     """
 
     token_strings: list[list[str]]
@@ -78,25 +95,59 @@ class NlpContributions:
     base_values: np.ndarray
     label_names: list[str] | None = field(default=None)
     index: pd.Index | None = field(default=None)
+    folds_case: bool | None = field(default=None)
 
     _SPECIAL_RE: re.Pattern = re.compile(r"^\[.*\]$|^##|^\s*$")
 
     def __len__(self) -> int:
         return len(self.token_strings)
 
+    def resolve_lowercase(self, lowercase: bool | None = None) -> bool:
+        """Decide whether word units should be case-folded, deferring to the model by default.
+
+        One source of truth for the question, so a caller that has to normalise units the same
+        way (the webapp's exclusion vocabulary) cannot drift from :meth:`word_importance`.
+
+        Parameters
+        ----------
+        lowercase : bool, optional
+            Explicit caller override. ``None`` (default) derives the answer from ``folds_case``.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``AWFUL`` and ``awful`` should aggregate into one unit.
+
+        Notes
+        -----
+        With no override, an *uncased* model folds and a *cased* model does not: on an uncased
+        tokenizer both spellings are the same input ids, so keeping them apart splits one word
+        into variants the model provably cannot distinguish; on a cased one they are different
+        inputs whose attributions differ for real reasons, and merging would hide that.
+
+        When ``folds_case`` is ``None`` — no tokenizer to probe, e.g. a bare LIME
+        ``classifier_fn`` — this falls back to folding, which keeps a corpus-level ranking from
+        fragmenting on a question that cannot be answered here.
+        """
+        if lowercase is not None:
+            return lowercase
+        return True if self.folds_case is None else self.folds_case
+
     def word_importance(
         self,
         label_idx: int,
         n_top: int = 20,
         filter_special: bool = True,
+        filter_punctuation: bool = True,
+        lowercase: bool | None = None,
         filter_sign: str = "all",
         exclude_words: set[str] | None = None,
         sample_indices: list[int] | None = None,
     ) -> pd.Series:
         """Aggregate token contributions by word across all samples for one class.
 
-        For each unique (stripped) token string that appears in the batch,
-        computes the mean contribution across all its occurrences.
+        For each unique (stripped, by default lowercased) token string that appears in
+        the batch, computes the mean contribution across all its occurrences.
 
         Parameters
         ----------
@@ -107,12 +158,29 @@ class NlpContributions:
         filter_special : bool
             If ``True``, skip empty strings, ``[CLS]``/``[SEP]``-style bracket
             tokens, and ``##subword`` wordpiece prefixes.
+        filter_punctuation : bool
+            If ``True`` (default), skip units made entirely of punctuation (``.``, ``,``, ``!!!``).
+            Word segmentation emits punctuation as its own unit so it stays visible and additive in
+            a *local* explanation; in a corpus-level ranking it is almost always noise, so it is
+            hidden here unless explicitly asked for.
+        lowercase : bool, optional
+            Case-fold each unit before aggregating, so ``AWFUL``, ``Awful`` and ``awful``
+            form one row. ``None`` (default) derives this from the model's own tokenizer
+            via :meth:`resolve_lowercase` — folding on an uncased model, keeping case on a
+            cased one — so pass a bool only to override that.
+            Folding also makes the ranking comparable across backends: SHAP labels units by
+            slicing the *source text* (keeping its casing) while Captum/LIG labels them from
+            tokenizer output (already normalised), so on an uncased model the two would
+            otherwise report different vocabularies for one corpus.
+            The per-instance sentence highlight always keeps the original casing, whatever
+            this is set to.
         filter_sign : {"all", "positive", "negative"}
             If ``"positive"``, keep only words with positive mean contribution.
             If ``"negative"``, keep only words with negative mean contribution.
         exclude_words : set[str], optional
             Additional set of word strings to exclude (e.g. user-selected
-            stopwords or corpus words to hide).
+            stopwords or corpus words to hide). Matched against the same
+            normalised key, so under ``lowercase`` the exclusion is case-insensitive.
         sample_indices : list[int], optional
             Positional indices of the samples to include in the aggregation.
             When ``None`` (default) all samples are used.
@@ -122,7 +190,13 @@ class NlpContributions:
         pd.Series
             Word → mean contribution, sorted by absolute value descending.
         """
-        _exclude: set[str] = exclude_words or set()
+
+        fold = self.resolve_lowercase(lowercase)
+
+        def _key(token: str) -> str:
+            return token.lower() if fold else token
+
+        _exclude: set[str] = {_key(w) for w in exclude_words} if exclude_words else set()
         word_contribs: dict[str, list[float]] = {}
         iter_data = (
             ((self.token_strings[i], self.values[i]) for i in sample_indices)
@@ -135,11 +209,14 @@ class NlpContributions:
                 tok_clean = tok.strip()
                 if filter_special and self._SPECIAL_RE.match(tok_clean):
                     continue
-                if tok_clean in _exclude:
+                if filter_punctuation and is_punctuation(tok_clean):
                     continue
-                if tok_clean not in word_contribs:
-                    word_contribs[tok_clean] = []
-                word_contribs[tok_clean].append(float(val))
+                key = _key(tok_clean)
+                if key in _exclude:
+                    continue
+                if key not in word_contribs:
+                    word_contribs[key] = []
+                word_contribs[key].append(float(val))
 
         importance = pd.Series({w: float(np.mean(vs)) for w, vs in word_contribs.items()})
         importance = importance.reindex(importance.abs().sort_values(ascending=False).index)

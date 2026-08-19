@@ -21,15 +21,13 @@ class TestNlpShapBackend(unittest.TestCase):
 
 
 class TestAggregateSubwords(unittest.TestCase):
-    """``_aggregate_subwords`` merges SHAP's whitespace-delimited subword fragments into words."""
+    """``_aggregate_subwords`` merges SHAP's segments into words at word/non-word boundaries."""
 
     def test_merges_subwords_and_drops_specials(self):
         # SHAP's Text masker: a subword glued to the previous piece carries no trailing space;
         # the piece that ends the word does (see shap.maskers.Text.token_segments).
         tokens = ["", "i ", "am ", "hap", "py ", ""]
-        contribs = np.array(
-            [[1.0, 0.0], [2.0, 1.0], [3.0, 2.0], [4.0, 3.0], [5.0, 4.0], [6.0, 5.0]], dtype=float
-        )
+        contribs = np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0], [4.0, 3.0], [5.0, 4.0], [6.0, 5.0]], dtype=float)
         base = np.array([10.0, 20.0])
 
         words, word_contribs, new_base = _aggregate_subwords(tokens, contribs, base)
@@ -40,16 +38,133 @@ class TestAggregateSubwords(unittest.TestCase):
         # Leading/trailing blank (CLS/SEP-equivalent) attribution folded into the baseline.
         np.testing.assert_allclose(new_base, [10.0 + 1.0 + 6.0, 20.0 + 0.0 + 5.0])
 
-    def test_merges_punctuation_glued_contraction(self):
-        # "don't" is tokenized as "don" + "'" + "t " — none carry inter-token whitespace.
+    def test_splits_contraction_at_the_apostrophe(self):
+        # "don't" is segmented as "don" + "'" + "t " — none carry inter-token whitespace, so the
+        # old whitespace-only rule glued them. The word/non-word rule splits at the apostrophe,
+        # matching the units the tokenizer's own pre-tokenizer produces (and hence the LIG backend).
         tokens = ["", "i ", "don", "'", "t ", "feel ", "sad", ""]
         contribs = np.arange(8 * 2, dtype=float).reshape(8, 2)
         base = np.zeros(2)
 
         words, word_contribs, new_base = _aggregate_subwords(tokens, contribs, base)
 
-        self.assertEqual(words, ["i", "don't", "feel", "sad"])
-        np.testing.assert_allclose(word_contribs[1], contribs[2] + contribs[3] + contribs[4])
+        self.assertEqual(words, ["i", "don", "'", "t", "feel", "sad"])
+        np.testing.assert_allclose(new_base + word_contribs.sum(axis=0), base + contribs.sum(axis=0))
+
+    def test_punctuation_is_not_glued_to_neighbouring_words(self):
+        # Regression: real ``shap.maskers.Text`` output for
+        # "The acting was superb!!! I really did enjoy.Overall,I recommend it." — the old rule
+        # produced "superb!!!" and "enjoy.Overall,I" because only whitespace ended a word.
+        tokens = [
+            "",
+            "The ",
+            "acting ",
+            "was ",
+            "superb",
+            "!",
+            "!",
+            "! ",
+            "I ",
+            "really ",
+            "did ",
+            "enjoy",
+            ".",
+            "Overall",
+            ",",
+            "I ",
+            "recommend ",
+            "it",
+            ".",
+            "",
+        ]
+        contribs = np.arange(len(tokens), dtype=float).reshape(-1, 1)
+
+        words, word_contribs, new_base = _aggregate_subwords(tokens, contribs, np.zeros(1))
+
+        self.assertEqual(
+            words,
+            [
+                "The",
+                "acting",
+                "was",
+                "superb",
+                "!",
+                "!",
+                "!",
+                "I",
+                "really",
+                "did",
+                "enjoy",
+                ".",
+                "Overall",
+                ",",
+                "I",
+                "recommend",
+                "it",
+                ".",
+            ],
+        )
+        np.testing.assert_allclose(new_base + word_contribs.sum(axis=0), contribs.sum(axis=0))
+
+    def test_leading_space_regime_does_not_collapse_the_sample(self):
+        # SHAP's slow-tokenizer fallback prepends a *leading* space to each token instead of
+        # carrying trailing gap text (shap/maskers/_text.py). Under the old trailing-whitespace
+        # rule nothing ever flushed, so a whole sample became one "word".
+        tokens = ["", "The", " acting", " was", " superb", "!", "!", "!", " I", " enjoy", ""]
+        contribs = np.arange(len(tokens), dtype=float).reshape(-1, 1)
+
+        words, _, _ = _aggregate_subwords(tokens, contribs, np.zeros(1))
+
+        self.assertEqual(words, ["The", "acting", "was", "superb", "!", "!", "!", "I", "enjoy"])
+
+    def test_subwords_merge_in_both_segment_regimes(self):
+        for tokens in (["up", "dating "], [" up", "dating"]):
+            with self.subTest(tokens=tokens):
+                contribs = np.array([[1.0], [2.0]])
+                words, word_contribs, _ = _aggregate_subwords(tokens, contribs, np.zeros(1))
+                self.assertEqual(words, ["updating"])
+                np.testing.assert_allclose(word_contribs, [[3.0]])
+
+    def test_unsegmented_script_does_not_collapse_into_one_word(self):
+        # CJK has no inter-word spaces, so a character-class rule would see one long word run.
+        tokens = ["\u6211", "\u559c", "\u6b22"]
+        contribs = np.arange(3, dtype=float).reshape(-1, 1)
+        words, _, _ = _aggregate_subwords(tokens, contribs, np.zeros(1))
+        self.assertEqual(words, ["\u6211", "\u559c", "\u6b22"])
+
+    def test_korean_subwords_still_merge(self):
+        # Korean *is* space-segmented, so its subword pieces must join like any other script's —
+        # Hangul is deliberately excluded from the unsegmented-script list.
+        tokens = ["\uc601\ud654", "\ub294 ", "\uc88b", "\uc558\ub2e4"]
+        contribs = np.arange(4, dtype=float).reshape(-1, 1)
+        words, _, _ = _aggregate_subwords(tokens, contribs, np.zeros(1))
+        self.assertEqual(words, ["\uc601\ud654\ub294", "\uc88b\uc558\ub2e4"])
+
+    def test_bracket_text_folds_into_baseline_only_without_a_special_set(self):
+        # With the tokenizer's own special set, literal "[LAUGHTER]" in the source is a real word.
+        tokens = ["ha ", "[LAUGHTER] ", "good "]
+        contribs = np.array([[1.0], [2.0], [3.0]])
+
+        words, _, new_base = _aggregate_subwords(
+            tokens, contribs, np.zeros(1), special_tokens=frozenset({"[CLS]", "[SEP]"})
+        )
+        self.assertEqual(words, ["ha", "[LAUGHTER]", "good"])
+        np.testing.assert_allclose(new_base, [0.0])
+
+        # Without one (bare callable), the bracket regex still guards against leaking [CLS]/[SEP].
+        words, _, new_base = _aggregate_subwords(["[CLS] ", "good ", "[SEP] "], contribs, np.zeros(1))
+        self.assertEqual(words, ["good"])
+        np.testing.assert_allclose(new_base, [4.0])
+
+    def test_declared_special_token_folds_into_baseline(self):
+        tokens = ["<s> ", "good ", "</s> "]
+        contribs = np.array([[1.0], [2.0], [3.0]])
+        words, word_contribs, new_base = _aggregate_subwords(
+            tokens, contribs, np.zeros(1), special_tokens=frozenset({"<s>", "</s>"})
+        )
+        self.assertEqual(words, ["good"])
+        np.testing.assert_allclose(word_contribs, [[2.0]])
+        np.testing.assert_allclose(new_base, [4.0])
 
     def test_preserves_completeness(self):
         tokens = ["", "great ", "mov", "ie ", ""]
