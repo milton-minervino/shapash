@@ -224,3 +224,77 @@ def test_whatif_app_callbacks_end_to_end(hf):
     payload = r.get_json()["response"]
     assert payload["counterfactual-results"]["children"] is not None
     assert isinstance(payload["counterfactual-store"]["data"], list)
+
+
+def test_label_noise_detection_with_real_probabilities(hf):
+    """Confident learning end to end on real model outputs, with neighbour corroboration.
+
+    The corpus deliberately mislabels two obviously-emotional sentences, so a working pipeline has to
+    surface them; the assertions stay on structure and on the planted rows rather than on an exact
+    count, since the estimated per-cell counts depend on the model's real calibration.
+    """
+    classifier, tokenizer, _ = hf
+    model = HFClassifierModel(classifier, tokenizer, label_names=LABELS)
+
+    texts = [
+        "i am so happy today",
+        "i feel terrified and alone",
+        "i am furious about this",
+        "what a wonderful and joyful day",
+        "i am scared of the dark",
+        "this fills me with rage",
+    ]
+    truth = ["joy", "fear", "anger", "joy", "fear", "anger"]
+    # Plant two label errors: rows 0 and 2 keep their text but get someone else's label.
+    noisy = list(truth)
+    noisy[0], noisy[2] = "anger", "joy"
+
+    reference = (texts, truth)
+    xpl = NlpExplainer(model, label_names=LABELS, reference_corpus=reference)
+    xpl.compile(texts, y_true=noisy)
+
+    assert xpl.can_detect_label_noise()
+    assert xpl.can_probe_labels()
+    report = xpl.detect_label_noise(top_n=5)
+
+    assert report.n_samples == len(texts)
+    assert report.label_names == LABELS
+    assert report.noise_matrix.shape == (len(LABELS), len(LABELS))
+    np.testing.assert_allclose(report.noise_matrix.sum(), 1.0, atol=1e-6)
+    assert 0.0 <= report.noise_rate <= 1.0
+    assert report.thresholds.shape == (len(LABELS),)
+
+    flagged = {issue.index for issue in report.issues}
+    assert {0, 2} <= flagged, f"planted mislabels missed; flagged {flagged}"
+    for issue in report.issues:
+        assert issue.given_label in LABELS
+        assert issue.suggested_label in LABELS
+        assert issue.suggested_label != issue.given_label
+        assert issue.text == texts[issue.index]
+        assert issue.probe is not None
+        assert issue.probe.top_label in LABELS
+        assert 0.0 <= issue.probe.given_prob <= 1.0
+
+    # The probe is fit on the reference corpus, which here carries the *clean* labels — so on the two
+    # planted errors it should reject the (wrong) label the batch gave them. Note this reference
+    # corpus deliberately reuses the batch texts to keep the assertion deterministic; in real use it
+    # must be a separate corpus, or the probe would be scoring its own training rows.
+    planted = {issue.index: issue for issue in report.issues if issue.index in {0, 2}}
+    for index, issue in planted.items():
+        assert not issue.probe.backs_given, f"row {index}: probe defended a planted wrong label"
+        assert issue.probe.top_label == truth[index]
+
+    # Without a reference corpus there is no second opinion, and detection still runs.
+    bare = NlpExplainer(model, label_names=LABELS)
+    bare.compile(texts, y_true=noisy)
+    assert not bare.can_probe_labels()
+    assert all(issue.probe is None for issue in bare.detect_label_noise(top_n=5).issues)
+
+
+def test_label_noise_unavailable_without_ground_truth(hf):
+    classifier, tokenizer, _ = hf
+    xpl = NlpExplainer(HFClassifierModel(classifier, tokenizer, label_names=LABELS), label_names=LABELS)
+    xpl.compile(["i am so happy today", "i feel terrified and alone"])
+    assert not xpl.can_detect_label_noise()
+    with pytest.raises(RuntimeError, match="ground-truth labels"):
+        xpl.detect_label_noise()

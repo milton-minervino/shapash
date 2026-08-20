@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from shapash.backend.nlp_backend import NlpContributions
+from shapash.compute.diagnostics.label_noise import LabelNoiseReport
 from shapash.compute.generators.base import Counterfactual, Field
 from shapash.compute.retrieval.similar_examples import Neighbor
 
@@ -76,4 +77,18 @@ class InteractiveEngine(Protocol):
 
     def find_similar(self, text: str, top_k: int = 5) -> list[Neighbor]:
         """Return the ``top_k`` reference examples most similar to ``text``, most-similar first."""
+        ...
+
+    def can_detect_label_noise(self) -> bool:
+        """Whether the compiled batch carries the ground truth + per-class probabilities this needs."""
+        ...
+
+    def can_probe_labels(self) -> bool:
+        """Whether a labelled reference corpus is bound to second-guess flagged labels."""
+        ...
+
+    def detect_label_noise(
+        self, top_n: int = 50, score: str = "self_confidence", probe: bool = True
+    ) -> LabelNoiseReport:
+        """Rank probably-mislabelled samples in the compiled batch by confident learning."""
         ...

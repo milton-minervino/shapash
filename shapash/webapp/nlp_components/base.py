@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from shapash.compute.diagnostics.label_noise import has_usable_probabilities
 from shapash.explainer.interactive import InteractiveEngine
 from shapash.model.base import SupportsGradients, has_capabilities
 from shapash.webapp.nlp_view import NlpView
@@ -19,6 +20,7 @@ CAP_PREDICT = "engine:predict"
 CAP_COUNTERFACTUAL = "engine:counterfactual"
 CAP_GRADIENTS = "model:gradients"
 CAP_SIMILAR = "engine:similar"
+CAP_LABELS = "data:labels"
 
 
 def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> frozenset[str]:
@@ -27,7 +29,8 @@ def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> f
     Parameters
     ----------
     view : NlpView
-        Read-only view (data capabilities could be added here later).
+        Read-only view, supplying the *data* capabilities — what the compiled batch contains,
+        independent of whether a live model is still attached.
     engine : InteractiveEngine or None
         Live engine, or ``None`` for a snapshot (no live capabilities).
 
@@ -38,6 +41,10 @@ def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> f
         "model:gradients"}``).
     """
     caps: set[str] = set()
+    # Data capabilities are read from the compiled batch, so they survive a snapshot — they sit
+    # outside the engine guard below on purpose.
+    if view.y_true is not None and has_usable_probabilities(view.y_prob):
+        caps.add(CAP_LABELS)
     if engine is not None:
         if engine.can_edit():
             caps.add(CAP_PREDICT)

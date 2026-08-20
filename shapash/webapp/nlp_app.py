@@ -26,6 +26,7 @@ from shapash.plots.plot_word_importance import plot_word_importance
 from shapash.webapp.nlp_components import (
     CounterfactualComponent,
     DataEditorComponent,
+    LabelNoiseComponent,
     SentenceHighlightComponent,
     SimilarExamplesComponent,
     WaterfallComponent,
@@ -634,6 +635,7 @@ class NlpWebApp:
                 DataEditorComponent(),
                 CounterfactualComponent(),
                 SimilarExamplesComponent(),
+                LabelNoiseComponent(),
             )
             if type(comp).is_available(self._view, self._engine)
         ]
@@ -642,6 +644,7 @@ class NlpWebApp:
         editor_comp = next((c for c in self._components if isinstance(c, DataEditorComponent)), None)
         cf_comp = next((c for c in self._components if isinstance(c, CounterfactualComponent)), None)
         similar_comp = next((c for c in self._components if isinstance(c, SimilarExamplesComponent)), None)
+        noise_comp = next((c for c in self._components if isinstance(c, LabelNoiseComponent)), None)
 
         left_tabs: list = [("table", "Dataset", text_samples_body)]
         if scatter_col_content is not None:
@@ -654,6 +657,10 @@ class NlpWebApp:
         upper_right_tabs: list = [("importance", "Word Importance", word_importance_panel)]
         if error_analysis_body is not None:
             upper_right_tabs.append(("errors", "Error Analysis", error_analysis_body))
+        # Next to Error Analysis by design: same ground-truth prerequisite, and it answers the
+        # question that panel leaves open — whether the *label*, not the model, is what is wrong.
+        if noise_comp is not None:
+            upper_right_tabs.append(("label-noise", "Label Noise", noise_comp.layout(self._view, self._engine)))
         if cf_comp is not None:
             upper_right_tabs.append(("counterfactual", "Counterfactuals", cf_comp.layout(self._view, self._engine)))
         if similar_comp is not None:

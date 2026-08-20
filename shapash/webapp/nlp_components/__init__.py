@@ -21,6 +21,7 @@ from shapash.webapp.nlp_components.datapoint import (
     pack_datapoint,
     unpack_datapoint,
 )
+from shapash.webapp.nlp_components.label_noise import LabelNoiseComponent
 from shapash.webapp.nlp_components.sentence_highlight import SentenceHighlightComponent
 from shapash.webapp.nlp_components.similar_examples import SimilarExamplesComponent
 from shapash.webapp.nlp_components.waterfall import WaterfallComponent
@@ -30,6 +31,7 @@ __all__ = [
     "available_capabilities",
     "DataEditorComponent",
     "CounterfactualComponent",
+    "LabelNoiseComponent",
     "SentenceHighlightComponent",
     "SimilarExamplesComponent",
     "WaterfallComponent",
