@@ -114,6 +114,7 @@ class SimilarExampleRetriever:
         self.reference_labels = list(reference_labels) if reference_labels is not None else None
         self.store = EmbeddingStore(model, self.reference_texts, cache_dir=cache_dir)
         self._bank: np.ndarray | None = None  # (n_reference, hidden), L2-normalized rows
+        self._positions: dict[str, list[int]] | None = None  # text -> reference rows, for exclude_self
 
     @property
     def size(self) -> int:
@@ -157,6 +158,59 @@ class SimilarExampleRetriever:
         assert self._bank is not None  # noqa: S101 - build() guarantees this
         query_vec = _l2_normalize(self._encode([text]))[0]
         sims = self._bank @ query_vec  # cosine, rows already unit-norm
+        return self._top_k(sims, top_k)
+
+    def query_many(self, texts: list[str], top_k: int = 5, exclude_self: bool = False) -> list[list[Neighbor]]:
+        """Return the ``top_k`` most similar reference examples for **each** of ``texts``.
+
+        The batch counterpart of :meth:`query`, for callers ranking a whole set at once (e.g.
+        corroborating a list of suspected label errors). One :meth:`~shapash.model.base.SupportsEmbeddings.embed`
+        call — which the model chunks internally — plus a single matrix product against the bank,
+        rather than one forward pass per text.
+
+        Parameters
+        ----------
+        texts : list of str
+            The query texts.
+        top_k : int
+            Number of neighbours per query (clamped to the corpus size).
+        exclude_self : bool, optional
+            Drop reference examples whose text is *exactly equal* to the query. Set this when the
+            queries may themselves be in the reference corpus, where every text would otherwise
+            retrieve itself as its own nearest neighbour and crowd out a real one. Matching on text
+            equality rather than a similarity cutoff keeps genuine near-duplicates in the results.
+
+        Returns
+        -------
+        list[list[Neighbor]]
+            One neighbour list per query, in the order of ``texts``, each ordered by descending
+            cosine similarity.
+        """
+        if not texts:
+            return []
+        self.build()
+        assert self._bank is not None  # noqa: S101 - build() guarantees this
+        query_vecs = _l2_normalize(self._encode(list(texts)))  # (n_queries, hidden)
+        sims = query_vecs @ self._bank.T  # (n_queries, n_reference)
+        if exclude_self:
+            positions = self._text_positions()
+            for row, text in enumerate(texts):
+                hits = positions.get(text)
+                if hits:
+                    sims[row, hits] = -np.inf
+        return [self._top_k(sims[row], top_k) for row in range(sims.shape[0])]
+
+    def _text_positions(self) -> dict[str, list[int]]:
+        """Reference text to the rows holding it, built once (supports ``exclude_self``)."""
+        if self._positions is None:
+            positions: dict[str, list[int]] = {}
+            for i, text in enumerate(self.reference_texts):
+                positions.setdefault(text, []).append(i)
+            self._positions = positions
+        return self._positions
+
+    def _top_k(self, sims: np.ndarray, top_k: int) -> list[Neighbor]:
+        """Turn one row of similarities into its ``top_k`` :class:`Neighbor` objects, best first."""
         k = max(1, min(top_k, self.size))
         # argpartition for the top-k, then sort just those descending.
         top_idx = np.argpartition(-sims, k - 1)[:k]
@@ -169,6 +223,8 @@ class SimilarExampleRetriever:
                 label=self.reference_labels[i] if self.reference_labels is not None else None,
             )
             for i in top_idx
+            # An excluded row is -inf; it only surfaces when the corpus has nothing else to offer.
+            if np.isfinite(sims[i])
         ]
 
 
