@@ -961,12 +961,15 @@ def main() -> None:
         xpl.find_similar(sentences[0], top_k=1)
 
     logger.info(
-        "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s | can_find_similar=%s",
+        "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s | can_find_similar=%s"
+        " | can_detect_label_noise=%s | can_probe_labels=%s",
         config.attribution,
         ",".join(name for name, _ in xpl.available_cf_generators()) or "none",
         xpl.can_edit(),
         xpl.can_counterfactual(),
         xpl.can_find_similar(),
+        xpl.can_detect_label_noise(),
+        xpl.can_probe_labels(),
     )
     logger.info("Serving on http://%s:%d (Ctrl+C to stop)", config.host, config.port)
     xpl.run_app(port=config.port, debug=False, host=config.host, scatter_xy=projected)

@@ -20,9 +20,11 @@ from shapash.backend.nlp_backend import NlpBackend, NlpContributions, NlpRawExpl
 from shapash.backend.nlp_lime_backend import NlpLimeBackend
 from shapash.backend.nlp_shap_backend import NlpShapBackend
 from shapash.compute.generators import AblationFlipGenerator, HotFlipGenerator
+from shapash.compute.retrieval import Neighbor
 from shapash.explainer.nlp_explainer import NlpExplainer
 from shapash.model.base import SupportsEmbeddings, SupportsGradients, SupportsTokenization, TextModel
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
+from shapash.plots.plot_noise_matrix import plot_noise_matrix
 from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.plots.plot_waterfall import plot_waterfall
@@ -456,6 +458,45 @@ class TestPlotWordImportance(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # plot_confusion_matrix
 # ---------------------------------------------------------------------------
+
+
+class TestPlotNoiseMatrix(unittest.TestCase):
+    """The noise matrix is given-vs-true and mostly diagonal, so it needs its own axes and masking."""
+
+    def setUp(self):
+        # Typical shape: ~94% correctly labelled, one contaminated pair (A labelled, really B).
+        self.joint = np.array([[0.50, 0.05, 0.0], [0.01, 0.30, 0.0], [0.0, 0.0, 0.14]])
+        self.labels = ["A", "B", "C"]
+
+    def test_returns_heatmap_figure(self):
+        self.assertIsInstance(plot_noise_matrix(self.joint, self.labels), go.Figure)
+
+    def test_diagonal_is_masked_by_default(self):
+        # Left in, the ~90% diagonal flattens every off-diagonal cell to the same near-white shade.
+        z = plot_noise_matrix(self.joint, self.labels).data[0].z
+        self.assertTrue(np.all(np.isnan(np.diag(z))))
+        self.assertAlmostEqual(z[0][1], 0.05)
+
+    def test_masked_cells_render_no_text(self):
+        text = plot_noise_matrix(self.joint, self.labels).data[0].text
+        self.assertEqual(text[0][0], "")
+        self.assertEqual(text[0][1], "5.0%")
+
+    def test_diagonal_can_be_kept(self):
+        z = plot_noise_matrix(self.joint, self.labels, mask_diagonal=False).data[0].z
+        np.testing.assert_allclose(np.diag(z), [0.50, 0.30, 0.14])
+
+    def test_does_not_mutate_the_callers_matrix(self):
+        original = self.joint.copy()
+        plot_noise_matrix(self.joint, self.labels)
+        np.testing.assert_array_equal(self.joint, original)
+
+    def test_axes_name_the_label_semantics_not_the_prediction(self):
+        # The whole reason this is not a plot_confusion_matrix mode: the columns are the estimated
+        # *true* class, not the model's prediction.
+        layout = plot_noise_matrix(self.joint, self.labels).layout
+        self.assertEqual(layout.yaxis.title.text, "Given label")
+        self.assertEqual(layout.xaxis.title.text, "Estimated true class")
 
 
 class TestPlotConfusionMatrix(unittest.TestCase):
@@ -1403,6 +1444,170 @@ class TestCompileDiskCacheIsolation(unittest.TestCase):
             other.clear_cache(_SAMPLE_TEXTS, cache_dir)
 
             self.assertTrue(keeper_path.exists(), "clearing one backend dropped another's cache")
+
+
+class TestDetectLabelNoise(unittest.TestCase):
+    """The explainer's confident-learning surface, on the __new__-built stub (no model, no backend)."""
+
+    def _with_labels(self, y_true=None, y_prob=None):
+        """A compiled stub carrying ground truth and per-class probabilities.
+
+        Sample 1 is labelled ``joy`` while the model confidently says ``sadness`` — the planted
+        error. Both classes carry at least one label, without which ``sadness`` would have no
+        estimable threshold and could never be suggested (covered separately in the compute tests).
+        """
+        xpl = _make_explainer()
+        confident = ["joy", "sadness", "sadness"]
+        probs = np.full((3, N_CLASSES), 0.02)
+        for row, name in enumerate(confident):
+            probs[row, LABEL_NAMES.index(name)] = 0.90
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        xpl.y_pred = pd.Series(confident, index=pd.RangeIndex(3), name="prediction")
+        xpl.y_prob = pd.DataFrame(probs, index=pd.RangeIndex(3), columns=LABEL_NAMES) if y_prob is None else y_prob
+        xpl.y_true = (
+            pd.Series(["joy", "joy", "sadness"], index=pd.RangeIndex(3), name="ground_truth")
+            if y_true is None
+            else y_true
+        )
+        return xpl
+
+    # ── capability flag ────────────────────────────────────────────────
+    def test_available_with_ground_truth_and_per_class_probabilities(self):
+        self.assertTrue(self._with_labels().can_detect_label_noise())
+
+    def test_unavailable_without_ground_truth(self):
+        xpl = self._with_labels()
+        xpl.y_true = None
+        self.assertFalse(xpl.can_detect_label_noise())
+
+    def test_unavailable_with_only_the_winning_class_probability(self):
+        # The raw-pipeline path emits a single "probability" column; the losing classes' scores are
+        # precisely what confident learning needs.
+        legacy = pd.DataFrame({"probability": [0.9, 0.9, 0.9]}, index=pd.RangeIndex(3))
+        self.assertFalse(self._with_labels(y_prob=legacy).can_detect_label_noise())
+
+    def test_unavailable_on_a_stub_that_never_set_y_prob(self):
+        # The __new__ path sets neither attribute; getattr must not raise.
+        self.assertFalse(_make_explainer().can_detect_label_noise())
+
+    def test_available_without_a_model(self):
+        # Unlike the other capability flags this needs no live model, so it survives from_snapshot().
+        xpl = self._with_labels()
+        self.assertIsNone(xpl.model)
+        self.assertTrue(xpl.can_detect_label_noise())
+
+    # ── detection ──────────────────────────────────────────────────────
+    def test_raises_when_the_prerequisites_are_missing(self):
+        with self.assertRaisesRegex(RuntimeError, "ground-truth labels"):
+            _make_explainer().detect_label_noise()
+
+    def test_flags_the_planted_mislabel(self):
+        report = self._with_labels().detect_label_noise()
+        self.assertEqual([i.index for i in report.issues], [1])
+        issue = report.issues[0]
+        self.assertEqual(issue.given_label, "joy")
+        self.assertEqual(issue.suggested_label, "sadness")
+        self.assertEqual(issue.text, "this is terrible and sad")
+
+    def test_label_names_come_from_the_probability_columns(self):
+        report = self._with_labels().detect_label_noise()
+        self.assertEqual(report.label_names, LABEL_NAMES)
+        self.assertEqual(report.noise_matrix.shape, (N_CLASSES, N_CLASSES))
+        self.assertEqual(report.n_samples, 3)
+
+    def test_respects_top_n_and_score(self):
+        report = self._with_labels().detect_label_noise(top_n=0, score="normalized_margin")
+        self.assertEqual(report.issues, [])
+        self.assertEqual(report.n_issues, 1)
+
+    # ── memoisation ────────────────────────────────────────────────────
+    def test_repeats_are_served_from_the_memo(self):
+        xpl = self._with_labels()
+        first = xpl.detect_label_noise(top_n=5)
+        self.assertIs(xpl.detect_label_noise(top_n=5), first)
+
+    def test_different_arguments_recompute(self):
+        xpl = self._with_labels()
+        self.assertIsNot(xpl.detect_label_noise(top_n=5), xpl.detect_label_noise(top_n=4))
+
+    # ── independent probe ──────────────────────────────────────────────
+    def _probe_corpus(self):
+        """A reference corpus separable by words the audited fixture's texts also use."""
+        texts = [
+            "this is wonderful and joyful",
+            "wonderful joyful and bright",
+            "a joyful wonderful day",
+            "bright and wonderful joy",
+            "this is terrible and sad",
+            "terrible sad and bleak",
+            "a sad terrible day",
+            "bleak and terrible sadness",
+        ]
+        labels = ["joy"] * 4 + ["sadness"] * 4
+        return texts, labels
+
+    def test_no_probe_when_no_reference_corpus_is_bound(self):
+        xpl = self._with_labels()
+        self.assertFalse(xpl.can_probe_labels())
+        self.assertIsNone(xpl.detect_label_noise().issues[0].probe)
+
+    def test_probe_verdict_is_attached_when_a_labelled_corpus_is_bound(self):
+        xpl = self._with_labels()
+        xpl._reference_corpus = self._probe_corpus()
+        self.assertTrue(xpl.can_probe_labels())
+        issue = xpl.detect_label_noise().issues[0]
+        self.assertIsNotNone(issue.probe)
+        self.assertIn(issue.probe.top_label, {"joy", "sadness"})
+        self.assertEqual(issue.probe.backs_given, issue.probe.top_label == issue.given_label)
+
+    def test_probe_corroborates_a_genuine_label_error(self):
+        # The flagged row is "this is terrible and sad" carrying the label "joy". The reference
+        # corpus puts that vocabulary firmly in "sadness", so the probe rejects the given label too
+        # — the two-signals-agree case, which is the one worth relabelling.
+        xpl = self._with_labels()
+        xpl._reference_corpus = self._probe_corpus()
+        issue = xpl.detect_label_noise().issues[0]
+        self.assertEqual((issue.given_label, issue.text), ("joy", "this is terrible and sad"))
+        self.assertFalse(issue.probe.backs_given)
+        self.assertEqual(issue.probe.top_label, "sadness")
+        self.assertLess(issue.probe.given_prob, 0.5)
+
+    def test_probe_backs_the_label_when_the_corpus_sides_with_it(self):
+        # The mirror case, and the reason the column exists: same flagged row, but a corpus that
+        # calls this vocabulary "joy". The probe now defends the label, marking the row as the
+        # audited model's error rather than the corpus's.
+        xpl = self._with_labels()
+        texts, _ = self._probe_corpus()
+        xpl._reference_corpus = (texts, ["sadness"] * 4 + ["joy"] * 4)
+        issue = xpl.detect_label_noise().issues[0]
+        self.assertEqual(issue.given_label, "joy")
+        self.assertTrue(issue.probe.backs_given)
+        self.assertGreater(issue.probe.given_prob, 0.5)
+
+    def test_probe_is_skipped_when_not_requested(self):
+        xpl = self._with_labels()
+        xpl._reference_corpus = self._probe_corpus()
+        self.assertIsNone(xpl.detect_label_noise(probe=False).issues[0].probe)
+
+    def test_probe_is_fit_once_and_reused_across_calls(self):
+        xpl = self._with_labels()
+        xpl._reference_corpus = self._probe_corpus()
+        xpl.detect_label_noise(top_n=5)
+        first = xpl._label_probe
+        self.assertIsNotNone(first)
+        xpl.detect_label_noise(top_n=4)  # different args -> recompute, but the probe is kept
+        self.assertIs(xpl._label_probe, first)
+
+    def test_probe_needs_no_model_or_retriever(self):
+        # The point of fitting on plain text: a prediction-only pipeline that cannot embed (so
+        # can_find_similar() is False) still gets the second opinion.
+        xpl = self._with_labels()
+        xpl._reference_corpus = self._probe_corpus()
+        xpl._retriever = None
+        xpl._text_model = None
+        self.assertFalse(xpl.can_find_similar())
+        self.assertTrue(xpl.can_probe_labels())
+        self.assertIsNotNone(xpl.detect_label_noise().issues[0].probe)
 
 
 if __name__ == "__main__":

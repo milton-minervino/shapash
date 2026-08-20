@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import pickle
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -26,6 +26,12 @@ from sklearn.decomposition import PCA
 
 from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 from shapash.backend.nlp_shap_backend import NlpShapBackend
+from shapash.compute.diagnostics.label_noise import (
+    LabelNoiseReport,
+    detect_label_issues,
+    has_usable_probabilities,
+)
+from shapash.compute.diagnostics.label_probe import LabelProbe
 from shapash.compute.embedding_store import EmbeddingStore, hash_corpus
 from shapash.compute.generators.ablation_flip import AblationFlipGenerator
 from shapash.compute.generators.base import Counterfactual, CounterfactualGenerator, Field
@@ -151,6 +157,9 @@ class NlpExplainer:
         Neighbours are compared in the model's own ``embedding_space``. To compare in a different
         space, set the model's ``embedding_space`` — that moves the neighbours and any scatter built
         by :meth:`compute_projection` together, since both read the space through the same store.
+        When ``labels`` is given, this corpus additionally trains the label-noise panel's
+        independent probe (:meth:`can_probe_labels`), which needs no model and so is available even
+        when retrieval is not.
     reference_cache_dir : str or Path, optional
         When given, the reference embedding bank is persisted here and reloaded on later runs, so
         only the first launch pays the (one-off) cost of embedding the reference corpus.
@@ -238,6 +247,15 @@ class NlpExplainer:
                 reference_labels=ref_labels,
                 cache_dir=reference_cache_dir,
             )
+        # Kept as plain data beside the retriever, not inside it: the label probe needs only labelled
+        # text and no model at all, so it must stay available for a prediction-only pipeline that
+        # cannot embed — exactly the case the retriever above declines to build for.
+        self._reference_corpus: tuple[list[str], list[str]] | None = (
+            (list(reference_corpus[0]), list(reference_corpus[1]))
+            if reference_corpus is not None and reference_corpus[1] is not None
+            else None
+        )
+        self._label_probe: LabelProbe | None = None  # fit lazily on first use, then reused
 
         self.contributions: NlpContributions | None = None
         self.texts: pd.Series | None = None
@@ -500,6 +518,10 @@ class NlpExplainer:
         xpl.cf_generator = None
         xpl.cf_generators = {}
         xpl._retriever = None
+        # The snapshot carries results, not the corpus they were compared against, so the label
+        # probe cannot be refit — label-noise detection still runs, just without the second opinion.
+        xpl._reference_corpus = None
+        xpl._label_probe = None
         xpl.label_names = results.label_names
         xpl.texts = results.texts
         xpl.contributions = results.computed.contributions
@@ -589,6 +611,126 @@ class NlpExplainer:
             )
         with self._compute_guard():  # embed() tokenizes — serialize against explain_text/predict
             return retriever.query(text, top_k=top_k)
+
+    def can_detect_label_noise(self) -> bool:
+        """Whether label-noise detection can run on the compiled batch.
+
+        Needs ground truth plus one probability column per class — nothing else. In particular it
+        needs **no model**, so unlike the other capability flags this stays ``True`` after
+        :meth:`from_snapshot`; only the optional neighbour corroboration in
+        :meth:`detect_label_noise` requires a live embedding-capable model.
+
+        ``False`` when ``compile()`` got no ``y_true``, and when the bound model is a raw pipeline
+        that reports only the winning class's confidence (a single ``probability`` column).
+        """
+        return getattr(self, "y_true", None) is not None and has_usable_probabilities(getattr(self, "y_prob", None))
+
+    def can_probe_labels(self) -> bool:
+        """Whether the model-independent label probe can run (needs a *labelled* reference corpus).
+
+        The probe is fit on the reference corpus, so unlike :meth:`can_find_similar` it needs no
+        model — a prediction-only pipeline still gets it. It is ``False`` after
+        :meth:`from_snapshot`, which carries results but not the corpus they were compared against.
+        """
+        return getattr(self, "_reference_corpus", None) is not None
+
+    def detect_label_noise(
+        self, top_n: int = 50, score: str = "self_confidence", probe: bool = True
+    ) -> LabelNoiseReport:
+        """Rank the compiled samples whose ground-truth label is probably wrong.
+
+        Runs confident learning (see :mod:`shapash.compute.diagnostics.label_noise`) over the
+        probabilities and labels already held from :meth:`compile`, then attaches a
+        model-independent second opinion to each flagged sample.
+
+        Parameters
+        ----------
+        top_n : int
+            Maximum number of issues to return, worst first.
+        score : {"self_confidence", "normalized_margin"}
+            Ranking method for the flagged samples.
+        probe : bool, optional
+            Attach a :class:`~shapash.compute.diagnostics.label_probe.ProbeVerdict` to each returned
+            issue — a second opinion from a bag-of-words classifier fit on the reference corpus,
+            which owes nothing to the audited model. Silently skipped when
+            :meth:`can_probe_labels` is ``False``. The probe judges only the issues actually
+            returned, so cost scales with ``top_n``, not the corpus.
+
+        Returns
+        -------
+        LabelNoiseReport
+            The ranked issues plus the estimated class-to-class noise matrix.
+
+        Raises
+        ------
+        RuntimeError
+            If the batch carries no ground truth or no per-class probabilities.
+
+        Notes
+        -----
+        Confident learning assumes the probabilities are **out-of-sample** — compiled on data the
+        model did not train on. On a model's own training split it will under-report. See the module
+        docstring of :mod:`shapash.compute.diagnostics.label_noise`.
+
+        Confident learning cannot tell a wrong *label* from a confidently wrong *model* — both look
+        like "the model disagrees with the label". The probe verdict is what separates them, and it
+        is reported alongside the ranking rather than folded into it: a high
+        ``issue.probe.given_prob`` means the reference corpus backs the label, so the row is
+        probably the model's mistake, not the corpus's. Only the probe can say this, because it is
+        the one signal here that does not come from the audited model.
+
+        Examples
+        --------
+        >>> xpl.compile(texts, y_true=labels)
+        >>> report = xpl.detect_label_noise(top_n=20)
+        >>> report.noise_rate
+        0.062
+        >>> report.issues[0].probe.backs_given  # corpus sides with the label -> suspect the model
+        True
+        """
+        if not self.can_detect_label_noise():
+            raise RuntimeError(
+                "detect_label_noise() needs ground-truth labels (pass y_true to compile()) and "
+                "per-class probabilities (a model reporting every class's score, not just the "
+                "predicted one)."
+            )
+        cache_key = (getattr(self, "_data_hash", None), top_n, score, probe)
+        cached = getattr(self, "_label_noise_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cast("LabelNoiseReport", cached[1])
+
+        y_prob = cast("pd.DataFrame", self.y_prob)
+        y_true = cast("pd.Series", self.y_true)
+        texts = cast("pd.Series", self.texts)
+        report = detect_label_issues(
+            y_prob.to_numpy(dtype=float),
+            [str(v) for v in y_true.tolist()],
+            [str(t) for t in texts.tolist()],
+            [str(c) for c in y_prob.columns],
+            top_n=top_n,
+            score=score,
+        )
+        if probe and report.issues and self.can_probe_labels():
+            report = replace(report, issues=self._attach_probe(report.issues))
+
+        self._label_noise_cache = (cache_key, report)
+        return report
+
+    def _attach_probe(self, issues: list) -> list:
+        """Return ``issues`` with each carrying the independent probe's verdict on its given label.
+
+        The probe is fit once and kept: it costs seconds over a few thousand reference texts, and a
+        panel re-detecting on every control change would otherwise pay that each time. No compute
+        guard is taken — this is scikit-learn over plain strings, touching neither the shared
+        tokenizer nor the model.
+        """
+        probe = getattr(self, "_label_probe", None)
+        if probe is None:
+            ref_texts, ref_labels = cast("tuple[list[str], list[str]]", self._reference_corpus)
+            probe = LabelProbe(ref_texts, ref_labels)
+            self._label_probe = probe
+        verdicts = probe.verdicts([iss.text for iss in issues], [iss.given_label for iss in issues])
+        return [replace(issue, probe=verdict) for issue, verdict in zip(issues, verdicts, strict=True)]
 
     def predict(self, text: str) -> tuple[str, dict[str, float]]:
         """Predict a single text, returning ``(label, {label: probability})``."""
