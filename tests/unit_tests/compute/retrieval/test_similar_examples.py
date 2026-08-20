@@ -186,6 +186,70 @@ class TestRetriever(unittest.TestCase):
             self.assertNotEqual(r_dec.store.key, r_pool.store.key)
 
 
+class TestQueryMany(unittest.TestCase):
+    """The batch path must agree with the single-text one, and pay one embed call for the lot."""
+
+    def setUp(self):
+        self.model = FakeEmbeddingModel()
+        self.texts = ["happy joy", "joyful glad", "sad down", "miserable"]
+        self.labels = ["pos", "pos", "neg", "neg"]
+        self.retriever = SimilarExampleRetriever(self.model, self.texts, self.labels)
+
+    def test_matches_query_row_for_row(self):
+        queries = ["happy joy", "miserable"]
+        batched = self.retriever.query_many(queries, top_k=3)
+        one_at_a_time = [self.retriever.query(q, top_k=3) for q in queries]
+        self.assertEqual(batched, one_at_a_time)
+
+    def test_embeds_the_whole_batch_in_one_call(self):
+        self.retriever.build()  # pay the bank up front so only query encoding is counted
+        before = self.model.calls
+        self.retriever.query_many(["happy joy", "miserable", "neutral"], top_k=2)
+        self.assertEqual(self.model.calls - before, 1)
+
+    def test_empty_input_returns_empty_without_embedding(self):
+        before = self.model.calls
+        self.assertEqual(self.retriever.query_many([], top_k=3), [])
+        self.assertEqual(self.model.calls, before)
+
+    def test_single_text_batch(self):
+        [neighbors] = self.retriever.query_many(["happy joy"], top_k=2)
+        self.assertEqual([n.text for n in neighbors], ["happy joy", "joyful glad"])
+
+    def test_top_k_is_clamped_to_the_corpus_size(self):
+        [neighbors] = self.retriever.query_many(["happy joy"], top_k=99)
+        self.assertEqual(len(neighbors), self.retriever.size)
+
+    def test_exclude_self_drops_the_query_from_its_own_results(self):
+        # The case that matters: the queries are themselves corpus members, so without this every
+        # row's nearest neighbour is itself.
+        [neighbors] = self.retriever.query_many(["happy joy"], top_k=2, exclude_self=True)
+        self.assertEqual([n.text for n in neighbors], ["joyful glad", "miserable"])
+
+    def test_exclude_self_removes_every_copy_of_a_duplicated_text(self):
+        retriever = SimilarExampleRetriever(
+            FakeEmbeddingModel(), ["happy joy", "happy joy", "sad down"], ["pos", "pos", "neg"]
+        )
+        [neighbors] = retriever.query_many(["happy joy"], top_k=3, exclude_self=True)
+        self.assertEqual([n.text for n in neighbors], ["sad down"])
+
+    def test_exclude_self_leaves_texts_that_merely_look_alike(self):
+        # Matching on text equality, not a similarity cutoff: "joyful glad" is a near-duplicate in
+        # embedding space and must survive.
+        [neighbors] = self.retriever.query_many(["happy joy"], top_k=1, exclude_self=True)
+        self.assertEqual(neighbors[0].text, "joyful glad")
+
+    def test_labels_ride_along_as_in_the_single_query_path(self):
+        [neighbors] = self.retriever.query_many(["sad down"], top_k=2)
+        self.assertTrue(all(isinstance(n, Neighbor) for n in neighbors))
+        self.assertEqual([n.label for n in neighbors], ["neg", "neg"])
+
+    def test_unlabelled_corpus_yields_none_labels(self):
+        retriever = SimilarExampleRetriever(FakeEmbeddingModel(), self.texts)
+        [neighbors] = retriever.query_many(["happy joy"], top_k=2)
+        self.assertEqual([n.label for n in neighbors], [None, None])
+
+
 class TestL2Normalize(unittest.TestCase):
     def test_unit_norm_rows(self):
         out = _l2_normalize(np.array([[3.0, 4.0], [1.0, 0.0]]))
