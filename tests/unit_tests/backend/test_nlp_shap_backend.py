@@ -225,5 +225,55 @@ class TestRunExplainer(unittest.TestCase):
         np.testing.assert_allclose(raw.base_values, [[0.1 + 1.0 + 4.0, 0.2 + 0.0 + 3.0]])
 
 
+class FakePipeline:
+    """Stands in for a ``transformers`` pipeline: callable, with the private batch-size slot."""
+
+    def __init__(self, batch_size=None):
+        self._batch_size = batch_size
+        self.tokenizer = object()
+
+    def __call__(self, texts, **kwargs):
+        return np.zeros((len(texts), 2))
+
+
+class TestPipelineBatchSize(unittest.TestCase):
+    """A pipeline arriving with no batch size scores masked variants one at a time — see __init__."""
+
+    def _backend(self, model, **kwargs):
+        return NlpShapBackend(model=model, explainer_args={"explainer": FakeShapExplainer}, **kwargs)
+
+    def test_sets_batch_size_on_unconfigured_pipeline(self):
+        pipe = FakePipeline()
+        self._backend(pipe)
+        self.assertEqual(pipe._batch_size, 64)
+
+    def test_treats_batch_size_of_one_as_unconfigured(self):
+        # transformers resolves an unset batch size to 1, so 1 carries no intent.
+        pipe = FakePipeline(batch_size=1)
+        self._backend(pipe)
+        self.assertEqual(pipe._batch_size, 64)
+
+    def test_never_overrides_a_configured_pipeline(self):
+        pipe = FakePipeline(batch_size=8)
+        self._backend(pipe)
+        self.assertEqual(pipe._batch_size, 8)
+
+    def test_explicit_batch_size_is_honoured(self):
+        pipe = FakePipeline()
+        self._backend(pipe, batch_size=256)
+        self.assertEqual(pipe._batch_size, 256)
+
+    def test_none_leaves_the_pipeline_untouched(self):
+        pipe = FakePipeline()
+        self._backend(pipe, batch_size=None)
+        self.assertIsNone(pipe._batch_size)
+
+    def test_bare_callable_is_unaffected(self):
+        # A LIME-style scoring function has no _batch_size slot; it must not gain one.
+        model = lambda texts: np.zeros((len(texts), 2))  # noqa: E731
+        self._backend(model)
+        self.assertFalse(hasattr(model, "_batch_size"))
+
+
 if __name__ == "__main__":
     unittest.main()
