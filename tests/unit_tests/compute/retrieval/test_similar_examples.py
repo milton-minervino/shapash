@@ -105,6 +105,21 @@ class TestRetriever(unittest.TestCase):
         self.assertEqual(set(model.spaces), {None})
         self.assertIn("pooled", retriever.store.space_key)
 
+    def test_a_space_change_rebuilds_the_bank(self):
+        """A bank held across a live space switch would be cosine-compared against queries from the
+        new space — two unrelated spaces, yielding a plausible number rather than an error."""
+        self.retriever.query("happy joy", top_k=1)
+        self.model.calls = 0
+        self.model.embedding_space = "pooled"
+        self.retriever.query("happy joy", top_k=1)
+        self.assertEqual(self.model.calls, 2)  # bank rebuilt in the new space, plus the query
+
+    def test_the_bank_is_built_once_while_the_space_holds(self):
+        """Guard on the fix above: the bank is the expensive, amortizable half and must stay so."""
+        for _ in range(3):
+            self.retriever.query("happy joy", top_k=1)
+        self.assertEqual(self.model.calls, 4)  # one bank + three queries
+
     def test_query_ranks_by_cosine_similarity(self):
         neighbors = self.retriever.query("happy joy", top_k=2)
         self.assertEqual([n.text for n in neighbors], ["happy joy", "joyful glad"])
@@ -121,6 +136,44 @@ class TestRetriever(unittest.TestCase):
     def test_top_k_clamped_to_corpus_size(self):
         neighbors = self.retriever.query("neutral", top_k=99)
         self.assertEqual(len(neighbors), 4)
+
+
+class TestQueryThreshold(unittest.TestCase):
+    """The threshold path: not a fixed count, ranked descending, with an uncapped total."""
+
+    def setUp(self):
+        self.model = FakeEmbeddingModel()
+        self.texts = ["happy joy", "joyful glad", "sad down", "miserable"]
+        self.labels = ["pos", "pos", "neg", "neg"]
+        self.retriever = SimilarExampleRetriever(self.model, self.texts, self.labels)
+
+    def test_returns_only_matches_above_threshold_descending(self):
+        # cosine("happy joy", "happy joy") = 1.0, cosine("happy joy", "joyful glad") ~= 0.994,
+        # the other two are near-orthogonal — well below any threshold used here.
+        neighbors, total = self.retriever.query_threshold("happy joy", threshold=0.99)
+        self.assertEqual([n.text for n in neighbors], ["happy joy", "joyful glad"])
+        self.assertEqual(total, 2)
+        self.assertGreaterEqual(neighbors[0].score, neighbors[1].score)
+
+    def test_threshold_is_strict_exclusive(self):
+        # A threshold equal to the best possible score (self-similarity = 1.0) admits nothing.
+        neighbors, total = self.retriever.query_threshold("happy joy", threshold=1.0)
+        self.assertEqual(neighbors, [])
+        self.assertEqual(total, 0)
+
+    def test_limit_caps_returned_neighbors_but_not_the_total(self):
+        neighbors, total = self.retriever.query_threshold("happy joy", threshold=0.99, limit=1)
+        self.assertEqual([n.text for n in neighbors], ["happy joy"])
+        self.assertEqual(total, 2)  # still 2 cleared the threshold, only 1 is returned
+
+    def test_no_limit_returns_every_match(self):
+        neighbors, total = self.retriever.query_threshold("happy joy", threshold=-1.0, limit=None)
+        self.assertEqual(len(neighbors), self.retriever.size)
+        self.assertEqual(total, self.retriever.size)
+
+    def test_labels_ride_along(self):
+        neighbors, _total = self.retriever.query_threshold("happy joy", threshold=0.99)
+        self.assertEqual([n.label for n in neighbors], ["pos", "pos"])
 
     def test_bank_built_once_and_reused(self):
         self.retriever.query("happy joy", top_k=1)

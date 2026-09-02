@@ -56,9 +56,9 @@ def test_lig_backend_contributions(model):
     backend = NlpCaptumLigBackend(model, label_names=LABELS)
     raw = backend.run_explainer(["i am so happy today", "i feel terrified"])
 
-    assert len(raw.contributions) == 2
+    assert len(raw.values) == 2
     assert raw.base_values.shape == (2, len(LABELS))
-    for values, tokens in zip(raw.contributions, raw.data):
+    for values, tokens in zip(raw.values, raw.token_strings):
         assert values.shape == (len(tokens), len(LABELS))
         assert np.isfinite(values).all()
         # Subwords are merged to whole words and specials dropped — no [CLS]/[SEP]/## leak into highlights.
@@ -67,7 +67,7 @@ def test_lig_backend_contributions(model):
     # LIG is a completion method: base + sum(attributions) ≈ logits(x) for each class.
     input_ids, attention_mask, _ = model.encode("i am so happy today")
     logits_x = model.logits(input_ids, attention_mask)[0].detach().cpu().numpy()
-    recon = raw.base_values[0] + raw.contributions[0].sum(axis=0)
+    recon = raw.base_values[0] + raw.values[0].sum(axis=0)
     np.testing.assert_allclose(recon, logits_x, atol=0.2)
 
 

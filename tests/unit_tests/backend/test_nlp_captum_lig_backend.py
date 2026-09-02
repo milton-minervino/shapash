@@ -11,7 +11,7 @@ import numpy as np
 
 from shapash.backend import NlpCaptumLigBackend, get_backend_cls_from_name
 from shapash.backend.nlp_captum_lig_backend import _aggregate_by_alignment, _aggregate_subwords
-from shapash.model.base import TextModel
+from shapash.model.base import SupportsCaptumIG, TextModel
 
 
 class PredictOnlyModel(TextModel):
@@ -34,6 +34,11 @@ class TestNlpCaptumLigBackend(unittest.TestCase):
     def test_requires_captum_capability(self):
         with self.assertRaises(TypeError):
             NlpCaptumLigBackend(PredictOnlyModel(), label_names=["neg", "pos"])
+
+    def test_backend_contract_attributes(self):
+        self.assertEqual(NlpCaptumLigBackend.reference_kind, "point")
+        self.assertTrue(NlpCaptumLigBackend.is_additive)
+        self.assertEqual(NlpCaptumLigBackend.requires_model_capabilities, (SupportsCaptumIG,))
 
 
 class TestAggregateSubwords(unittest.TestCase):

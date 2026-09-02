@@ -16,6 +16,7 @@ from shapash.compute.diagnostics.label_noise import LabelIssue, detect_label_iss
 from shapash.compute.diagnostics.label_probe import LabelProbe, ProbeVerdict
 from shapash.compute.generators.base import Counterfactual, IntField, TokenListField
 from shapash.compute.retrieval.similar_examples import Neighbor
+from shapash.explainer.nlp_explanation import NlpExplanation
 from shapash.webapp.nlp_app import NlpWebApp
 from shapash.webapp.nlp_components import (
     CounterfactualComponent,
@@ -23,7 +24,6 @@ from shapash.webapp.nlp_components import (
     LabelNoiseComponent,
     SimilarExamplesComponent,
 )
-from shapash.webapp.nlp_view import NlpView
 
 LABEL_NAMES = ["neg", "pos"]
 
@@ -40,10 +40,7 @@ def _contributions() -> NlpContributions:
     token_strings = [["i", "am", "happy"], ["this", "is", "bad"]]
     values = [np.random.randn(3, 2), np.random.randn(3, 2)]
     base_values = np.zeros((2, 2))
-    c = NlpContributions(token_strings=token_strings, values=values, base_values=base_values)
-    c.label_names = LABEL_NAMES
-    c.index = pd.RangeIndex(2)
-    return c
+    return NlpContributions(token_strings=token_strings, values=values, base_values=base_values)
 
 
 class FakeEngine:
@@ -81,13 +78,34 @@ class FakeEngine:
         # groups, keep seeing neither the Error Analysis nor the Label Noise tab.
         self.detect_calls = []
 
-    def can_detect_label_noise(self):
+    def to_explanation(self) -> NlpExplanation:
+        """The ``NlpExplanation`` a real ``explain()`` call would have produced for this batch.
+
+        ``NlpWebApp`` holds an explanation, not the engine — this is what tests pass as the first
+        argument, while ``self`` (the ``FakeEngine``) is passed separately as ``engine=``.
+        """
+        return NlpExplanation(
+            texts=self.texts,
+            token_strings=self.contributions.token_strings,
+            values=self.contributions.values,
+            base_values=self.contributions.base_values,
+            y_pred=self.y_pred,
+            y_prob=self.y_prob,
+            y_true=self.y_true,
+            label_names=self.label_names,
+            folds_case=None,
+            backend_name="fake",
+            is_additive=True,
+            reference_kind="none",
+        )
+
+    def can_detect_label_noise(self, explanation=None):
         return self.y_true is not None
 
     def can_probe_labels(self):
         return self.probe_corpus is not None
 
-    def detect_label_noise(self, top_n=50, score="self_confidence", probe=True):
+    def detect_label_noise(self, explanation, top_n=50, score="self_confidence", probe=True):
         self.detect_calls.append({"top_n": top_n, "score": score, "probe": probe})
         report = detect_label_issues(
             self.y_prob.to_numpy(dtype=float),
@@ -121,6 +139,15 @@ class FakeEngine:
             Neighbor(index=0, score=0.99, text="i am joyful", label="pos"),
             Neighbor(index=1, score=0.80, text="this is awful", label="neg"),
         ][:top_k]
+
+    def find_similar_threshold(self, text, threshold=0.95, limit=50):
+        all_neighbors = [
+            Neighbor(index=0, score=0.99, text="i am joyful", label="pos"),
+            Neighbor(index=1, score=0.96, text="so glad today", label="pos"),
+            Neighbor(index=2, score=0.80, text="this is awful", label="neg"),
+        ]
+        matches = [n for n in all_neighbors if n.score > threshold]
+        return matches[:limit], len(matches)
 
     def available_cf_generators(self):
         return [("hotflip", "HotFlip"), ("ablation_flip", "Ablation")]
@@ -158,10 +185,24 @@ class FakeEngine:
 
 
 def _collect_ids(node, found):
-    """Recursively collect all string component ids in a Dash layout tree."""
+    """Recursively collect all string component ids in a Dash layout tree.
+
+    Also descends into RadioItems/Checklist ``options[].label`` — components nested there (e.g. a
+    numeric input inline with its radio button) aren't under ``.children``, but Dash still renders
+    and wires them, since ``label`` is documented to accept a component.
+    """
     cid = getattr(node, "id", None)
     if isinstance(cid, str):
         found.add(cid)
+    options = getattr(node, "options", None)
+    if isinstance(options, (list, tuple)):
+        for opt in options:
+            label = opt.get("label") if isinstance(opt, dict) else None
+            if isinstance(label, (list, tuple)):
+                for item in label:
+                    _collect_ids(item, found)
+            elif label is not None:
+                _collect_ids(label, found)
     children = getattr(node, "children", None)
     if children is None:
         return
@@ -174,7 +215,7 @@ def _collect_ids(node, found):
 
 class TestWhatIfMounting(unittest.TestCase):
     def _ids(self, engine):
-        app = NlpWebApp(engine)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         found = set()
         _collect_ids(app.app.layout, found)
         return app, found
@@ -210,7 +251,8 @@ class TestWhatIfMounting(unittest.TestCase):
         self.assertIn("counterfactual-cfg-group-ablation_flip", ids)
 
     def test_selector_toggle_callback_registered_with_multiple_generators(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("counterfactual-cfg-group-hotflip.style", outputs)
 
@@ -228,7 +270,8 @@ class TestWhatIfMounting(unittest.TestCase):
         self.assertEqual(self._whatif_components(app), [])
 
     def test_callbacks_registered_when_mounted(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("data-editor-prob.figure", outputs)
         self.assertIn("counterfactual-results.children", outputs)
@@ -250,7 +293,8 @@ class TestWhatIfMounting(unittest.TestCase):
         self.assertNotIn("similar-topk", ids)
 
     def test_similar_callbacks_registered_when_mounted(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=False, can_similar=True))
+        engine = FakeEngine(can_edit=True, can_cf=False, can_similar=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("similar-results.children", outputs)
 
@@ -269,7 +313,7 @@ class TestThreePanelLayout(unittest.TestCase):
     """The LIT-style three-panel shell: tab groups, mounted bodies, and the current-datapoint store."""
 
     def _ids(self, engine, **kwargs):
-        app = NlpWebApp(engine, **kwargs)
+        app = NlpWebApp(engine.to_explanation(), engine=engine, **kwargs)
         found = set()
         _collect_ids(app.app.layout, found)
         return app, found
@@ -327,7 +371,8 @@ class TestThreePanelLayout(unittest.TestCase):
         self.assertIn("current-datapoint", ids)
 
     def test_detail_panels_read_current_datapoint(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         # Highlight and waterfall render off the shared primary-selection store...
         self.assertIn(("current-datapoint", "data"), _callback_binding_ids(app, "sentence-highlight.children"))
         self.assertIn(("current-datapoint", "data"), _callback_binding_ids(app, "waterfall-graph.figure"))
@@ -335,7 +380,8 @@ class TestThreePanelLayout(unittest.TestCase):
         self.assertIn(("current-datapoint", "data"), _callback_binding_ids(app, "counterfactual-results.children"))
 
     def test_current_datapoint_written_by_row_and_editor(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         # The table-selection writer keys off the selected row.
         self.assertIn(("dataset-table", "selectedRows"), _callback_binding_ids(app, "current-datapoint.data"))
         # The editor's Predict also writes it (allow_duplicate) — its combined key carries the prob figure.
@@ -343,28 +389,31 @@ class TestThreePanelLayout(unittest.TestCase):
         self.assertIn("current-datapoint.data", editor_key)
 
     def test_tab_toggle_callbacks_registered(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True), scatter_xy=np.zeros((2, 2)))
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine, scatter_xy=np.zeros((2, 2)))
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("left-tabs-body-table.style", outputs)
         self.assertIn("lower-right-tabs-body-waterfall.style", outputs)
 
 
 class TestReadContractSeam(unittest.TestCase):
-    """The app shell reads compiled data only through ``NlpView``; it keeps no raw explainer handle.
+    """The app shell reads compiled data only from the ``NlpExplanation``; no raw explainer handle.
 
-    ``FakeEngine`` exposes the view/engine surface but has no ``explainer`` attribute, so a mounted
-    app proves the read path is served by the contract alone. These asserts lock the seam so a future
-    edit cannot silently reintroduce a ``self.explainer`` bypass (see nlp_app engine/view split).
+    ``FakeEngine`` has no ``explainer`` attribute, so a mounted app proves the read path is served by
+    the artifact alone. These asserts lock the seam so a future edit cannot silently reintroduce a
+    ``self.explainer`` bypass, nor let display state accumulate back onto the artifact.
     """
 
     def test_app_holds_no_raw_explainer_handle(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True))
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         self.assertFalse(hasattr(app, "explainer"))
 
-    def test_app_exposes_view_and_engine_roles(self):
+    def test_app_exposes_explanation_and_engine_roles(self):
         engine = FakeEngine(can_edit=True, can_cf=True)
-        app = NlpWebApp(engine)
-        self.assertIsInstance(app._view, NlpView)  # read contract
+        explanation = engine.to_explanation()
+        app = NlpWebApp(explanation, engine=engine)
+        self.assertIs(app._explanation, explanation)  # read contract: the artifact itself
         self.assertIs(app._engine, engine)  # live-action contract
 
 
@@ -378,10 +427,10 @@ class TestSimilarComponent(unittest.TestCase):
         from shapash.webapp.nlp_components import SimilarExamplesComponent
 
         engine = FakeEngine(can_edit=True, can_cf=False, can_similar=True)
-        view = NlpView(engine)
+        explanation = engine.to_explanation()
         app = dash.Dash(__name__)
         comp = SimilarExamplesComponent()
-        comp.register_callbacks(app, view, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
+        comp.register_callbacks(app, explanation, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
         return app, engine
 
     @staticmethod
@@ -398,14 +447,16 @@ class TestSimilarComponent(unittest.TestCase):
 
         engine = FakeEngine(can_edit=True, can_cf=False, can_similar=True)
         found = set()
-        _collect_ids(SimilarExamplesComponent().layout(NlpView(engine), engine), found)
+        _collect_ids(SimilarExamplesComponent().layout(engine.to_explanation(), engine), found)
         self.assertIn("similar-topk", found)
+        self.assertIn("similar-threshold", found)
+        self.assertIn("similar-mode", found)
         self.assertIn("similar-results", found)
 
     def test_update_similar_returns_table_and_texts(self):
         app, _ = self._register()
         update = self._callback(app, "similar-results")
-        children, texts = update({"text": "i am happy", "label": "pos"}, 5)
+        children, texts = update({"text": "i am happy", "label": "pos"}, "topk", 5, 0.95)
         self.assertEqual(texts, ["i am joyful", "this is awful"])
         self.assertIsNotNone(children)
 
@@ -415,7 +466,32 @@ class TestSimilarComponent(unittest.TestCase):
         app, _ = self._register()
         update = self._callback(app, "similar-results")
         with self.assertRaises(PreventUpdate):
-            update({"text": "  "}, 5)
+            update({"text": "  "}, "topk", 5, 0.95)
+
+    def test_update_similar_threshold_mode_filters_and_reports_total(self):
+        app, _ = self._register()
+        update = self._callback(app, "similar-results")
+        children, texts = update({"text": "i am happy", "label": "pos"}, "threshold", 5, 0.90)
+        # Only the two neighbours scoring above 0.90 clear the threshold (see FakeEngine.find_similar_threshold).
+        self.assertEqual(texts, ["i am joyful", "so glad today"])
+        self.assertIsNotNone(children)
+
+    def test_update_similar_threshold_mode_empty_above_cutoff(self):
+        app, _ = self._register()
+        update = self._callback(app, "similar-results")
+        children, texts = update({"text": "i am happy", "label": "pos"}, "threshold", 5, 0.999)
+        self.assertEqual(texts, [])
+        self.assertIsNotNone(children)
+
+    def test_toggle_mode_inputs_disables_the_inactive_control(self):
+        app, _ = self._register()
+        toggle = self._callback(app, "similar-topk.disabled")
+        topk_disabled, threshold_disabled = toggle("threshold")
+        self.assertTrue(topk_disabled)
+        self.assertFalse(threshold_disabled)
+        topk_disabled, threshold_disabled = toggle("topk")
+        self.assertFalse(topk_disabled)
+        self.assertTrue(threshold_disabled)
 
     def test_inspect_makes_neighbor_the_current_datapoint(self):
         from unittest import mock
@@ -451,12 +527,51 @@ class TestSimilarComponent(unittest.TestCase):
         table = _neighbors_table(neighbors, predicted_label=None, component_id="similar")
         self.assertIsNotNone(table)
 
+    def test_match_rate_caption_reports_share_of_predicted_label(self):
+        from shapash.webapp.nlp_components.similar_examples import _match_rate_caption
+
+        neighbors = [
+            Neighbor(index=0, score=0.9, text="a", label="pos"),
+            Neighbor(index=1, score=0.8, text="b", label="pos"),
+            Neighbor(index=2, score=0.7, text="c", label="neg"),
+            Neighbor(index=3, score=0.6, text="d", label="neg"),
+        ]
+        caption = _match_rate_caption(neighbors, predicted_label="pos")
+        self.assertIn("2/4", caption)
+        self.assertIn("50%", caption)
+
+    def test_match_rate_caption_none_without_a_prediction_or_labels(self):
+        from shapash.webapp.nlp_components.similar_examples import _match_rate_caption
+
+        neighbors = [Neighbor(index=0, score=0.9, text="a", label="pos")]
+        self.assertIsNone(_match_rate_caption(neighbors, predicted_label=None))
+        unlabelled = [Neighbor(index=0, score=0.9, text="a", label=None)]
+        self.assertIsNone(_match_rate_caption(unlabelled, predicted_label="pos"))
+
+    def test_render_results_includes_cap_note_only_when_capped(self):
+        from shapash.webapp.nlp_components.similar_examples import _render_results
+
+        neighbors = [Neighbor(index=0, score=0.99, text="a", label="pos")]
+        capped = _render_results(neighbors, predicted_label="pos", component_id="similar", shown_of=5)
+        uncapped = _render_results(neighbors, predicted_label="pos", component_id="similar", shown_of=None)
+
+        def _flat_text(node):
+            children = getattr(node, "children", None)
+            if isinstance(children, str):
+                return children
+            if isinstance(children, list):
+                return "".join(_flat_text(c) for c in children if c is not None)
+            return _flat_text(children) if children is not None else ""
+
+        self.assertIn("Showing 1 of 5", _flat_text(capped))
+        self.assertNotIn("Showing", _flat_text(uncapped))
+
 
 class TestLabelNoiseMounting(unittest.TestCase):
     """``CAP_LABELS`` is a *data* capability: it depends on the compiled batch, not on a live model."""
 
     def _ids(self, engine):
-        app = NlpWebApp(engine)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         found = set()
         _collect_ids(app.app.layout, found)
         return app, found
@@ -488,18 +603,19 @@ class TestLabelNoiseMounting(unittest.TestCase):
 
     def test_caption_warns_when_no_independent_cross_check_is_available(self):
         engine = FakeEngine(can_edit=True, can_cf=False, has_labels=True)
-        layout = LabelNoiseComponent().layout(NlpView(engine), engine)
+        layout = LabelNoiseComponent().layout(engine.to_explanation(), engine)
         caption = layout.children[1].children
         self.assertIn("no independent cross-check", caption)
 
     def test_caption_explains_the_corpus_column_when_the_probe_is_available(self):
         engine = FakeEngine(can_edit=True, can_cf=False, has_labels=True, probe_corpus=_PROBE_CORPUS)
-        layout = LabelNoiseComponent().layout(NlpView(engine), engine)
+        layout = LabelNoiseComponent().layout(engine.to_explanation(), engine)
         caption = layout.children[1].children
         self.assertIn("Corpus column", caption)
 
     def test_callbacks_registered_when_mounted(self):
-        app = NlpWebApp(FakeEngine(can_edit=True, can_cf=True, has_labels=True))
+        engine = FakeEngine(can_edit=True, can_cf=True, has_labels=True)
+        app = NlpWebApp(engine.to_explanation(), engine=engine)
         outputs = " ".join(app.app.callback_map.keys())
         self.assertIn("label-noise-results.children", outputs)
 
@@ -512,10 +628,10 @@ class TestLabelNoiseComponent(unittest.TestCase):
         import dash
 
         engine = FakeEngine(can_edit=True, can_cf=False, has_labels=True, **kwargs)
-        view = NlpView(engine)
+        explanation = engine.to_explanation()
         app = dash.Dash(__name__)
         comp = LabelNoiseComponent()
-        comp.register_callbacks(app, view, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
+        comp.register_callbacks(app, explanation, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
         return app, engine
 
     @staticmethod

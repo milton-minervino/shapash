@@ -54,6 +54,42 @@ class TestVectors(unittest.TestCase):
         np.testing.assert_allclose(store.vectors(), first)
         self.assertEqual(model.calls, 1)
 
+    def test_a_space_change_invalidates_the_in_memory_memo(self):
+        """The memo is keyed by ``key``, which folds in the space — not by tag alone.
+
+        A tag-only memo answered from the previous space after a live ``embedding_space`` switch and
+        never even consulted the (correctly keyed) file on disk.
+        """
+        model = FakeModel()
+        store = EmbeddingStore(model, TEXTS)
+        store.vectors()
+        model.space = "pooled"
+        store.vectors()
+        self.assertEqual(model.calls, 2)  # re-embedded rather than replaying the decision-space memo
+
+    def test_the_memo_still_holds_within_one_space(self):
+        """Guard on the fix above: invalidating on a space change must not disable memoization."""
+        model = FakeModel()
+        store = EmbeddingStore(model, TEXTS)
+        for _ in range(3):
+            store.vectors()
+        self.assertEqual(model.calls, 1)
+
+    def test_a_space_change_reloads_from_disk_rather_than_recomputing(self):
+        """Once both spaces are on disk, switching back and forth costs no forward pass."""
+        with tempfile.TemporaryDirectory() as d:
+            model = FakeModel()
+            store = EmbeddingStore(model, TEXTS, cache_dir=d)
+            store.vectors()
+            model.space = "pooled"
+            store.vectors()
+            fresh = EmbeddingStore(FakeModel(), TEXTS, cache_dir=d)
+            fresh.model.space = "pooled"
+            fresh.vectors()
+            fresh.model.space = "decision"
+            fresh.vectors()
+            self.assertEqual(fresh.model.calls, 0)  # both spaces served from their own files
+
     def test_embeds_in_the_models_default_space(self):
         """The store never picks a space of its own: it calls embed() bare and keys on what that means."""
         model = FakeModel(space="pooled")

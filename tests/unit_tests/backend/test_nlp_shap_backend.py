@@ -219,8 +219,8 @@ class TestRunExplainer(unittest.TestCase):
 
         raw = backend.run_explainer(["updating"])
 
-        self.assertEqual(raw.data, [["updating"]])
-        np.testing.assert_allclose(raw.contributions[0], [[5.0, 3.0]])
+        self.assertEqual(raw.token_strings, [["updating"]])
+        np.testing.assert_allclose(raw.values[0], [[5.0, 3.0]])
         # CLS ([1,0]) + SEP ([4,3]) folded into the base.
         np.testing.assert_allclose(raw.base_values, [[0.1 + 1.0 + 4.0, 0.2 + 0.0 + 3.0]])
 
