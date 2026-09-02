@@ -77,7 +77,7 @@ class CounterfactualComponent(WebappComponent):
             )
         return items
 
-    def layout(self, view, engine=None) -> html.Div:
+    def layout(self, explanation, engine=None) -> html.Div:
         """Return the counterfactual card with a method selector and per-generator config controls.
 
         The selector and *every* generator's controls are built here (not injected by a callback) so
@@ -132,7 +132,7 @@ class CounterfactualComponent(WebappComponent):
             style=_CARD_STYLE,
         )
 
-    def register_callbacks(self, app, view, engine, stores) -> None:
+    def register_callbacks(self, app, explanation, engine, stores) -> None:
         """Wire the method selector, Generate, and per-row Apply (→ shared editor store)."""
         apply_store = stores["apply"]
         current_store = stores["current"]

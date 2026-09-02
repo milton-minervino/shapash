@@ -1,23 +1,52 @@
 """Serve the NLP explainer **with the What-if Lab** (live model, cached compute).
 
+The shape of the script follows the ``fit`` / ``explain`` split:
+
+1. ``NlpExplainer(model, backend=...)`` — bind the model. No data, no results.
+2. ``xpl.fit(reference_texts, y=reference_labels)`` — learn *reference state*: the similar-examples
+   corpus and the label probe. Optional; skipped entirely with ``--n-reference 0``. This embeds the
+   reference corpus (``precompute=True``), so the first run is slower here and the webapp's
+   "Similar Examples" panel is instant; ``--cache-dir`` makes later runs reload instead.
+3. ``explanation = xpl.explain(sentences, y=y_true, cache_dir=...)`` — the expensive step. Returns an
+   immutable ``NlpExplanation``; the explainer keeps a memo, not a result.
+4. Everything downstream takes that artifact as an *argument* — ``compute_projection(explanation,
+   ...)``, ``can_detect_label_noise(explanation)``, ``run_app(explanation, ...)``.
+
 The What-if Lab needs a live model in memory — editing a sample, re-predicting, and generating
-counterfactuals all call the real model, so a model-free snapshot (``from_snapshot``) makes the
-lab self-disable. There is therefore no way to serve what-if without loading the model.
+counterfactuals all call the real model. That is why ``run_app`` gets both the artifact (what to
+render) and ``self`` (how to compute live); serving an artifact alone makes the lab self-disable.
+There is therefore no way to serve what-if without loading the model.
 
 What *can* be avoided on every restart is recomputing the expensive stuff around the
 model. This script caches both to ``--cache-dir`` (keyed by a hash of the input texts):
 
-* **SHAP contributions + predictions** — via the built-in ``compile(cache_dir=...)``.
-* **The text embeddings and the 2-D projection** — via ``compute_projection(cache_dir=...)``. The
-  library owns the embedding + caching (so the scatter and the similar-example neighbours are always
-  in the same space); this script only supplies the reducer, PaCMAP.
+* **Contributions + predictions** — via ``explain(..., cache_dir=...)``.
+* **The text embeddings and the 2-D projection** — via ``compute_projection(explanation, cache_dir=...)``.
+  The library owns the embedding + caching (so the scatter and the similar-example neighbours are
+  always in the same space); this script only supplies the reducer, PaCMAP.
 
 The caching is automatic: each run **loads** the cache if one exists for these exact
 texts, otherwise it **computes and writes** it. So the first run is slow; every run after
 pays only the model load (a few seconds on CPU). Pass ``--recompute`` to force a fresh
 compute (e.g. after changing the explainer). Iterating on the webapp itself? Don't
-restart at all — keep this in a REPL and re-call ``run_app`` after reloading the webapp
-modules; the model stays resident.
+restart at all — keep this in a REPL and re-call ``run_app(explanation, ...)`` after reloading the
+webapp modules; the model and the artifact both stay resident.
+
+**The cache file is a snapshot.** ``explain``'s cache entries are ``NlpExplanation.save`` output — a
+zip of plain-text ``meta.json`` plus parquet, no pickle — so any ``<hash>.xpl`` under ``--cache-dir``
+can be reopened with **no model and no backend**::
+
+    from shapash.explainer.nlp_explanation import NlpExplanation
+    from shapash.webapp.nlp_app import NlpWebApp
+
+    explanation, scatter = NlpExplanation.load("…/nlp_shap/<hash>.xpl")
+    NlpWebApp(explanation, engine=None, scatter_xy=scatter).run(port=8050)
+
+One caveat, and it is deliberate rather than an oversight: **the cached artifact carries no ground
+truth.** The cache key covers ``(texts, model, backend)``, and ``y`` is not a function of that key —
+it belongs to whoever called ``explain``. Serving a cache file directly therefore self-disables the
+confusion matrix and the label-noise panel. For a shareable snapshot *with* labels, save the object
+``explain`` returned: ``explanation.save(path, scatter_xy=projected)``.
 
 The model runs on CPU when no GPU is present, so this serves fine on a plain box.
 
@@ -57,7 +86,7 @@ substitution) and ``ablation`` (leave-one-out token removal) — and are switche
 The on-disk cache mirrors these dependencies as a hierarchy under ``--cache-dir``:
 ``<model>/<dataset>__<split>/`` holds the (backend-independent) embedding-store artifacts — the
 vectors and the projection derived from them — and a per-backend ``<...>/nlp_shap/`` or
-``<...>/nlp_captum_lig/`` subdirectory holds that method's ``<hash>.pkl`` contributions.
+``<...>/nlp_captum_lig/`` subdirectory holds that method's ``<hash>.xpl`` contributions.
 
 Serving a *private* model and dataset (both local, nothing on the hub)
 ----------------------------------------------------------------------
@@ -355,7 +384,7 @@ def _dataset_slug(config: ServeConfig) -> str:
 def _dataset_cache_dir(config: ServeConfig) -> Path:
     """Return ``cache_dir/<model>/<dataset>__<split>`` — the level the projection is cached at.
 
-    The compile and projection caches both key on the model (and, for contributions, the backend), so
+    The explain and projection caches both key on the model (and, for contributions, the backend), so
     these path levels are organisational rather than load-bearing: they keep a ``--cache-dir`` readable
     and prunable per model/dataset. The PaCMAP projection embeds the texts with ``model.embed`` and
     never touches the attribution backend, so every ``--attribution`` choice shares one projection cache
@@ -364,11 +393,11 @@ def _dataset_cache_dir(config: ServeConfig) -> Path:
     return config.cache_dir / _model_slug(config) / _dataset_slug(config)
 
 
-def _compile_cache_dir(config: ServeConfig) -> Path:
+def _explain_cache_dir(config: ServeConfig) -> Path:
     """Return ``<dataset-dir>/<backend>`` — the level contributions are cached at.
 
     Contributions *do* depend on the attribution backend, so SHAP and LIG get separate subdirectories.
-    Switching ``--attribution`` then reads/writes a different ``<hash>.pkl`` instead of silently
+    Switching ``--attribution`` then reads/writes a different ``<hash>.xpl`` instead of silently
     reusing the other method's cached highlights — no ``--recompute`` needed to swap methods.
     """
     return _dataset_cache_dir(config) / _ATTRIBUTION_BACKENDS[config.attribution]
@@ -897,7 +926,7 @@ def build_reducer() -> pacmap.PaCMAP:
 
 
 def main() -> None:
-    """Load config + data + model, (re)use the SHAP + projection cache, and serve the What-if webapp."""
+    """Load config + data + model, fit, explain (reusing the cache), and serve the artifact."""
     config = parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -908,7 +937,7 @@ def main() -> None:
 
     sentences, y_true = load_data(config)
     dataset_dir = _dataset_cache_dir(config)  # projection lives here (shared across attribution backends)
-    compile_dir = _compile_cache_dir(config)  # contributions live here (one subdir per attribution backend)
+    explain_dir = _explain_cache_dir(config)  # contributions live here (one subdir per attribution backend)
 
     model = load_model(config)
     if config.embedding_space is not None:
@@ -923,42 +952,58 @@ def main() -> None:
     reference_corpus = load_reference_corpus(config)
     similar_cache_dir = dataset_dir / "similar"
 
-    # No cf_generator is passed: NlpExplainer auto-discovers every built-in compatible with the model
-    # (HotFlip + AblationFlip on an HF classifier) and offers them from the What-if Lab's method dropdown.
-    # reference_corpus enables the "Similar Examples" panel (skipped when --n-reference 0).
+    # Step 1 — bind the model. No data and no results: the constructor takes what is true for every
+    # batch. No cf_generator is passed, so NlpExplainer auto-discovers every built-in compatible with
+    # the model (HotFlip + AblationFlip on an HF classifier) and offers them from the What-if Lab's
+    # method dropdown.
     xpl = NlpExplainer(
         model,
         label_names=model.label_names,
         backend=build_backend(config, model),
-        reference_corpus=reference_corpus,
-        reference_cache_dir=similar_cache_dir,
     )
+
+    # Step 2 — fit() learns reference state, which for text is the corpus. Two panels come from it,
+    # with different requirements: "Similar Examples" needs an embedding-capable model, while the
+    # label-noise probe needs only the *labels* and so works even behind a prediction-only pipeline.
+    # Passing y is what enables the second. Both are skipped when --n-reference 0 leaves this None.
+    # This is where the reference corpus gets embedded (one forward pass per example, cached under
+    # similar_cache_dir) — deliberately here rather than inside the first callback that opens the
+    # panel. Pass precompute=False to trade a fast start for a slow first click.
+    reference_texts, reference_labels = reference_corpus if reference_corpus is not None else (None, None)
+    xpl.fit(reference_texts, y=reference_labels, cache_dir=similar_cache_dir)
+
     if config.recompute:
         # Drop this text set's cached contributions so the steps below recompute + overwrite. The
         # explainer owns the key (it covers the model and backend), so it also owns the deletion —
         # only *this* model+backend's entry goes, other backends' caches are left intact. The
         # embeddings + projection are dropped by compute_projection(recompute=True) below.
         logger.info("--recompute: dropping cached %s contributions + projection for these texts", config.attribution)
-        xpl.clear_cache(sentences, compile_dir)
+        xpl.clear_cache(sentences, explain_dir)
 
     # Both steps load from cache if one exists for these exact texts, otherwise they compute and write
     # it. So the first run is slow; later runs only pay the model load.
-    compile_cache = xpl.cache_path(sentences, compile_dir)
-    if compile_cache.exists():
-        logger.info("Contributions cache hit (%s) — loading %s", config.attribution, compile_cache)
+    explain_cache = xpl.cache_path(sentences, explain_dir)
+    if explain_cache.exists():
+        logger.info("Contributions cache hit (%s) — loading %s", config.attribution, explain_cache)
     else:
         logger.info(
             "Contributions cache miss (%s) — computing for %d texts (this is the slow part)",
             config.attribution,
             len(sentences),
         )
-    xpl.compile(sentences, y_true=y_true, cache_dir=compile_dir)
-    projected = xpl.compute_projection(reducer=build_reducer(), cache_dir=dataset_dir, recompute=config.recompute)
+    # Step 3 — the expensive call, and the only one that produces results. The returned artifact is
+    # immutable and holds no model, no backend and no explainer handle; ground truth rides on it
+    # (never on xpl), which is why a cache hit still gets *this* run's y_true attached.
+    explanation = xpl.explain(sentences, y=y_true, cache_dir=explain_dir)
 
-    if xpl.can_find_similar():
-        # Build (and cache) the reference activation bank now so the first in-app lookup is instant.
-        logger.info("Warming similar-examples bank over %d reference texts…", len(reference_corpus[0]))
-        xpl.find_similar(sentences[0], top_k=1)
+    # Step 4 — everything downstream reads the artifact as an argument.
+    projected = xpl.compute_projection(
+        explanation, reducer=build_reducer(), cache_dir=dataset_dir, recompute=config.recompute
+    )
+
+    # (No bank warm-up here: fit(precompute=True) above already embedded the reference corpus, under
+    # the same condition this used to test — can_find_similar() is "a retriever was built", which is
+    # exactly what fit's precompute branch keys on.)
 
     logger.info(
         "attribution=%s | counterfactual=%s | can_edit=%s | can_counterfactual=%s | can_find_similar=%s"
@@ -968,11 +1013,13 @@ def main() -> None:
         xpl.can_edit(),
         xpl.can_counterfactual(),
         xpl.can_find_similar(),
-        xpl.can_detect_label_noise(),
+        # Takes the artifact: label-noise detection needs ground truth + per-class probabilities, and
+        # both live on the explanation rather than on the explainer.
+        xpl.can_detect_label_noise(explanation),
         xpl.can_probe_labels(),
     )
     logger.info("Serving on http://%s:%d (Ctrl+C to stop)", config.host, config.port)
-    xpl.run_app(port=config.port, debug=False, host=config.host, scatter_xy=projected)
+    xpl.run_app(explanation, port=config.port, debug=False, host=config.host, scatter_xy=projected)
 
 
 if __name__ == "__main__":

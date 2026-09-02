@@ -1,9 +1,13 @@
 """``WebappComponent`` contract + capability resolution for what-if panels.
 
 A component declares the capabilities it needs via ``requires``; :func:`available_capabilities`
-computes what the bound view + engine actually provide, and :meth:`WebappComponent.is_available`
+computes what the bound explanation + engine actually provide, and :meth:`WebappComponent.is_available`
 gates mounting on ``requires <= available``. This is the mechanism that makes the What-if Lab
 appear only when the explainer holds a live (and, for counterfactuals, gradient-capable) model.
+
+Components read the immutable :class:`~shapash.explainer.nlp_explanation.NlpExplanation` directly and
+never write to it: every display choice lives in a Dash ``dcc.Store`` or a callback argument, so the
+artifact a component renders is the same one that was saved.
 """
 
 from __future__ import annotations
@@ -12,8 +16,8 @@ from abc import ABC, abstractmethod
 
 from shapash.compute.diagnostics.label_noise import has_usable_probabilities
 from shapash.explainer.interactive import InteractiveEngine
+from shapash.explainer.nlp_explanation import NlpExplanation
 from shapash.model.base import SupportsGradients, has_capabilities
-from shapash.webapp.nlp_view import NlpView
 
 # Capability tokens components may require.
 CAP_PREDICT = "engine:predict"
@@ -21,16 +25,17 @@ CAP_COUNTERFACTUAL = "engine:counterfactual"
 CAP_GRADIENTS = "model:gradients"
 CAP_SIMILAR = "engine:similar"
 CAP_LABELS = "data:labels"
+CAP_GROUND_TRUTH = "data:ground_truth"
 
 
-def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> frozenset[str]:
-    """Return the capability tokens the given view + engine satisfy.
+def available_capabilities(explanation: NlpExplanation, engine: InteractiveEngine | None) -> frozenset[str]:
+    """Return the capability tokens the given explanation + engine satisfy.
 
     Parameters
     ----------
-    view : NlpView
-        Read-only view, supplying the *data* capabilities — what the compiled batch contains,
-        independent of whether a live model is still attached.
+    explanation : NlpExplanation
+        The immutable artifact, supplying the *data* capabilities — what the compiled batch
+        contains, independent of whether a live model is still attached.
     engine : InteractiveEngine or None
         Live engine, or ``None`` for a snapshot (no live capabilities).
 
@@ -43,8 +48,10 @@ def available_capabilities(view: NlpView, engine: InteractiveEngine | None) -> f
     caps: set[str] = set()
     # Data capabilities are read from the compiled batch, so they survive a snapshot — they sit
     # outside the engine guard below on purpose.
-    if view.y_true is not None and has_usable_probabilities(view.y_prob):
-        caps.add(CAP_LABELS)
+    if explanation.y_true is not None:
+        caps.add(CAP_GROUND_TRUTH)
+        if has_usable_probabilities(explanation.y_prob):
+            caps.add(CAP_LABELS)
     if engine is not None:
         if engine.can_edit():
             caps.add(CAP_PREDICT)
@@ -74,12 +81,12 @@ class WebappComponent(ABC):
     requires: frozenset[str] = frozenset()
 
     @classmethod
-    def is_available(cls, view: NlpView, engine: InteractiveEngine | None) -> bool:
-        """Whether the component's ``requires`` are satisfied by the view + engine."""
-        return cls.requires <= available_capabilities(view, engine)
+    def is_available(cls, explanation: NlpExplanation, engine: InteractiveEngine | None) -> bool:
+        """Whether the component's ``requires`` are satisfied by the explanation + engine."""
+        return cls.requires <= available_capabilities(explanation, engine)
 
     @abstractmethod
-    def layout(self, view: NlpView, engine: InteractiveEngine | None = None):
+    def layout(self, explanation: NlpExplanation, engine: InteractiveEngine | None = None):
         """Return the Dash layout for this component.
 
         ``engine`` is provided for components whose initial UI depends on live capabilities — e.g. the
@@ -88,15 +95,15 @@ class WebappComponent(ABC):
         """
 
     @abstractmethod
-    def register_callbacks(self, app, view: NlpView, engine: InteractiveEngine, stores: dict) -> None:
+    def register_callbacks(self, app, explanation: NlpExplanation, engine: InteractiveEngine, stores: dict) -> None:
         """Register this component's Dash callbacks.
 
         Parameters
         ----------
         app : dash.Dash
             The Dash application.
-        view : NlpView
-            Read-only data accessor.
+        explanation : NlpExplanation
+            The immutable artifact to read (never written to).
         engine : InteractiveEngine
             Live engine for prediction / counterfactual generation.
         stores : dict

@@ -29,8 +29,16 @@ Sentence/Waterfall panels — the words that pushed the model away from the give
 counterfactual and similar-example panels, the sample is already compiled, so this costs no
 re-explanation.
 
-Gated by ``CAP_LABELS`` alone: the method needs no model, so the panel also works on a snapshot. The
-Corpus check column self-disables when no labelled reference corpus is bound.
+Gated by ``CAP_LABELS`` alone: the underlying method needs no model, so in principle this panel
+should also work on a loaded snapshot (no live engine). **Temporarily not the case**: since the
+``fit``/``explain`` split moved ``detect_label_noise`` onto the live ``NlpExplainer`` (it also
+attaches the optional label-probe corroboration, which is fit-time engine state), a snapshot loaded
+via ``NlpExplanation.load()`` has no engine to call it on. The Detect button therefore shows a
+message instead of running when ``engine`` is ``None`` — see :meth:`LabelNoiseComponent.register_callbacks`.
+Restoring snapshot support needs ``detect_label_noise``'s core computation split out as a pure
+function over the artifact (data-only), with the probe corroboration staying engine-only; deferred
+to a later retrofit.
+The Corpus check column self-disables when no labelled reference corpus is bound.
 """
 
 from __future__ import annotations
@@ -63,7 +71,7 @@ class LabelNoiseComponent(WebappComponent):
     # Data-only: no engine capability, so this also mounts on a snapshot explainer.
     requires = frozenset({CAP_LABELS})
 
-    def layout(self, view, engine=None) -> html.Div:
+    def layout(self, explanation, engine=None) -> html.Div:
         """Return the panel: detection controls over an initially empty results area."""
         can_probe = engine is not None and engine.can_probe_labels()
         caption = (
@@ -124,7 +132,7 @@ class LabelNoiseComponent(WebappComponent):
             style=_CARD_STYLE,
         )
 
-    def register_callbacks(self, app, view, engine, stores) -> None:
+    def register_callbacks(self, app, explanation, engine, stores) -> None:
         """Run detection on demand; wire each row's Inspect into the shared current datapoint."""
         current_store = stores["current"]
 
@@ -138,7 +146,15 @@ class LabelNoiseComponent(WebappComponent):
         def detect(n_clicks, top_n, score):
             if not n_clicks:
                 raise PreventUpdate
+            if engine is None:
+                # See the module docstring: detect_label_noise lives on the live engine for now,
+                # so a loaded snapshot (no engine) cannot run it yet.
+                return html.Div(
+                    "Label-noise detection needs a live explainer — unavailable on a loaded snapshot.",
+                    className="text-muted",
+                ), []
             report = engine.detect_label_noise(
+                explanation,
                 top_n=int(top_n) if top_n else _DEFAULT_TOP_N,
                 score=score or _DEFAULT_SCORE,
             )
@@ -168,17 +184,16 @@ class LabelNoiseComponent(WebappComponent):
             if not sample_indices or not (0 <= row < len(sample_indices)):
                 raise PreventUpdate
             pos = int(sample_indices[row])
-            contributions = view.contributions
-            texts = view.texts
-            if contributions is None or texts is None or not (0 <= pos < len(texts)):
+            texts = explanation.texts
+            if texts is None or not (0 <= pos < len(texts)):
                 raise PreventUpdate
-            base_values = contributions.base_values
-            y_pred = view.y_pred
+            base_values = explanation.base_values
+            y_pred = explanation.y_pred
             return pack_datapoint(
                 text=str(texts.iloc[pos]),
                 orig_idx=pos,
-                tokens=contributions.token_strings[pos],
-                values=contributions.values[pos],
+                tokens=explanation.token_strings[pos],
+                values=explanation.values[pos],
                 base_values=(base_values[pos] if base_values is not None else None),
                 label=(str(y_pred.iloc[pos]) if y_pred is not None else None),
             )

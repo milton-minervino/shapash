@@ -22,6 +22,7 @@ from shapash.backend.nlp_backend import NlpContributions
 from shapash.compute.diagnostics.label_noise import LabelNoiseReport
 from shapash.compute.generators.base import Counterfactual, Field
 from shapash.compute.retrieval.similar_examples import Neighbor
+from shapash.explainer.nlp_explanation import NlpExplanation
 
 
 @runtime_checkable
@@ -79,8 +80,16 @@ class InteractiveEngine(Protocol):
         """Return the ``top_k`` reference examples most similar to ``text``, most-similar first."""
         ...
 
-    def can_detect_label_noise(self) -> bool:
-        """Whether the compiled batch carries the ground truth + per-class probabilities this needs."""
+    def find_similar_threshold(self, text: str, threshold: float = 0.95, limit: int = 50) -> tuple[list[Neighbor], int]:
+        """Return reference examples scoring above ``threshold`` (not a fixed count), capped at ``limit``.
+
+        Returns ``(neighbors, total)`` where ``total`` is the count that cleared ``threshold`` before
+        capping to ``limit``.
+        """
+        ...
+
+    def can_detect_label_noise(self, explanation: NlpExplanation) -> bool:
+        """Whether ``explanation`` carries the ground truth + per-class probabilities this needs."""
         ...
 
     def can_probe_labels(self) -> bool:
@@ -88,7 +97,7 @@ class InteractiveEngine(Protocol):
         ...
 
     def detect_label_noise(
-        self, top_n: int = 50, score: str = "self_confidence", probe: bool = True
+        self, explanation: NlpExplanation, top_n: int = 50, score: str = "self_confidence", probe: bool = True
     ) -> LabelNoiseReport:
-        """Rank probably-mislabelled samples in the compiled batch by confident learning."""
+        """Rank probably-mislabelled samples in ``explanation`` by confident learning."""
         ...

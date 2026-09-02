@@ -1,8 +1,8 @@
 """NLP SHAP backend — token-level SHAP contributions for text classification models.
 
 ``NlpShapBackend`` wraps ``shap.Explainer`` for text inputs and implements
-``run_explainer``.  All shared infrastructure (``NlpContributions`` dataclass,
-``get_local_contributions``, common ``__init__`` skeleton) lives in
+``run_explainer``, returning an ``NlpContributions``.  All shared infrastructure
+(``get_local_contributions``, common ``__init__`` skeleton) lives in
 ``NlpBackend`` (see ``nlp_backend.py``).
 
 ``shap.maskers.Text.token_segments`` emits *segments* of the source string rather than the
@@ -28,7 +28,7 @@ import unicodedata
 import numpy as np
 import shap
 
-from shapash.backend.nlp_backend import NlpBackend, NlpRawExplanation
+from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 
 # SHAP's masker reports special tokens as blank segments on its offset-mapping path; their
 # attribution is folded into the baseline during word aggregation.
@@ -176,20 +176,41 @@ class NlpShapBackend(NlpBackend):
         explainer class (the ``"explainer"`` key selects the class; all other
         keys are forwarded as its constructor arguments).
     explainer_compute_args : dict, optional
-        Keyword arguments forwarded to the explainer call (``__call__``).
+        Keyword arguments forwarded to the explainer call (``__call__``). Two matter for text:
+
+        ``max_evals`` (SHAP default 500) is the accuracy knob, and that default is far from
+        converged: any imdb review over ~40 words exhausts it and lands 8-45% (max|Δ| / max|value|)
+        from the fully-traversed explanation, which costs 3k-23k evals.
+
+        ``batch_size`` (default: the ``Text`` masker's 5) caps how many masked variants reach
+        ``model`` per call, and is *not* free. The Owen loop drains a whole batch from its
+        best-first queue before pushing any children, so a larger batch expands different nodes
+        under the same ``max_evals`` and deterministically shifts the values, within the error band
+        above. Worth ~1.6x on short texts; 0.98x and 2.2x peak memory on imdb-length ones, where a
+        512-token forward pass already saturates the GPU.
     batch_size : int or None, optional
         Batch size applied to ``model`` when it is a ``transformers`` pipeline that does not
-        already have one. Default 64. Pass ``None`` to leave the pipeline untouched.
+        already have one. Default 64. Pass ``None`` to leave the pipeline untouched. Distinct from
+        the explainer's ``batch_size`` above: this one only regroups the strings SHAP has already
+        chosen, so it never changes the explanation.
 
         A pipeline built without ``batch_size`` scores a list of strings *one at a time*, so an
         explanation degenerates into ``max_evals`` (default 500) sequential single-sample forward
         passes. Batching lets them pad into one pass — ~1.9x on distilbert-imdb/GPU — for a
         numerically identical explanation (max|Δ| 1.1e-07), since the explainer's tree traversal
-        is untouched. Raise it alongside the explainer's own ``batch_size``, which caps how many
-        masked variants arrive per call.
+        is untouched.
     """
 
     name = "nlp_shap"
+    # No reference is learned from data: the ``Text`` masker infers its own masking
+    # scheme from the pipeline/tokenizer (``masker=None`` below), so ``fit`` has
+    # nothing backend-specific to learn here.
+    reference_kind = "none"
+    # Shapley values satisfy the efficiency axiom by construction, and stay additive
+    # even under the Partition/Owen path SHAP silently takes for text (see A8 in
+    # docs/architecture/refactoring-plan.md: Owen values satisfy efficiency too).
+    is_additive = True
+    requires_model_capabilities = ()  # a plain scoring callable is enough
 
     def __init__(
         self,
@@ -207,6 +228,12 @@ class NlpShapBackend(NlpBackend):
         # ``_batch_size`` is what ``transformers.Pipeline.__call__`` reads (``None`` means 1) and
         # there is no public setter, so a release that renames it makes this a silent no-op rather
         # than an error. A pipeline the caller already configured is never overridden.
+        #
+        # transformers logs "using the pipelines sequentially on GPU ... please use a dataset" during
+        # every GPU explanation. It is a false positive: the check is only ``call_count > 10 and
+        # device == cuda`` and never inspects the input. We already pass lists, which transformers
+        # wraps in a ``PipelineDataset`` and feeds to the same ``DataLoader`` a real Dataset would
+        # get (measured: 1.009x, i.e. noise), and SHAP would flatten any dataset back to a list anyway.
         if batch_size is not None and getattr(model, "_batch_size", "absent") in (None, 1):
             model._batch_size = batch_size
 
@@ -225,7 +252,7 @@ class NlpShapBackend(NlpBackend):
         # when no tokenizer is reachable (bare callable / ``SimpleTokenizer``) — see ``_is_special``.
         self._special_tokens = _masker_special_tokens(self.explainer)
 
-    def run_explainer(self, x) -> NlpRawExplanation:
+    def run_explainer(self, x) -> NlpContributions:
         """Run the SHAP text explainer and return all explanation components.
 
         Subword tokens are merged into whole words via ``_aggregate_subwords`` before being
@@ -239,7 +266,7 @@ class NlpShapBackend(NlpBackend):
 
         Returns
         -------
-        NlpRawExplanation
+        NlpContributions
             Ragged list of value arrays, baseline predictions, and token
             strings per sample.
         """
@@ -261,8 +288,8 @@ class NlpShapBackend(NlpBackend):
             contributions.append(word_contribs)
             base_values.append(word_base)
 
-        return NlpRawExplanation(
-            contributions=contributions,
+        return NlpContributions(
+            token_strings=data,
+            values=contributions,
             base_values=np.stack(base_values, axis=0),
-            data=data,
         )

@@ -29,8 +29,8 @@ from collections.abc import Iterable
 import numpy as np
 
 from shapash._optional import import_optional_module
-from shapash.backend.nlp_backend import NlpBackend, NlpRawExplanation
-from shapash.model.base import SupportsCaptumIG, has_capabilities
+from shapash.backend.nlp_backend import NlpBackend, NlpContributions
+from shapash.model.base import SupportsCaptumIG
 
 _NLP_EXTRA = 'Install the NLP extra: pip install "shapash[nlp]".'
 
@@ -205,6 +205,15 @@ class NlpCaptumLigBackend(NlpBackend):
     """
 
     name = "nlp_captum_lig"
+    # A constructed point from the tokenizer (model.reference_ids() -> pad/mask ids),
+    # not learned from data — see A9 in docs/architecture/refactoring-plan.md.
+    reference_kind = "point"
+    # Integrated Gradients satisfies the completeness axiom (Sundararajan, Taly & Yan,
+    # 2017, "Axiomatic Attribution for Deep Networks"): attributions sum exactly to
+    # logits(x) - logits(baseline).
+    is_additive = True
+    # Checked once by NlpBackend.__init__ instead of here — see its docstring.
+    requires_model_capabilities = (SupportsCaptumIG,)
 
     def __init__(
         self,
@@ -215,17 +224,12 @@ class NlpCaptumLigBackend(NlpBackend):
         explainer_compute_args: dict | None = None,
         show_progress: bool = False,
     ) -> None:
-        if not has_capabilities(model, SupportsCaptumIG):
-            raise TypeError(
-                "NlpCaptumLigBackend requires a model implementing SupportsCaptumIG "
-                "(e.g. HFClassifierModel); got a model without the Captum attribution surface."
-            )
         super().__init__(model, preprocessing, label_names, explainer_args, explainer_compute_args)
         self.show_progress = show_progress
         captum_attr = import_optional_module("captum.attr", extra=_NLP_EXTRA)
         self.explainer = captum_attr.LayerIntegratedGradients(model.logits, model.embedding_layer)
 
-    def run_explainer(self, x) -> NlpRawExplanation:
+    def run_explainer(self, x) -> NlpContributions:
         """Attribute each text with LIG, one pass per class, and return per-token contributions.
 
         Parameters
@@ -235,7 +239,7 @@ class NlpCaptumLigBackend(NlpBackend):
 
         Returns
         -------
-        NlpRawExplanation
+        NlpContributions
             Ragged list of ``(n_tokens_i, n_classes)`` value arrays, per-sample baseline logits, and
             token strings per sample.
         """
@@ -281,10 +285,10 @@ class NlpCaptumLigBackend(NlpBackend):
             base_values.append(base_logits)
             data.append(word_tokens)
 
-        return NlpRawExplanation(
-            contributions=contributions,
+        return NlpContributions(
+            token_strings=data,
+            values=contributions,
             base_values=np.stack(base_values, axis=0),
-            data=data,
         )
 
     def _progress_iter(self, items: list[str]) -> Iterable[str]:

@@ -24,9 +24,9 @@ class SentenceHighlightComponent(WebappComponent):
     def __init__(self, default_class_idx: int = 0) -> None:
         self._default_class_idx = default_class_idx
 
-    def layout(self, view, engine=None) -> html.Div:
+    def layout(self, explanation, engine=None) -> html.Div:
         """Return the class picker + sentence-highlight placeholder div."""
-        label_names = view.label_names or [str(i) for i in range(view.n_classes)]
+        label_names = explanation.label_names or [str(i) for i in range(explanation.n_classes)]
         class_options: list[dcc.Dropdown.Options] = [{"label": name, "value": i} for i, name in enumerate(label_names)]
         return html.Div(
             [
@@ -60,7 +60,7 @@ class SentenceHighlightComponent(WebappComponent):
             style={"height": "100%"},
         )
 
-    def register_callbacks(self, app, view, engine, stores) -> None:
+    def register_callbacks(self, app, explanation, engine, stores) -> None:
         """Wire the predicted-class sync and the sentence-highlight render."""
         current_store = stores["current"]
 
@@ -74,7 +74,7 @@ class SentenceHighlightComponent(WebappComponent):
         def sync_local_class_to_prediction(datapoint):
             if not datapoint or datapoint.get("label") is None:
                 raise PreventUpdate
-            label_idx = view.label_to_idx.get(str(datapoint["label"]))
+            label_idx = explanation.label_to_idx.get(str(datapoint["label"]))
             if label_idx is None:
                 raise PreventUpdate
             return label_idx

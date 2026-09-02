@@ -2,9 +2,9 @@
 
 Prototype bridge toward Phase 5b (composable WebappComponents). Panels are being extracted into
 ``WebappComponent``s one at a time (see ``shapash/webapp/nlp_components/``); global word importance,
-the dataset table, scatter, and error analysis are still built inline here pending their own
-extraction. All tabular-only SmartApp panels (violin, cluster, scatter prediction picking) beyond
-what NLP needs are absent rather than disabled.
+the dataset table, and scatter are still built inline here pending their own extraction. All
+tabular-only SmartApp panels (violin, cluster, scatter prediction picking) beyond what NLP needs are
+absent rather than disabled.
 """
 
 from __future__ import annotations
@@ -21,18 +21,19 @@ from dash import Input, Output, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
 
 from shapash.backend.nlp_backend import is_punctuation
-from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
+from shapash.explainer.interactive import InteractiveEngine
+from shapash.explainer.nlp_explanation import NlpExplanation, select_label_column
 from shapash.plots.plot_word_importance import plot_word_importance
 from shapash.webapp.nlp_components import (
     CounterfactualComponent,
     DataEditorComponent,
+    ErrorAnalysisComponent,
     LabelNoiseComponent,
     SentenceHighlightComponent,
     SimilarExamplesComponent,
     WaterfallComponent,
     pack_datapoint,
 )
-from shapash.webapp.nlp_view import NlpView
 
 _APPLY_STORE = "whatif-apply-store"
 _CURRENT_STORE = "current-datapoint"
@@ -77,37 +78,6 @@ def _compose_selection(
     return combined
 
 
-def _cell_from_click(click_data: dict | None, name_to_idx: dict[str, int]) -> tuple[int, int] | None:
-    """Resolve a confusion-matrix cell click to ``(pred_idx, true_idx)``.
-
-    Heatmap ``clickData`` does not reliably include ``customdata`` the way scatter traces do, so
-    prefer it when present but fall back to mapping the predicted (``x``) and true (``y``) axis label
-    names back to their class indices. Returns ``None`` for an empty or unrecognised click.
-    """
-    if not click_data or not click_data.get("points"):
-        return None
-    point = click_data["points"][0]
-    custom = point.get("customdata")
-    if custom is not None and len(custom) == 2:
-        return int(custom[0]), int(custom[1])
-    if point.get("x") in name_to_idx and point.get("y") in name_to_idx:
-        return name_to_idx[point["x"]], name_to_idx[point["y"]]
-    return None
-
-
-def _empty_word_fig(message: str) -> go.Figure:
-    """Placeholder figure with a centred hint, for the per-cell word charts before a cell is picked."""
-    fig = go.Figure()
-    fig.add_annotation(text=message, showarrow=False, font=dict(color="#888888"), xref="paper", yref="paper")
-    fig.update_layout(
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        plot_bgcolor="white",
-        margin=dict(l=20, r=20, t=20, b=20),
-    )
-    return fig
-
-
 class NlpWebApp:
     """Minimal Dash webapp driven by an ``NlpExplainer``.
 
@@ -134,8 +104,15 @@ class NlpWebApp:
 
     Parameters
     ----------
-    explainer : NlpExplainer
-        A compiled ``NlpExplainer`` instance (``compile()`` must have been called).
+    explanation : NlpExplanation
+        The result of ``NlpExplainer.explain()`` (or a loaded one — see
+        ``NlpExplanation.load()``) to serve.
+    engine : InteractiveEngine, optional
+        Live engine for what-if actions (re-predicting edited text, generating
+        counterfactuals, similar-example retrieval, label-noise probing) — normally the
+        ``NlpExplainer`` that produced ``explanation``. ``None`` for a snapshot loaded via
+        ``NlpExplanation.load()``, which carries no model: components self-disable via
+        their ``requires`` when the engine is absent or lacks a capability.
     scatter_xy : np.ndarray, optional
         Pre-computed 2-D projection, shape ``(n_samples, 2)``.  When provided,
         a scatter panel is added to the layout.  Compute with PaCMAP, UMAP,
@@ -143,22 +120,27 @@ class NlpWebApp:
         the projection itself to avoid heavy optional dependencies.
     """
 
-    def __init__(self, explainer, scatter_xy: np.ndarray | None = None) -> None:
-        if explainer.contributions is None:
-            raise RuntimeError("NlpExplainer.compile() must be called before launching the webapp.")
+    def __init__(
+        self,
+        explanation: NlpExplanation,
+        engine: InteractiveEngine | None = None,
+        scatter_xy: np.ndarray | None = None,
+    ) -> None:
         if scatter_xy is not None:
             scatter_xy = np.asarray(scatter_xy)
-            n = len(explainer.texts)
+            n = len(explanation.texts)
             if scatter_xy.shape != (n, 2):
                 raise ValueError(f"scatter_xy must have shape ({n}, 2), got {scatter_xy.shape}")
         self._scatter_xy: np.ndarray | None = scatter_xy
 
-        # What-if Lab: read-only view + live engine (the explainer itself when it is live).
-        # Components self-disable via their `requires` when the engine lacks a capability
-        # (e.g. an explainer restored from a snapshot holds no model). `self._components` itself is
-        # assembled later in `_build_layout` (it needs `_full_table_records`, not ready yet here).
-        self._view = NlpView(explainer)
-        self._engine = explainer
+        # What-if Lab: the immutable artifact + a separate, possibly-absent live engine. The
+        # artifact is only ever read here — display state lives in the `dcc.Store`s declared in
+        # `_build_layout`, never on the explanation.
+        # Components self-disable via their `requires` when the engine is None or lacks a capability
+        # (e.g. a loaded snapshot has no model at all). `self._components` itself is assembled later
+        # in `_build_layout` (it needs `_full_table_records`, not ready yet here).
+        self._explanation = explanation
+        self._engine = engine
 
         self.app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
         self.app.title = "Shapash — NLP Explainer"
@@ -190,28 +172,28 @@ class NlpWebApp:
     # ------------------------------------------------------------------
 
     def _build_layout(self) -> None:
-        contrib = self._view.contributions
-        label_names = contrib.label_names or [str(i) for i in range(self._view.n_classes)]
+        explanation = self._explanation
+        label_names = explanation.label_names or [str(i) for i in range(self._explanation.n_classes)]
         # Predicted-label name → class index, shared by the confusion matrix and (via
-        # NlpView.label_to_idx) by SentenceHighlightComponent's predicted-class sync callback.
-        self._label_to_idx = self._view.label_to_idx
-        n = self._view.n_samples
+        # NlpExplanation.label_to_idx) by SentenceHighlightComponent's predicted-class sync callback.
+        self._label_to_idx = self._explanation.label_to_idx
+        n = self._explanation.n_samples
 
         # ── Table records — always include _orig_idx for scatter filtering ──
-        texts = self._view.texts
+        texts = self._explanation.texts
         assert texts is not None  # noqa: S101 - the webapp requires an already-compiled explainer
         records: dict[str, list] = {
             "_orig_idx": list(range(n)),
             "text": texts.tolist(),
-            "prediction": (self._view.y_pred.tolist() if self._view.y_pred is not None else [""] * n),
+            "prediction": (self._explanation.y_pred.tolist() if self._explanation.y_pred is not None else [""] * n),
         }
-        if self._view.y_true is not None:
-            records["ground_truth"] = self._view.y_true.tolist()
+        if self._explanation.y_true is not None:
+            records["ground_truth"] = self._explanation.y_true.tolist()
 
         # Single "Probability" column — confidence of the predicted class.
         # max(axis=1) works for both binary and multiclass since the predicted
         # label is always the argmax, regardless of how columns are named.
-        y_prob: pd.DataFrame | None = self._view.y_prob
+        y_prob: pd.DataFrame | None = self._explanation.y_prob
         if y_prob is not None:
             records["probability"] = y_prob.max(axis=1).tolist()
 
@@ -247,11 +229,11 @@ class NlpWebApp:
         # entry here always matches a bar in the chart. On an uncased model that folds
         # AWFUL/Awful/awful into one entry; on a cased model it leaves all three, because there
         # they are genuinely different inputs.
-        _fold_words = contrib.resolve_lowercase()
+        _fold_words = explanation.resolve_lowercase()
         all_words = sorted(
             {
                 tok.strip().lower() if _fold_words else tok.strip()
-                for sample_tokens in contrib.token_strings
+                for sample_tokens in explanation.token_strings
                 for tok in sample_tokens
                 if tok.strip() and not _SPECIAL_RE.match(tok.strip()) and not is_punctuation(tok)
             }
@@ -262,7 +244,7 @@ class NlpWebApp:
         scatter_col_content = None
         if self._scatter_xy is not None:
             color_options: list[dcc.Dropdown.Options] = [{"label": "Prediction", "value": "prediction"}]
-            if self._view.y_true is not None:
+            if self._explanation.y_true is not None:
                 color_options.append({"label": "Ground Truth", "value": "ground_truth"})
             color_options.append({"label": "Word contribution", "value": "word_contribution"})
 
@@ -320,111 +302,6 @@ class NlpWebApp:
                 ],
                 # Flex column so the graph above can stretch to the panel height.
                 style={"display": "flex", "flexDirection": "column", "height": "100%"},
-            )
-
-        # ── Error Analysis panel (confusion matrix + per-cell word importance) ──
-        # Only meaningful with ground truth. The matrix is a global selection driver like the
-        # scatter: clicking a cell writes ``error-cell`` (see callbacks), which composes with any
-        # scatter selection to filter the table and the main Word Importance tab, and drives the two
-        # per-cell word charts below (words toward the predicted vs. the true class).
-        error_analysis_body = None
-        if has_gt:
-            normalize_options: list[dcc.RadioItems.Options] = [
-                {"label": " Counts", "value": "count"},
-                {"label": " Recall", "value": "recall"},
-            ]
-            idx_of = self._label_to_idx
-            y_true, y_pred = self._view.y_true, self._view.y_pred
-            # has_gt confirms y_true was compiled; y_pred always accompanies it.
-            assert y_true is not None and y_pred is not None  # noqa: S101
-            true_arr = np.array([idx_of.get(str(v), -1) for v in y_true.tolist()])
-            pred_arr = np.array([idx_of.get(str(v), -1) for v in y_pred.tolist()])
-            k = len(label_names)
-            cm = np.zeros((k, k), dtype=int)
-            for t, p in zip(true_arr, pred_arr, strict=True):
-                if t >= 0 and p >= 0:
-                    cm[t, p] += 1
-            self._cm = cm
-            self._cm_true_idx = true_arr
-            self._cm_pred_idx = pred_arr
-
-            error_analysis_body = html.Div(
-                [
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                html.H6(
-                                    "Confusion Matrix — click a cell to inspect that error group",
-                                    className="fw-bold mb-0",
-                                ),
-                                width="auto",
-                                className="align-self-center",
-                            ),
-                            dbc.Col(
-                                dcc.RadioItems(
-                                    id="cm-normalize",
-                                    options=normalize_options,
-                                    value="count",
-                                    inline=True,
-                                    inputStyle={"marginRight": "4px"},
-                                    labelStyle={"marginRight": "12px"},
-                                ),
-                                width="auto",
-                                className="align-self-center",
-                            ),
-                            dbc.Col(
-                                dbc.Button(
-                                    "× clear cell",
-                                    id="error-cell-clear-btn",
-                                    n_clicks=0,
-                                    color="link",
-                                    size="sm",
-                                    className="text-muted p-0",
-                                    style={"fontSize": "0.8em"},
-                                ),
-                                width="auto",
-                                className="align-self-center ms-auto",
-                            ),
-                        ],
-                        className="align-items-center mb-2",
-                        style={"flex": "0 0 auto"},
-                    ),
-                    dcc.Graph(
-                        id="confusion-matrix-graph",
-                        figure=plot_confusion_matrix(cm, label_names, title="", width=None, height=None),
-                        config={"displayModeBar": False, "responsive": True},
-                        style={"height": "360px", "flex": "0 0 auto"},
-                    ),
-                    html.Small(
-                        id="error-cell-caption",
-                        children="Click a cell to see the words behind those errors.",
-                        className="text-muted d-block my-2",
-                        style={"flex": "0 0 auto"},
-                    ),
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                dcc.Graph(
-                                    id="error-pred-importance",
-                                    config={"displayModeBar": False, "responsive": True},
-                                    style={"height": "320px"},
-                                ),
-                                width=6,
-                            ),
-                            dbc.Col(
-                                dcc.Graph(
-                                    id="error-true-importance",
-                                    config={"displayModeBar": False, "responsive": True},
-                                    style={"height": "320px"},
-                                ),
-                                width=6,
-                            ),
-                        ],
-                        className="g-2",
-                        style={"flex": "0 0 auto"},
-                    ),
-                ],
-                style={"height": "100%", "display": "flex", "flexDirection": "column", "overflowY": "auto"},
             )
 
         # ── Global Word Importance panel — controls live inside it ──
@@ -583,6 +460,18 @@ class NlpWebApp:
                     style={"display": "none", "fontSize": "0.8em"},
                 )
             )
+        if has_gt:
+            selection_children.append(
+                dbc.Button(
+                    "× clear cell",
+                    id="error-cell-clear-btn",
+                    n_clicks=0,
+                    color="link",
+                    size="sm",
+                    className="text-muted p-0 me-3",
+                    style={"display": "none", "fontSize": "0.8em"},
+                )
+            )
         selection_children.append(
             dbc.Button(
                 "× clear word filter",
@@ -636,8 +525,9 @@ class NlpWebApp:
                 CounterfactualComponent(),
                 SimilarExamplesComponent(),
                 LabelNoiseComponent(),
+                ErrorAnalysisComponent(),
             )
-            if type(comp).is_available(self._view, self._engine)
+            if type(comp).is_available(self._explanation, self._engine)
         ]
         highlight_comp = next(c for c in self._components if isinstance(c, SentenceHighlightComponent))
         waterfall_comp = next(c for c in self._components if isinstance(c, WaterfallComponent))
@@ -645,30 +535,37 @@ class NlpWebApp:
         cf_comp = next((c for c in self._components if isinstance(c, CounterfactualComponent)), None)
         similar_comp = next((c for c in self._components if isinstance(c, SimilarExamplesComponent)), None)
         noise_comp = next((c for c in self._components if isinstance(c, LabelNoiseComponent)), None)
+        error_analysis_comp = next((c for c in self._components if isinstance(c, ErrorAnalysisComponent)), None)
 
         left_tabs: list = [("table", "Dataset", text_samples_body)]
         if scatter_col_content is not None:
             left_tabs.append(("scatter", "Embeddings", scatter_col_content))
         if editor_comp is not None:
-            left_tabs.append(("editor", "Data Editor", editor_comp.layout(self._view, self._engine)))
+            left_tabs.append(("editor", "Data Editor", editor_comp.layout(self._explanation, self._engine)))
 
         # Error Analysis sits beside Word Importance: it *is* an aggregated word-importance view
         # (per confusion-matrix cell), so it belongs with the other global "why" panels on the right.
         upper_right_tabs: list = [("importance", "Word Importance", word_importance_panel)]
-        if error_analysis_body is not None:
-            upper_right_tabs.append(("errors", "Error Analysis", error_analysis_body))
+        if error_analysis_comp is not None:
+            upper_right_tabs.append(
+                ("errors", "Error Analysis", error_analysis_comp.layout(self._explanation, self._engine))
+            )
         # Next to Error Analysis by design: same ground-truth prerequisite, and it answers the
         # question that panel leaves open — whether the *label*, not the model, is what is wrong.
         if noise_comp is not None:
-            upper_right_tabs.append(("label-noise", "Label Noise", noise_comp.layout(self._view, self._engine)))
+            upper_right_tabs.append(("label-noise", "Label Noise", noise_comp.layout(self._explanation, self._engine)))
         if cf_comp is not None:
-            upper_right_tabs.append(("counterfactual", "Counterfactuals", cf_comp.layout(self._view, self._engine)))
+            upper_right_tabs.append(
+                ("counterfactual", "Counterfactuals", cf_comp.layout(self._explanation, self._engine))
+            )
         if similar_comp is not None:
-            upper_right_tabs.append(("similar", "Similar Examples", similar_comp.layout(self._view, self._engine)))
+            upper_right_tabs.append(
+                ("similar", "Similar Examples", similar_comp.layout(self._explanation, self._engine))
+            )
 
         lower_right_tabs: list = [
-            ("highlight", "Sentence", highlight_comp.layout(self._view, self._engine)),
-            ("waterfall", "Waterfall", waterfall_comp.layout(self._view, self._engine)),
+            ("highlight", "Sentence", highlight_comp.layout(self._explanation, self._engine)),
+            ("waterfall", "Waterfall", waterfall_comp.layout(self._explanation, self._engine)),
         ]
 
         left_column = html.Div(
@@ -774,7 +671,7 @@ class NlpWebApp:
     # ------------------------------------------------------------------
 
     def _register_callbacks(self) -> None:
-        contrib = self._view.contributions
+        explanation = self._explanation
         full_records = self._full_table_records
         has_gt = self._has_gt
 
@@ -818,7 +715,7 @@ class NlpWebApp:
             if label_idx is None:
                 raise PreventUpdate
             effective_indices = _compose_indices(selected_indices, error_cell, bool(errors_only))
-            word_imp = contrib.word_importance(
+            word_imp = explanation.word_importance(
                 label_idx=int(label_idx),
                 n_top=int(topk or 20),
                 filter_sign=sign_filter or "all",
@@ -851,13 +748,13 @@ class NlpWebApp:
             if not selected_rows:
                 raise PreventUpdate
             pos = int(selected_rows[0]["_orig_idx"])
-            base_values = contrib.base_values
+            base_values = explanation.base_values
             base = base_values[pos] if base_values is not None else None
             return pack_datapoint(
                 text=selected_rows[0].get("text", ""),
                 orig_idx=pos,
-                tokens=contrib.token_strings[pos],
-                values=contrib.values[pos],
+                tokens=explanation.token_strings[pos],
+                values=explanation.values[pos],
                 base_values=base,
                 label=selected_rows[0].get("prediction"),
             )
@@ -936,7 +833,7 @@ class NlpWebApp:
             total = len(full_records)
             parts = []
             if error_cell:
-                names = contrib.label_names or []
+                names = explanation.label_names or []
                 pred_name = names[error_cell["pred"]] if error_cell["pred"] < len(names) else str(error_cell["pred"])
                 true_name = names[error_cell["true"]] if error_cell["true"] < len(names) else str(error_cell["true"])
                 parts.append(f"predicted {pred_name} · true {true_name}")
@@ -1047,84 +944,6 @@ class NlpWebApp:
                 hidden = {"display": "none", "fontSize": "0.8em"}
                 return visible if selected_indices else hidden
 
-        # ── Error Analysis callbacks (registered only with ground truth) ──
-        if has_gt:
-            names = contrib.label_names or [str(i) for i in range(self._cm.shape[0])]
-            name_to_idx = {name: i for i, name in enumerate(names)}
-            cm = self._cm
-            pred_idx_arr = self._cm_pred_idx
-            true_idx_arr = self._cm_true_idx
-
-            @self.app.callback(
-                Output("confusion-matrix-graph", "figure"),
-                Input("cm-normalize", "value"),
-            )
-            def update_confusion_matrix(normalize):
-                fig = plot_confusion_matrix(
-                    cm,
-                    names,
-                    normalize="true" if normalize == "recall" else None,
-                    title="",  # the tab header already labels this panel
-                )
-                # Let the container height drive size (this panel is only half-column tall).
-                fig.layout.width = None
-                fig.layout.height = None
-                return fig
-
-            # Cell click / clear → the shared error-cell selection. A single owner (dispatching on the
-            # trigger) keeps this the only writer, so no allow_duplicate coordination is needed.
-            @self.app.callback(
-                Output("error-cell", "data"),
-                Output("confusion-matrix-graph", "clickData"),
-                Input("confusion-matrix-graph", "clickData"),
-                Input("error-cell-clear-btn", "n_clicks"),
-                prevent_initial_call=True,
-            )
-            def set_error_cell(click_data, _clear_clicks):
-                trigger = callback_context.triggered[0]["prop_id"] if callback_context.triggered else ""
-                if "error-cell-clear-btn" in trigger:
-                    return None, None
-                cell = _cell_from_click(click_data, name_to_idx)
-                if cell is None:
-                    raise PreventUpdate
-                pred_i, true_i = cell
-                indices = np.where((pred_idx_arr == pred_i) & (true_idx_arr == true_i))[0].tolist()
-                # Reset clickData so re-clicking the *same* cell registers as a change and re-fires.
-                return {"pred": pred_i, "true": true_i, "indices": indices}, None
-
-            # Per-cell word importance: words driving the (wrong) predicted class vs. the true class.
-            @self.app.callback(
-                Output("error-pred-importance", "figure"),
-                Output("error-true-importance", "figure"),
-                Output("error-cell-caption", "children"),
-                Input("error-cell", "data"),
-            )
-            def update_error_word_charts(error_cell):
-                if not error_cell:
-                    empty = _empty_word_fig("Click a confusion-matrix cell to see the words behind those errors.")
-                    return empty, empty, "Click a cell to see the words behind those errors."
-                pred_i, true_i, indices = error_cell["pred"], error_cell["true"], error_cell["indices"]
-                pred_name, true_name = names[pred_i], names[true_i]
-                if not indices:
-                    empty = _empty_word_fig("No samples for this (predicted, true) pair.")
-                    return empty, empty, f"predicted {pred_name} · true {true_name}: 0 samples"
-                wi_pred = contrib.word_importance(label_idx=pred_i, n_top=15, sample_indices=indices)
-                wi_true = contrib.word_importance(label_idx=true_i, n_top=15, sample_indices=indices)
-                fig_pred = plot_word_importance(
-                    wi_pred, title=f"Words toward predicted: {pred_name}", width=None, height=None
-                )
-                fig_true = plot_word_importance(
-                    wi_true, title=f"Words toward true: {true_name}", width=None, height=None
-                )
-                fig_pred.layout.height = None
-                fig_true.layout.height = None
-                caption = f"predicted {pred_name} · true {true_name}: {len(indices)} sample(s)"
-                if pred_i == true_i:
-                    caption += " — correct predictions (diagonal)"
-                elif len(indices) < 5:
-                    caption += " — few samples; interpret with caution"
-                return fig_pred, fig_true, caption
-
         # ── Tab visibility: toggle display of always-mounted bodies ──────
         # Bodies stay in the DOM (see _tabbed_card); only their `display` flips so the
         # cross-panel callbacks above keep firing for panels on inactive tabs.
@@ -1140,9 +959,14 @@ class NlpWebApp:
         # (The selection-summary readout is written by filter_table, which knows the row count.)
 
         # ── Registered components (always-on core panels + capability-gated What-if Lab) ──
-        stores = {"apply": _APPLY_STORE, "current": _CURRENT_STORE}
+        stores = {
+            "apply": _APPLY_STORE,
+            "current": _CURRENT_STORE,
+            "error_cell": "error-cell",
+            "error_cell_clear": "error-cell-clear-btn",
+        }
         for comp in self._components:
-            comp.register_callbacks(self.app, self._view, self._engine, stores)
+            comp.register_callbacks(self.app, self._explanation, self._engine, stores)
 
     # ------------------------------------------------------------------
     # Public
@@ -1158,15 +982,13 @@ class NlpWebApp:
 
     def _word_contributions(self, word: str, label_idx: int) -> np.ndarray:
         """Per-sample sum of SHAP contributions for all tokens matching *word*."""
-        contrib = self._view.contributions
-        n = self._view.n_samples
+        explanation = self._explanation
+        n = self._explanation.n_samples
         result = np.zeros(n)
         word_lower = word.lower()
         for i in range(n):
-            tokens = contrib.token_strings[i]
-            vals = contrib.values[i]
-            if vals.ndim == 2:
-                vals = vals[:, label_idx]
+            tokens = explanation.token_strings[i]
+            vals = select_label_column(explanation.values[i], label_idx)
             for j, tok in enumerate(tokens):
                 if tok.strip().lower() == word_lower:
                     result[i] += vals[j]
@@ -1178,8 +1000,8 @@ class NlpWebApp:
         ``None`` when either is unavailable. Matches the string comparison used by the
         "Model Errors" table filter so both stay consistent.
         """
-        y_true = self._view.y_true
-        y_pred = self._view.y_pred
+        y_true = self._explanation.y_true
+        y_pred = self._explanation.y_pred
         if y_true is None or y_pred is None:
             return None
         return np.asarray(y_true).astype(str) != np.asarray(y_pred).astype(str)
@@ -1220,11 +1042,11 @@ class NlpWebApp:
         set, misclassified points are emphasized (larger, opaque) and the rest are
         shadowed (small, faint) without altering their color.
         """
-        n = self._view.n_samples
-        contrib = self._view.contributions
-        view_texts = self._view.texts
-        assert view_texts is not None  # noqa: S101 - the webapp requires an already-compiled explainer
-        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in view_texts]
+        n = self._explanation.n_samples
+        explanation = self._explanation
+        exp_texts = self._explanation.texts
+        assert exp_texts is not None  # noqa: S101 - the webapp requires an already-compiled explainer
+        texts_short = [(t[:120] + "…") if len(t) > 120 else t for t in exp_texts]
         xy = self._scatter_xy
         assert xy is not None  # noqa: S101 - only registered/called when scatter_xy was provided
         error_mask = self._error_mask() if errors_only else None
@@ -1295,14 +1117,14 @@ class NlpWebApp:
             )
             return fig
 
-        if color_by == "ground_truth" and self._view.y_true is not None:
-            labels = [str(label) for label in self._view.y_true.tolist()]
-        elif self._view.y_pred is not None:
-            labels = [str(label) for label in self._view.y_pred.tolist()]
+        if color_by == "ground_truth" and self._explanation.y_true is not None:
+            labels = [str(label) for label in self._explanation.y_true.tolist()]
+        elif self._explanation.y_pred is not None:
+            labels = [str(label) for label in self._explanation.y_pred.tolist()]
         else:
             labels = [""] * n
 
-        label_names = contrib.label_names or sorted(set(labels))
+        label_names = explanation.label_names or sorted(set(labels))
 
         fig = go.Figure()
         for i, name in enumerate(label_names):

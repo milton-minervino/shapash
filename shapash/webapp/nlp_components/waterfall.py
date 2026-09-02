@@ -22,7 +22,7 @@ class WaterfallComponent(WebappComponent):
     name = "Waterfall"
     scope = "local"
 
-    def layout(self, view, engine=None) -> html.Div:
+    def layout(self, explanation, engine=None) -> html.Div:
         """Return the grouping-threshold slider + waterfall graph."""
         return html.Div(
             [
@@ -49,10 +49,9 @@ class WaterfallComponent(WebappComponent):
             style={"height": "100%"},
         )
 
-    def register_callbacks(self, app, view, engine, stores) -> None:
+    def register_callbacks(self, app, explanation, engine, stores) -> None:
         """Wire the waterfall figure to the current datapoint, class picker, and threshold."""
         current_store = stores["current"]
-        contrib = view.contributions
 
         @app.callback(
             Output("waterfall-graph", "figure"),
@@ -67,7 +66,7 @@ class WaterfallComponent(WebappComponent):
                 raise PreventUpdate
             label_idx = int(label_idx)
             tokens, vals, base_value, _ = unpack_datapoint(datapoint, label_idx)
-            label_name = (contrib.label_names or [])[label_idx] if contrib.label_names else str(label_idx)
+            label_name = (explanation.label_names or [])[label_idx] if explanation.label_names else str(label_idx)
             min_pct = (threshold_pct if threshold_pct is not None else 10) / 100.0
             return plot_waterfall(
                 tokens=tokens,

@@ -7,12 +7,11 @@ single interface spans both modalities.
 
 Return-type contract (migration target)
 ----------------------------------------
-Text backends already return typed structures (``NlpRawExplanation`` from
-``run_explainer``, ``NlpContributions`` from ``get_local_contributions``).
-Tabular backends still return ``dict`` / ``pd.DataFrame`` pending migration to
-the same typed contract.  ``Backend`` therefore types both methods loosely
-(``Any``); tighten these annotations once the tabular path has been migrated to
-the typed structures.
+Text backends already return a typed structure (``NlpContributions``, from both
+``run_explainer`` and ``get_local_contributions``). Tabular backends still return
+``dict`` / ``pd.DataFrame`` pending migration to the same typed contract.
+``Backend`` therefore types both methods loosely (``Any``); tighten these
+annotations once the tabular path has been migrated to the typed structures.
 """
 
 from __future__ import annotations

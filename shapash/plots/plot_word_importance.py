@@ -24,7 +24,7 @@ def plot_word_importance(
     ----------
     word_imp : pd.Series
         Word → mean SHAP contribution, already sorted by ``|value|`` descending
-        (as returned by ``NlpContributions.word_importance``).
+        (as returned by ``NlpExplanation.word_importance``).
     title : str
         Figure title.
     width : int
@@ -38,7 +38,7 @@ def plot_word_importance(
 
     Examples
     --------
-    >>> imp = contributions.word_importance(label_idx=1)
+    >>> imp = explanation.word_importance(label_idx=1)
     >>> fig = plot_word_importance(imp, title="Word importance — joy")
     >>> fig.show()
     """

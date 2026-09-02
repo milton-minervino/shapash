@@ -28,20 +28,20 @@ logger = logging.getLogger(__name__)
 def hash_corpus(texts: Sequence[str], key: str) -> str:
     """Stable digest over an identity ``key`` plus the corpus texts (order-sensitive).
 
-    The ``\\0`` separator after every text is what makes this collision-safe: without it
-    ``["ab", "c"]`` and ``["a", "bc"]`` hash identically, so two different corpora would share a cache
-    entry. ``key`` carries whatever else changes the cached artifact (model identity, representation
-    space, explanation backend) and is separated the same way.
+    Each string is framed with its own byte length before hashing, so no separator choice can
+    let two different inputs collide — a literal ``"\\0"`` inside a text can no longer make
+    ``["a\\0b"]`` and ``["a", "b"]`` hash identically. ``key`` carries whatever else changes the
+    cached artifact (model identity, representation space, explanation backend).
 
     Shared by every disk cache in the NLP path — the embedding/projection artifacts here and the
-    contribution pickle in :meth:`~shapash.explainer.nlp_explainer.NlpExplainer.compile` — so all of
+    contribution cache in :meth:`~shapash.explainer.nlp_explainer.NlpExplainer.explain` — so all of
     them key on the same, collision-safe rule.
     """
     h = hashlib.md5(usedforsecurity=False)
-    h.update(f"{key}\0".encode())
-    for text in texts:
-        h.update(text.encode())
-        h.update(b"\0")
+    for s in (key, *texts):
+        data = s.encode()
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
     return h.hexdigest()
 
 
@@ -81,7 +81,10 @@ class EmbeddingStore:
         self.model = model
         self.texts = list(texts)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
-        self._arrays: dict[str, np.ndarray] = {}
+        # Keyed by (key, tag), not tag alone: ``key`` folds in the model's *current* space, which is
+        # assignable at runtime (EncoderClassifierModel.embedding_space). A tag-only memo would answer
+        # from the old space after such a switch and never consult the correctly-keyed file on disk.
+        self._arrays: dict[tuple[str, str], np.ndarray] = {}
 
     @property
     def space_key(self) -> str:
@@ -118,19 +121,22 @@ class EmbeddingStore:
         Returns
         -------
         np.ndarray
-            The cached array. Memoized in memory, so repeat calls are free.
+            The cached array. Memoized in memory per ``(key, tag)``, so repeat calls are free while
+            the model's space is unchanged, and a space switch re-reads (or recomputes) rather than
+            returning the previous space's array.
         """
-        if tag in self._arrays:
-            return self._arrays[tag]
+        memo = (self.key, tag)
+        if memo in self._arrays:
+            return self._arrays[memo]
         cache_file = self.path(tag)
         if cache_file is not None and cache_file.exists():
             logger.info("Embedding store hit (%s) — loading %s", tag, cache_file)
-            self._arrays[tag] = np.load(cache_file)
-            return self._arrays[tag]
+            self._arrays[memo] = np.load(cache_file)
+            return self._arrays[memo]
 
         logger.info("Embedding store miss (%s) — computing over %d texts (%s)", tag, len(self.texts), self.space_key)
         array = compute()
-        self._arrays[tag] = array
+        self._arrays[memo] = array
         if cache_file is not None:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             np.save(cache_file, array)
@@ -138,10 +144,14 @@ class EmbeddingStore:
         return array
 
     def clear(self) -> None:
-        """Drop every cached artifact for this corpus — in memory and, when caching, on disk.
+        """Drop this corpus's cached artifacts — every in-memory one, and on disk those under this key.
 
         Removes *all* tags under this key, not just the embeddings, so a caller forcing a recompute
-        cannot leave a projection behind that was derived from vectors no longer on disk.
+        cannot leave a projection behind that was derived from vectors no longer on disk. The disk
+        sweep is scoped to the key, and therefore to the model's **current** space: files written for
+        a space the model has since moved off are not touched. They are already unreachable by
+        lookup, and re-selecting that space finds them again — which is the useful behaviour, not an
+        oversight. In memory the sweep is unconditional (every space).
         """
         self._arrays.clear()
         if self.cache_dir is None:

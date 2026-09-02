@@ -14,6 +14,8 @@ from typing import Any
 
 import numpy as np
 
+from shapash.explainer.nlp_explanation import select_label_column
+
 
 def pack_datapoint(
     *,
@@ -114,7 +116,7 @@ def unpack_datapoint(dp: dict, label_idx: int) -> tuple[list[str], np.ndarray, f
     """
     tokens = dp["tokens"]
     values = np.asarray(dp["values"], dtype=float)
-    vals = values[:, label_idx] if values.ndim == 2 else values
+    vals = select_label_column(values, label_idx)
     base_list = dp.get("base_values")
     base_value: float | None = None
     if base_list:

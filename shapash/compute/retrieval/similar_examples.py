@@ -114,6 +114,7 @@ class SimilarExampleRetriever:
         self.reference_labels = list(reference_labels) if reference_labels is not None else None
         self.store = EmbeddingStore(model, self.reference_texts, cache_dir=cache_dir)
         self._bank: np.ndarray | None = None  # (n_reference, hidden), L2-normalized rows
+        self._bank_space: str | None = None  # store.space_key the bank was built under — see build()
         self._positions: dict[str, list[int]] | None = None  # text -> reference rows, for exclude_self
 
     @property
@@ -129,11 +130,22 @@ class SimilarExampleRetriever:
         :class:`~shapash.compute.embedding_store.EmbeddingStore`; normalization is applied here rather
         than cached, since it is a single cheap pass and keeps the stored artifact the plain embeddings
         that other consumers (e.g. the scatter projection) can reuse. Rows end up unit-norm so a query
-        is a single matrix-vector product. Idempotent.
+        is a single matrix-vector product.
+
+        Idempotent *while the model stays in one space*. The space is assignable at runtime
+        (:attr:`~shapash.model.encoder.EncoderClassifierModel.embedding_space`), and a bank held over
+        such a switch would be compared against queries encoded in the new space — a cosine between
+        two unrelated spaces, which returns a plausible-looking number rather than failing. So the
+        bank records the space it was built under and is rebuilt when that moves. The comparison is
+        on ``space_key`` (two string reads) rather than the store's full key (an MD5 over the whole
+        corpus), which is sound here because the corpus is fixed at construction: only the space can
+        change under a given retriever.
         """
-        if self._bank is not None:
+        space = self.store.space_key
+        if self._bank is not None and self._bank_space == space:
             return
         self._bank = _l2_normalize(self.store.vectors())
+        self._bank_space = space
 
     def _encode(self, texts: list[str]) -> np.ndarray:
         """Embed ``texts`` in the model's configured space — the same one the scatter projects."""
@@ -159,6 +171,38 @@ class SimilarExampleRetriever:
         query_vec = _l2_normalize(self._encode([text]))[0]
         sims = self._bank @ query_vec  # cosine, rows already unit-norm
         return self._top_k(sims, top_k)
+
+    def query_threshold(self, text: str, threshold: float, limit: int | None = None) -> tuple[list[Neighbor], int]:
+        """Return every reference example scoring above ``threshold``, most-similar first.
+
+        Unlike :meth:`query`, the candidate set is not a fixed size: any reference example whose
+        cosine similarity to ``text`` exceeds ``threshold`` qualifies, however many that is. This is
+        the counterpart the webapp's threshold-filter mode needs — :meth:`query`'s ``top_k`` is an
+        ``argpartition`` over a fixed count and cannot tell you "how many clear 0.95", only "the k
+        best, whatever their score".
+
+        Parameters
+        ----------
+        text : str
+            The query text.
+        threshold : float
+            Minimum cosine similarity a reference example must *exceed* (strict) to qualify.
+        limit : int or None, optional
+            Cap on how many matches to return, most-similar first. ``None`` returns all of them —
+            callers rendering a live list should pass a display cap, since a low threshold can match
+            most of the corpus.
+
+        Returns
+        -------
+        tuple[list[Neighbor], int]
+            The matching neighbours (capped to ``limit``) and the total number that cleared
+            ``threshold`` before capping, so a caller can report e.g. "showing 50 of 138".
+        """
+        self.build()
+        assert self._bank is not None  # noqa: S101 - build() guarantees this
+        query_vec = _l2_normalize(self._encode([text]))[0]
+        sims = self._bank @ query_vec  # cosine, rows already unit-norm
+        return self._above_threshold(sims, threshold, limit)
 
     def query_many(self, texts: list[str], top_k: int = 5, exclude_self: bool = False) -> list[list[Neighbor]]:
         """Return the ``top_k`` most similar reference examples for **each** of ``texts``.
@@ -215,6 +259,21 @@ class SimilarExampleRetriever:
         # argpartition for the top-k, then sort just those descending.
         top_idx = np.argpartition(-sims, k - 1)[:k]
         top_idx = top_idx[np.argsort(-sims[top_idx])]
+        # An excluded row is -inf; it only surfaces when the corpus has nothing else to offer.
+        top_idx = top_idx[np.isfinite(sims[top_idx])]
+        return self._neighbors_from_indices(top_idx, sims)
+
+    def _above_threshold(self, sims: np.ndarray, threshold: float, limit: int | None) -> tuple[list[Neighbor], int]:
+        """Every finite row exceeding ``threshold``, descending, plus the pre-cap match count."""
+        idx = np.flatnonzero(np.isfinite(sims) & (sims > threshold))
+        idx = idx[np.argsort(-sims[idx])]
+        total = len(idx)
+        if limit is not None:
+            idx = idx[:limit]
+        return self._neighbors_from_indices(idx, sims), total
+
+    def _neighbors_from_indices(self, idx: np.ndarray, sims: np.ndarray) -> list[Neighbor]:
+        """Build :class:`Neighbor` objects for ``idx``, in the order given."""
         return [
             Neighbor(
                 index=int(i),
@@ -222,9 +281,7 @@ class SimilarExampleRetriever:
                 text=self.reference_texts[i],
                 label=self.reference_labels[i] if self.reference_labels is not None else None,
             )
-            for i in top_idx
-            # An excluded row is -inf; it only surfaces when the corpus has nothing else to offer.
-            if np.isfinite(sims[i])
+            for i in idx
         ]
 
 

@@ -1,8 +1,8 @@
 """NLP LIME backend — word-level LIME contributions for text classification models.
 
-``NlpLimeBackend`` wraps ``LimeTextExplainer`` and implements ``run_explainer``.
-All shared infrastructure (``NlpContributions`` dataclass,
-``get_local_contributions``, common ``__init__`` skeleton) lives in
+``NlpLimeBackend`` wraps ``LimeTextExplainer`` and implements ``run_explainer``,
+returning an ``NlpContributions``. All shared infrastructure
+(``get_local_contributions``, common ``__init__`` skeleton) lives in
 ``NlpBackend`` (see ``nlp_backend.py``).
 
 LIME works at word level (bag-of-words by default) rather than at the subword
@@ -23,7 +23,7 @@ try:
 except ImportError:
     _lime_available = False
 
-from shapash.backend.nlp_backend import NlpBackend, NlpRawExplanation
+from shapash.backend.nlp_backend import NlpBackend, NlpContributions
 
 
 class NlpLimeBackend(NlpBackend):
@@ -81,6 +81,19 @@ class NlpLimeBackend(NlpBackend):
     """
 
     name = "nlp_lime"
+    # Unlike tabular LIME (``LimeTabularExplainer(training_data=...)``, which needs a
+    # background corpus to build its discretizer/feature statistics), LimeTextExplainer
+    # takes no training-data-like constructor argument at all (see __init__ below) —
+    # explain_instance perturbs the instance text itself (word removal / mask_string
+    # substitution). There is nothing backend-specific for ``fit`` to learn here.
+    reference_kind = "none"
+    # LIME fits a locally-weighted linear surrogate (Ribeiro, Singh & Guestrin, 2016,
+    # "Why Should I Trust You?") whose objective is local fidelity, not exact
+    # reconstruction — there is no efficiency/completeness axiom forcing the weights to
+    # sum to f(x) - f(baseline). Matches tabular LimeBackend.support_groups=False, for
+    # the same algorithmic reason (not because tabular already decided it).
+    is_additive = False
+    requires_model_capabilities = ()  # a plain scoring callable is enough
 
     def __init__(
         self,
@@ -136,12 +149,12 @@ class NlpLimeBackend(NlpBackend):
             return matrix
         return np.array(result, dtype=np.float64)
 
-    def run_explainer(self, x) -> NlpRawExplanation:
+    def run_explainer(self, x) -> NlpContributions:
         """Run LimeTextExplainer on each sample and normalise output.
 
         Converts LIME's sparse per-label ``{label_id: [(word_id, weight)]}``
         representation into a dense ``(n_words, n_classes)`` array so that the
-        returned ``NlpRawExplanation`` matches the same field shapes as
+        returned ``NlpContributions`` matches the same field shapes as
         ``NlpShapBackend``.
 
         Parameters
@@ -151,7 +164,7 @@ class NlpLimeBackend(NlpBackend):
 
         Returns
         -------
-        NlpRawExplanation
+        NlpContributions
             Dense weight arrays, LIME intercepts as base values, and unique
             vocabulary words per sample.
         """
@@ -185,8 +198,8 @@ class NlpLimeBackend(NlpBackend):
             base_values_list.append([exp.intercept.get(i, 0.0) for i in range(effective_n_classes)])
             data.append(vocab)
 
-        return NlpRawExplanation(
-            contributions=contributions,
+        return NlpContributions(
+            token_strings=data,
+            values=contributions,
             base_values=np.array(base_values_list),
-            data=data,
         )

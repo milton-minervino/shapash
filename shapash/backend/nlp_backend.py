@@ -1,13 +1,13 @@
 """NLP backend infrastructure — shared base for text explainability backends.
 
-Two dataclasses form the typed pipeline between raw explainer output and the
-final explanation object:
-
-* ``NlpRawExplanation`` — returned by every concrete ``run_explainer``.
-  Carries ``contributions``, ``base_values``, and ``data`` as typed fields
-  instead of an untyped dict.
-* ``NlpContributions`` — returned by ``get_local_contributions`` to callers.
-  Adds word-importance aggregation and optional metadata (label names, index).
+``NlpContributions`` is the single typed payload every concrete ``run_explainer``
+returns: per-sample token strings, contribution values, and baseline predictions —
+no batch metadata (predictions, ground truth, class names) attached. It carries no
+behavior either; word-importance aggregation and persistence live on
+:class:`~shapash.explainer.nlp_explanation.NlpExplanation`, the batch artifact that
+wraps this data together with everything else ``NlpExplainer.explain()`` knows.
+The same slim type is also what :meth:`~shapash.explainer.nlp_explainer.NlpExplainer.explain_text`
+returns for a single live (uncommitted) text — a one-sample batch.
 
 ``NlpBackend`` is the abstract base class that owns the common ``__init__``
 skeleton and the ``get_local_contributions`` implementation.  Concrete
@@ -18,17 +18,19 @@ subclasses (``NlpShapBackend``, ``NlpLimeBackend``) only need to implement
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import ClassVar, Literal
 
 import numpy as np
-import pandas as pd
 
 from shapash.backend.backend import Backend
+from shapash.model.base import has_capabilities
 
 # A unit made entirely of punctuation/symbol characters — no letters, digits or underscore. Word
 # segmentation deliberately emits these as their own units (the model reads them, and "!!!" or "?"
 # genuinely moves a sentiment prediction), so they stay visible in a local highlight. They are noise
-# in a *corpus-level* ranking, though, which is why ``word_importance`` filters them by default.
+# in a *corpus-level* ranking, though, which is why ``NlpExplanation.word_importance`` filters them
+# by default.
 _PUNCTUATION_RE = re.compile(r"^[^\w\s]+$")
 
 
@@ -39,202 +41,59 @@ def is_punctuation(word: str) -> bool:
 
 
 @dataclass
-class NlpRawExplanation:
-    """Typed intermediate output of ``NlpBackend.run_explainer``.
-
-    Every concrete backend returns this instead of a plain dict so that the
-    three-field contract is enforced structurally rather than by convention.
-    ``get_local_contributions`` consumes it and produces ``NlpContributions``.
-
-    Attributes
-    ----------
-    contributions : list[np.ndarray]
-        Per-token contribution values, one array per sample.
-        Shape per sample: ``(n_tokens_i, n_classes)`` or ``(n_tokens_i,)``.
-    base_values : np.ndarray
-        Prediction baseline for each sample — SHAP base values or LIME
-        intercepts depending on the backend.  Shape ``(n_samples, n_classes)``
-        or ``(n_samples,)``.
-    data : list[list[str]]
-        Token or word strings per sample (variable length).
-    """
-
-    contributions: list[np.ndarray]
-    base_values: np.ndarray
-    data: list[list[str]]
-
-
-@dataclass
 class NlpContributions:
-    """Token-level contributions for a batch of text samples.
+    """Raw per-sample token contributions — a backend's output, no batch metadata attached.
 
     Attributes
     ----------
     token_strings : list[list[str]]
-        Tokenized representation of each sample (variable length per sample).
+        Word (or LIME-vocabulary) strings per sample, variable length.
     values : list[np.ndarray]
         Per-token contribution values, one array per sample.
         Each array has shape ``(n_tokens_i, n_classes)`` for multi-class models
         or ``(n_tokens_i,)`` for binary/regression.
-    base_values : np.ndarray
+    base_values : np.ndarray or None
         Baseline prediction for each sample, shape ``(n_samples, n_classes)``
-        or ``(n_samples,)``.
-    label_names : list[str] or None
-        Human-readable class names; set by the caller after construction.
-    index : pd.Index or None
-        Row index from the source ``pd.Series``; set by the caller after construction.
-    folds_case : bool or None
-        Whether the model's tokenizer normalises case away, from
-        :meth:`~shapash.model.base.SupportsTokenization.folds_case`; set by the caller after
-        construction. Decides the default unit grouping in :meth:`word_importance` — see
-        :meth:`resolve_lowercase`. ``None`` when the model exposes no tokenizer to ask.
+        or ``(n_samples,)``. ``None`` when the backend has no reference at all
+        (see :attr:`NlpBackend.reference_kind`).
     """
 
     token_strings: list[list[str]]
     values: list[np.ndarray]
-    base_values: np.ndarray
-    label_names: list[str] | None = field(default=None)
-    index: pd.Index | None = field(default=None)
-    folds_case: bool | None = field(default=None)
-
-    _SPECIAL_RE: re.Pattern = re.compile(r"^\[.*\]$|^##|^\s*$")
-
-    def __len__(self) -> int:
-        return len(self.token_strings)
-
-    def resolve_lowercase(self, lowercase: bool | None = None) -> bool:
-        """Decide whether word units should be case-folded, deferring to the model by default.
-
-        One source of truth for the question, so a caller that has to normalise units the same
-        way (the webapp's exclusion vocabulary) cannot drift from :meth:`word_importance`.
-
-        Parameters
-        ----------
-        lowercase : bool, optional
-            Explicit caller override. ``None`` (default) derives the answer from ``folds_case``.
-
-        Returns
-        -------
-        bool
-            ``True`` when ``AWFUL`` and ``awful`` should aggregate into one unit.
-
-        Notes
-        -----
-        With no override, an *uncased* model folds and a *cased* model does not: on an uncased
-        tokenizer both spellings are the same input ids, so keeping them apart splits one word
-        into variants the model provably cannot distinguish; on a cased one they are different
-        inputs whose attributions differ for real reasons, and merging would hide that.
-
-        When ``folds_case`` is ``None`` — no tokenizer to probe, e.g. a bare LIME
-        ``classifier_fn`` — this falls back to folding, which keeps a corpus-level ranking from
-        fragmenting on a question that cannot be answered here.
-        """
-        if lowercase is not None:
-            return lowercase
-        return True if self.folds_case is None else self.folds_case
-
-    def word_importance(
-        self,
-        label_idx: int,
-        n_top: int = 20,
-        filter_special: bool = True,
-        filter_punctuation: bool = True,
-        lowercase: bool | None = None,
-        filter_sign: str = "all",
-        exclude_words: set[str] | None = None,
-        sample_indices: list[int] | None = None,
-    ) -> pd.Series:
-        """Aggregate token contributions by word across all samples for one class.
-
-        For each unique (stripped, by default lowercased) token string that appears in
-        the batch, computes the mean contribution across all its occurrences.
-
-        Parameters
-        ----------
-        label_idx : int
-            Index of the class to compute importance for.
-        n_top : int
-            Maximum number of words to return, sorted by ``|mean contribution|``.
-        filter_special : bool
-            If ``True``, skip empty strings, ``[CLS]``/``[SEP]``-style bracket
-            tokens, and ``##subword`` wordpiece prefixes.
-        filter_punctuation : bool
-            If ``True`` (default), skip units made entirely of punctuation (``.``, ``,``, ``!!!``).
-            Word segmentation emits punctuation as its own unit so it stays visible and additive in
-            a *local* explanation; in a corpus-level ranking it is almost always noise, so it is
-            hidden here unless explicitly asked for.
-        lowercase : bool, optional
-            Case-fold each unit before aggregating, so ``AWFUL``, ``Awful`` and ``awful``
-            form one row. ``None`` (default) derives this from the model's own tokenizer
-            via :meth:`resolve_lowercase` — folding on an uncased model, keeping case on a
-            cased one — so pass a bool only to override that.
-            Folding also makes the ranking comparable across backends: SHAP labels units by
-            slicing the *source text* (keeping its casing) while Captum/LIG labels them from
-            tokenizer output (already normalised), so on an uncased model the two would
-            otherwise report different vocabularies for one corpus.
-            The per-instance sentence highlight always keeps the original casing, whatever
-            this is set to.
-        filter_sign : {"all", "positive", "negative"}
-            If ``"positive"``, keep only words with positive mean contribution.
-            If ``"negative"``, keep only words with negative mean contribution.
-        exclude_words : set[str], optional
-            Additional set of word strings to exclude (e.g. user-selected
-            stopwords or corpus words to hide). Matched against the same
-            normalised key, so under ``lowercase`` the exclusion is case-insensitive.
-        sample_indices : list[int], optional
-            Positional indices of the samples to include in the aggregation.
-            When ``None`` (default) all samples are used.
-
-        Returns
-        -------
-        pd.Series
-            Word → mean contribution, sorted by absolute value descending.
-        """
-
-        fold = self.resolve_lowercase(lowercase)
-
-        def _key(token: str) -> str:
-            return token.lower() if fold else token
-
-        _exclude: set[str] = {_key(w) for w in exclude_words} if exclude_words else set()
-        word_contribs: dict[str, list[float]] = {}
-        iter_data = (
-            ((self.token_strings[i], self.values[i]) for i in sample_indices)
-            if sample_indices is not None
-            else zip(self.token_strings, self.values, strict=True)
-        )
-        for tokens, vals in iter_data:
-            vals_1d: np.ndarray = vals[:, label_idx] if vals.ndim == 2 else vals
-            for tok, val in zip(tokens, vals_1d, strict=True):
-                tok_clean = tok.strip()
-                if filter_special and self._SPECIAL_RE.match(tok_clean):
-                    continue
-                if filter_punctuation and is_punctuation(tok_clean):
-                    continue
-                key = _key(tok_clean)
-                if key in _exclude:
-                    continue
-                if key not in word_contribs:
-                    word_contribs[key] = []
-                word_contribs[key].append(float(val))
-
-        importance = pd.Series({w: float(np.mean(vs)) for w, vs in word_contribs.items()})
-        importance = importance.reindex(importance.abs().sort_values(ascending=False).index)
-
-        if filter_sign == "positive":
-            importance = importance[importance > 0]
-        elif filter_sign == "negative":
-            importance = importance[importance < 0]
-
-        return importance.head(n_top)
+    base_values: np.ndarray | None
 
 
 class NlpBackend(Backend):
     """Abstract base class for NLP explainability backends.
 
-    Owns the ``__init__`` skeleton shared by all text backends and the
-    ``get_local_contributions`` implementation.  Concrete subclasses must
-    implement ``run_explainer`` and return an ``NlpRawExplanation``.
+    Owns the ``__init__`` skeleton shared by all text backends (including the
+    ``requires_model_capabilities`` check) and the ``get_local_contributions``
+    implementation.  Concrete subclasses must implement ``run_explainer`` and
+    return an ``NlpContributions``, and must declare the three class
+    attributes below.
+
+    Class Attributes
+    -----------------
+    reference_kind : {"distribution", "statistics", "point", "none"}
+        What kind of reference, if any, this method's numbers are measured against —
+        not every method has a baseline, so this is a four-valued question, not a
+        boolean. ``"distribution"``: rows the model is compared against (a genuine
+        baseline, e.g. SHAP kernel/permutation on tabular data). ``"statistics"``:
+        summaries used to perturb/discretize, never subtracted (e.g. LIME tabular's
+        discretizer). ``"point"``: one constructed input built by the model/tokenizer,
+        not learned from data (e.g. Captum LIG's pad/mask reference ids). ``"none"``:
+        no reference exists, or none is learned from data (e.g. a masker that infers
+        itself, or a pointwise gradient method).
+    is_additive : bool
+        Whether this method's contributions satisfy an efficiency/completeness axiom —
+        i.e. sum to a well-defined total (the prediction gap for Shapley-family methods,
+        ``logits(x) - logits(baseline)`` for Integrated Gradients). Licenses feature
+        grouping and waterfall/force-style charts; ``False`` for LIME, whose local
+        surrogate coefficients carry no such guarantee.
+    requires_model_capabilities : tuple[type, ...]
+        Capability ABCs (from :mod:`shapash.model.base`) the bound model must satisfy,
+        checked once here so a new backend declares its needs instead of failing at
+        first call. Empty when the backend only needs a plain scoring callable.
 
     Parameters
     ----------
@@ -249,7 +108,16 @@ class NlpBackend(Backend):
         Keyword arguments forwarded to the underlying explainer constructor.
     explainer_compute_args : dict, optional
         Keyword arguments forwarded to the explainer call / ``explain_instance``.
+
+    Raises
+    ------
+    TypeError
+        If ``model`` does not satisfy every capability in ``requires_model_capabilities``.
     """
+
+    reference_kind: ClassVar[Literal["distribution", "statistics", "point", "none"]]
+    is_additive: ClassVar[bool]
+    requires_model_capabilities: ClassVar[tuple[type, ...]] = ()
 
     def __init__(
         self,
@@ -259,24 +127,33 @@ class NlpBackend(Backend):
         explainer_args: dict | None = None,
         explainer_compute_args: dict | None = None,
     ) -> None:
+        required = type(self).requires_model_capabilities
+        if required and not has_capabilities(model, *required):
+            names = ", ".join(c.__name__ for c in required)
+            raise TypeError(
+                f"{type(self).__name__} requires a model implementing {names}; "
+                "got a model without the required attribution surface."
+            )
         self.model = model
         self._classes = label_names or []
         self.explainer_args = explainer_args or {}
         self.explainer_compute_args = explainer_compute_args or {}
 
     def get_local_contributions(
-        self, x, explain_data: NlpRawExplanation, subset: list[int] | None = None
+        self, x, explain_data: NlpContributions, subset: list[int] | None = None
     ) -> NlpContributions:
-        """Convert a ``NlpRawExplanation`` to ``NlpContributions``.
+        """Optionally select a subset of ``run_explainer``'s output.
+        TODO: dead-code, not used by any current NLP backend.  Keep for now to avoid breaking the interface.
 
         Parameters
         ----------
         x : list[str] or pd.Series
             Text samples (not used here; kept for interface compatibility).
-        explain_data : NlpRawExplanation
-            Typed output of ``run_explainer``.
+        explain_data : NlpContributions
+            The output of ``run_explainer``.
         subset : list[int], optional
-            Positional indices to select a subset of samples.
+            Positional indices to select a subset of samples. Returns ``explain_data`` unchanged
+            when ``None`` (the default).
 
         Returns
         -------
@@ -284,13 +161,11 @@ class NlpBackend(Backend):
             Token strings, contribution values, and baseline predictions for
             each sample.
         """
-        token_strings: list[list[str]] = [list(s) for s in explain_data.data]
-        values: list[np.ndarray] = list(explain_data.contributions)
-        base_values: np.ndarray = np.asarray(explain_data.base_values)
-
-        if subset is not None:
-            token_strings = [token_strings[i] for i in subset]
-            values = [values[i] for i in subset]
-            base_values = base_values[subset]
-
-        return NlpContributions(token_strings=token_strings, values=values, base_values=base_values)
+        if subset is None:
+            return explain_data
+        base_values = explain_data.base_values
+        return NlpContributions(
+            token_strings=[explain_data.token_strings[i] for i in subset],
+            values=[explain_data.values[i] for i in subset],
+            base_values=None if base_values is None else base_values[subset],
+        )

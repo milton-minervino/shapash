@@ -2,7 +2,7 @@
 
 Prototype of the master plan's Phase-5b ``WebappComponent`` contract, applied first to the
 interactive what-if panels (data editor + counterfactuals). Each component owns its layout and
-callbacks and declares its ``requires`` capabilities, self-disabling when the bound view/engine
+callbacks and declares its ``requires`` capabilities, self-disabling when the bound explanation/engine
 cannot satisfy them.
 
 Notably this **extends** the Phase-5b ``requires`` idea from *data* capabilities (e.g.
@@ -21,6 +21,7 @@ from shapash.webapp.nlp_components.datapoint import (
     pack_datapoint,
     unpack_datapoint,
 )
+from shapash.webapp.nlp_components.error_analysis import ErrorAnalysisComponent
 from shapash.webapp.nlp_components.label_noise import LabelNoiseComponent
 from shapash.webapp.nlp_components.sentence_highlight import SentenceHighlightComponent
 from shapash.webapp.nlp_components.similar_examples import SimilarExamplesComponent
@@ -31,6 +32,7 @@ __all__ = [
     "available_capabilities",
     "DataEditorComponent",
     "CounterfactualComponent",
+    "ErrorAnalysisComponent",
     "LabelNoiseComponent",
     "SentenceHighlightComponent",
     "SimilarExamplesComponent",
