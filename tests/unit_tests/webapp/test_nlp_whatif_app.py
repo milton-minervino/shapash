@@ -823,5 +823,47 @@ class TestLabelNoiseTable(unittest.TestCase):
         self.assertEqual(_probe_summary(self._issue()), "—")
 
 
+class TestSubpathMounting(unittest.TestCase):
+    """``url_base_pathname`` — serving behind a reverse proxy that routes a subpath, not a host."""
+
+    def _app(self, **kwargs):
+        engine = FakeEngine(can_edit=True, can_cf=True)
+        return NlpWebApp(engine.to_explanation(), engine=engine, **kwargs)
+
+    def test_serves_at_the_root_by_default(self):
+        config = self._app().app.config
+        self.assertEqual(config.routes_pathname_prefix, "/")
+        self.assertEqual(config.requests_pathname_prefix, "/")
+
+    def test_mounts_under_the_given_prefix(self):
+        config = self._app(url_base_pathname="/shapash-nlp-explainer/").app.config
+        # Both prefixes matter: routes_* is where Dash listens, requests_* is what it writes into
+        # the asset and callback URLs the browser then fetches.
+        self.assertEqual(config.routes_pathname_prefix, "/shapash-nlp-explainer/")
+        self.assertEqual(config.requests_pathname_prefix, "/shapash-nlp-explainer/")
+
+    def test_missing_slashes_are_added(self):
+        for given in ("shapash-nlp-explainer", "/shapash-nlp-explainer", "shapash-nlp-explainer/"):
+            with self.subTest(given=given):
+                config = self._app(url_base_pathname=given).app.config
+                self.assertEqual(config.requests_pathname_prefix, "/shapash-nlp-explainer/")
+
+    def test_the_served_routes_and_asset_urls_carry_the_prefix(self):
+        # The config values above are only half the contract: Dash must also *answer* on the prefix
+        # and write it into the script tags, or the page loads blank behind the proxy.
+        client = self._app(url_base_pathname="/shapash-nlp-explainer/").app.server.test_client()
+        self.assertEqual(client.get("/shapash-nlp-explainer/").status_code, 200)
+        self.assertEqual(client.get("/").status_code, 404)
+        body = client.get("/shapash-nlp-explainer/").get_data(as_text=True)
+        self.assertIn("/shapash-nlp-explainer/_dash-component-suites", body)
+        self.assertNotIn('"/_dash-', body)
+
+    def test_empty_prefixes_serve_at_the_root(self):
+        for given in ("", "/", "   "):
+            with self.subTest(given=given):
+                config = self._app(url_base_pathname=given).app.config
+                self.assertEqual(config.requests_pathname_prefix, "/")
+
+
 if __name__ == "__main__":
     unittest.main()

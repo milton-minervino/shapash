@@ -78,6 +78,30 @@ def _compose_selection(
     return combined
 
 
+def _normalize_base_pathname(path: str | None) -> str | None:
+    """Return *path* spelled the one way Dash accepts as ``url_base_pathname``.
+
+    Dash rejects a prefix that does not both start and end with ``/``, and a mount point copied
+    from an nginx ``location`` or typed on a CLI routinely arrives missing one. ``/x/`` is the only
+    valid spelling of the same intent, so the slashes are added rather than raised over.
+
+    Parameters
+    ----------
+    path : str or None
+        The requested mount point, in any slash spelling.
+
+    Returns
+    -------
+    str or None
+        ``None`` when the app should serve at the server root (``None``, ``""`` or ``"/"``),
+        otherwise the prefix with both slashes.
+    """
+    if path is None:
+        return None
+    stripped = path.strip().strip("/")
+    return f"/{stripped}/" if stripped else None
+
+
 class NlpWebApp:
     """Minimal Dash webapp driven by an ``NlpExplainer``.
 
@@ -118,6 +142,15 @@ class NlpWebApp:
         a scatter panel is added to the layout.  Compute with PaCMAP, UMAP,
         t-SNE, PCA, etc. and pass the result here — Shapash does not perform
         the projection itself to avoid heavy optional dependencies.
+    url_base_pathname : str, optional
+        Mount the app under a URL prefix instead of the server root, for serving behind a reverse
+        proxy that routes a subpath (e.g. ``"/shapash-nlp-explainer/"``) to this process. Dash
+        rewrites its own routes *and* every asset/callback URL it emits, so the prefix must match
+        the proxied path exactly. ``None`` (the default) serves at ``/``.
+
+        Missing slashes are added — ``"shapash-nlp-explainer"`` and ``"/shapash-nlp-explainer"``
+        both become ``"/shapash-nlp-explainer/"`` — since that is the only spelling Dash accepts
+        and a prefix copied from an nginx ``location`` easily arrives without one.
     """
 
     def __init__(
@@ -125,6 +158,7 @@ class NlpWebApp:
         explanation: NlpExplanation,
         engine: InteractiveEngine | None = None,
         scatter_xy: np.ndarray | None = None,
+        url_base_pathname: str | None = None,
     ) -> None:
         if scatter_xy is not None:
             scatter_xy = np.asarray(scatter_xy)
@@ -142,7 +176,11 @@ class NlpWebApp:
         self._explanation = explanation
         self._engine = engine
 
-        self.app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+        self.app = dash.Dash(
+            __name__,
+            external_stylesheets=[dbc.themes.BOOTSTRAP],
+            url_base_pathname=_normalize_base_pathname(url_base_pathname),
+        )
         self.app.title = "Shapash — NLP Explainer"
         # Pin the document to the viewport so only the inner panels scroll, never the page. The
         # 100vh shell needs html/body at full height with no default margin; overflow:hidden is the

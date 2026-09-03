@@ -206,6 +206,8 @@ rating < 3 -> ``"negative"``, and drops the neutral 3-star (a ground-truth conve
 Usage
 -----
     python demo/serve_nlp.py [--n 100] [--cache-dir demo/nlp_cache] [--port 8050]
+    # Behind a reverse proxy that routes a subpath (not a whole hostname) to this process:
+    python demo/serve_nlp.py --url-base-path /shapash-nlp-explainer/
     python demo/serve_nlp.py --recompute   # ignore the cache and recompute
     python demo/serve_nlp.py --attribution lig   # Captum LayerIntegratedGradients highlights
     python demo/serve_nlp.py --model-name distilbert-base-uncased-finetuned-sst-2-english \\
@@ -301,6 +303,10 @@ class ServeConfig:
     cache_dir: Path = _HERE / "nlp_cache"
     port: int = 8050
     host: str = "0.0.0.0"  # noqa: S104
+    # Mount point when a reverse proxy routes a subpath here rather than a whole hostname (e.g.
+    # "/shapash-nlp-explainer/"). Dash rewrites its own asset and callback URLs to match, so this
+    # has to equal the proxied path. None serves at the server root.
+    url_base_path: str | None = None
     recompute: bool = False
 
     def __post_init__(self) -> None:
@@ -507,6 +513,13 @@ def parse_args(argv: list[str] | None = None) -> ServeConfig:
     parser.add_argument("--cache-dir", type=Path, default=defaults.cache_dir)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--host", default=defaults.host)
+    parser.add_argument(
+        "--url-base-path",
+        default=defaults.url_base_path,
+        help="Serve the app under this URL prefix instead of '/', for a reverse proxy that routes a "
+        "subpath to this process (e.g. '/shapash-nlp-explainer/'). Must match the proxied path; "
+        "missing slashes are added.",
+    )
     parser.add_argument(
         "--recompute",
         action="store_true",
@@ -1018,8 +1031,18 @@ def main() -> None:
         xpl.can_detect_label_noise(explanation),
         xpl.can_probe_labels(),
     )
-    logger.info("Serving on http://%s:%d (Ctrl+C to stop)", config.host, config.port)
-    xpl.run_app(explanation, port=config.port, debug=False, host=config.host, scatter_xy=projected)
+    # Log the path the app actually mounts on, normalised the way NlpWebApp will normalise it, so a
+    # subpath run shows the URL to open rather than a root that would 404.
+    base_path = f"/{config.url_base_path.strip().strip('/')}/" if config.url_base_path else "/"
+    logger.info("Serving on http://%s:%d%s (Ctrl+C to stop)", config.host, config.port, base_path)
+    xpl.run_app(
+        explanation,
+        port=config.port,
+        debug=False,
+        host=config.host,
+        scatter_xy=projected,
+        url_base_pathname=config.url_base_path,
+    )
 
 
 if __name__ == "__main__":

@@ -1770,5 +1770,27 @@ class TestDetectLabelNoise(unittest.TestCase):
         self.assertIsNotNone(xpl.detect_label_noise(self._with_labels()).issues[0].probe)
 
 
+class TestRunAppMountPath(unittest.TestCase):
+    """``run_app`` forwards the reverse-proxy mount point to the webapp it builds."""
+
+    def test_url_base_pathname_reaches_the_webapp(self):
+        xpl = object.__new__(NlpExplainer)
+        explanation = object()
+        with patch("shapash.explainer.nlp_explainer.NlpWebApp") as web_app:
+            xpl.run_app(explanation, url_base_pathname="/shapash-nlp-explainer/")
+        web_app.assert_called_once_with(
+            explanation,
+            engine=xpl,
+            scatter_xy=None,
+            url_base_pathname="/shapash-nlp-explainer/",
+        )
+
+    def test_defaults_to_no_prefix(self):
+        xpl = object.__new__(NlpExplainer)
+        with patch("shapash.explainer.nlp_explainer.NlpWebApp") as web_app:
+            xpl.run_app(object())
+        self.assertIsNone(web_app.call_args.kwargs["url_base_pathname"])
+
+
 if __name__ == "__main__":
     unittest.main()

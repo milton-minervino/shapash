@@ -499,6 +499,7 @@ class NlpExplainer:
         debug: bool = False,
         host: str = "127.0.0.1",
         scatter_xy=None,
+        url_base_pathname: str | None = None,
     ) -> None:
         """Launch the NLP explanation webapp for ``explanation``.
 
@@ -532,8 +533,15 @@ class NlpExplainer:
             next to neighbours computed in another — selecting a cluster then means something other
             than it appears to. Use it when you want coordinates the library cannot produce, and
             accept that keeping them consistent is yours to manage.
+        url_base_pathname : str, optional
+            Mount the app under a URL prefix instead of the server root — for a reverse proxy that
+            routes a subpath (e.g. ``"/shapash-nlp-explainer/"``) to this process. Must match the
+            proxied path exactly; see :class:`~shapash.webapp.nlp_app.NlpWebApp`. ``None`` serves
+            at ``/``.
         """
-        NlpWebApp(explanation, engine=self, scatter_xy=scatter_xy).run(port=port, debug=debug, host=host)
+        NlpWebApp(explanation, engine=self, scatter_xy=scatter_xy, url_base_pathname=url_base_pathname).run(
+            port=port, debug=debug, host=host
+        )
 
     # ------------------------------------------------------------------
     # InteractiveEngine — live what-if surface (see explainer/interactive.py)

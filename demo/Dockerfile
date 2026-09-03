@@ -49,4 +49,4 @@ ENV HF_HUB_OFFLINE=1 \
 
 EXPOSE 8050
 
-CMD ["python", "serve_nlp.py"]
+CMD ["python", "serve_nlp.py", "--n", "1000", "--n-reference", "5000"]
