@@ -24,15 +24,25 @@ import numpy as np
 from dash import html
 from plotly import graph_objs as go
 
-from shapash.explainer.nlp_explanation import select_label_column
+from shapash.explainer.nlp_explanation import (
+    WORD_AGGREGATIONS,
+    aggregate_word_contributions,
+    select_label_column,
+)
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
 from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.plots.plot_waterfall import plot_waterfall
-from shapash.plots.plot_word_importance import plot_word_importance
+from shapash.plots.plot_word_importance import plot_word_importance, word_importance_axis_title
+from shapash.plots.plot_word_profile import plot_word_profile
 
 if TYPE_CHECKING:
     from shapash.explainer.nlp_explanation import NlpExplanation
+
+# The arguments that decide how word units are *keyed*, and so how many times each one occurs.
+# Shared by word_importance and word_counts; forwarding exactly these keeps a hover count equal to
+# the count its bar's aggregate was computed over.
+_COUNT_KWARGS = ("lowercase", "filter_special", "filter_punctuation", "sample_indices")
 
 
 class NlpPlotter:
@@ -213,21 +223,25 @@ class NlpPlotter:
         return plot_sentence_highlight(tokens=toks, values=values, base_value=base_value)
 
     # ── batch-level plots ───────────────────────────────────────────────────────────────
-    def words(
+    def word_importance(
         self,
-        label_idx: int = 0,
+        label_idx: int | None = 0,
         n_top: int = 20,
         title: str | None = None,
         width: int = 900,
         height: int | None = None,
         **kwargs: Any,
     ) -> go.Figure:
-        """Corpus-level word importance for one class.
+        """Corpus-level word importance for one class, or across all of them.
 
         Parameters
         ----------
-        label_idx : int
-            Index of the class to aggregate, in ``label_names`` order.
+        label_idx : int or None
+            Index of the class to aggregate, in ``label_names`` order. ``None`` collapses across
+            classes into ``max_c |statistic|`` — "how hard does this word push the model at all",
+            regardless of where it pushes. The bars are then magnitudes, so they are all one
+            colour and ``filter_sign`` has nothing to select on; the per-class breakdown of a word
+            found this way is :meth:`word_profile`.
         n_top : int
             Number of words to show, ranked by ``|mean contribution|``.
         title : str, optional
@@ -238,18 +252,119 @@ class NlpPlotter:
             Forwarded to
             :meth:`~shapash.explainer.nlp_explanation.NlpExplanation.word_importance` —
             ``filter_special``, ``filter_punctuation``, ``lowercase``, ``filter_sign``,
-            ``exclude_words``, ``sample_indices``.
+            ``exclude_words``, ``sample_indices``, ``rank_by``, ``min_occurrences``.
 
         Returns
         -------
         plotly.graph_objs.Figure
+
+        Notes
+        -----
+        The default ranking is by ``|mean|`` with no frequency floor, which on a real corpus is
+        dominated by words seen once. Pass ``min_occurrences=3`` (or ``rank_by="sum"``, which
+        weights by frequency inherently) for a ranking that reflects stable model behaviour.
         """
-        label_idx = self._check_label_idx(label_idx)
+        across_classes = label_idx is None
+        if label_idx is not None:
+            label_idx = self._check_label_idx(label_idx)
         word_imp = self._exp.word_importance(label_idx=label_idx, n_top=n_top, **kwargs)
-        name = self._label_name(label_idx)
+        name = self._label_name(label_idx) if label_idx is not None else None
         if title is None:
-            title = f"Word importance — {name}" if name else "Word importance"
-        return plot_word_importance(word_imp, title=title, width=width, height=height)
+            if across_classes:
+                title = "Word importance — all classes"
+            else:
+                title = f"Word importance — {name}" if name else "Word importance"
+        # The axis names whichever statistic word_importance actually returned (it stamps its
+        # rank_by onto the Series name), so a total is never read as an average — and, across
+        # classes, so a magnitude is never read as a signed contribution.
+        x_title = word_importance_axis_title(str(word_imp.name))
+        # Hover counts, computed under the same filters/scope as the ranking so a bar's count is
+        # the one its aggregate was taken over. Only the keying arguments are forwarded — the rest
+        # (filter_sign, exclude_words, rank_by...) select and order words, they do not change how
+        # many times a word occurs.
+        count_kwargs = {k: v for k, v in kwargs.items() if k in _COUNT_KWARGS}
+        counts = self._exp.word_counts(**count_kwargs)
+        return plot_word_importance(
+            word_imp,
+            title=title,
+            x_title=x_title,
+            width=width,
+            height=height,
+            counts=counts["n_occurrences"],
+        )
+
+    def word_profile(
+        self,
+        word: str,
+        agg: str = "mean",
+        lowercase: bool | None = None,
+        sample_indices: list[int] | None = None,
+        title: str | None = None,
+        width: int | None = 640,
+        height: int | None = None,
+    ) -> go.Figure:
+        """Profile of one word: its aggregated contribution to every class at once.
+
+        The complement of :meth:`word_importance`, which fixes a class and ranks the vocabulary.
+        Here the word is fixed and every class is shown, which is the view that answers "what does
+        this word mean to the model" — including the multi-class case where a word pulls toward
+        one class and away from another.
+
+        Parameters
+        ----------
+        word : str
+            The word to profile, matched the way :meth:`word_importance` keys its units.
+        agg : {"mean", "sum", "mean_abs", "sum_abs"}
+            How the word's occurrences collapse into one number per class. See
+            :func:`~shapash.explainer.nlp_explanation.aggregate_word_contributions` for what each
+            one does and does not tell you. Mean aggregations also draw the standard deviation
+            across occurrences as error bars.
+        lowercase : bool, optional
+            Case-fold the match. ``None`` (default) defers to the model's tokenizer.
+        sample_indices : list[int], optional
+            Restrict the aggregation to these samples (e.g. only the misclassified ones).
+        title : str, optional
+            Overrides the default, which names the word and the aggregation.
+        width, height : int, optional
+            Figure size in pixels.
+
+        Returns
+        -------
+        plotly.graph_objs.Figure
+
+        Raises
+        ------
+        ValueError
+            If the word does not occur in the batch (or in ``sample_indices``) — an empty chart
+            here is indistinguishable from a word with zero contribution, so it says so instead.
+        """
+        occurrences = self._exp.word_occurrences(word, lowercase=lowercase, sample_indices=sample_indices)
+        if occurrences.empty:
+            scope = " in the selected samples" if sample_indices is not None else ""
+            raise ValueError(f"{word!r} does not occur{scope} in this explanation.")
+        stats = aggregate_word_contributions(occurrences, agg=agg)
+        agg_label = WORD_AGGREGATIONS[agg][0]
+
+        spread = None
+        if WORD_AGGREGATIONS[agg][2] == "mean":
+            values = occurrences["contribution"].abs() if WORD_AGGREGATIONS[agg][1] else occurrences["contribution"]
+            # ddof=0: this is the spread of the occurrences actually observed, not an estimate of a
+            # population — and it keeps a single-occurrence word at 0 rather than NaN.
+            spread = values.groupby(occurrences["class_idx"]).std(ddof=0).sort_index()
+
+        n_occ = len(occurrences) // max(self._exp.n_classes, 1)
+        n_samples = int(occurrences["sample"].nunique())
+        if title is None:
+            title = f"{word!r} — {agg_label} over {n_occ} occurrence(s) in {n_samples} sample(s)"
+        return plot_word_profile(
+            stats,
+            label_names=self._exp.label_names,
+            spread=spread,
+            x_title=f"{agg_label} contribution",
+            title=title,
+            width=width,
+            height=height,
+        )
 
     def confusion(
         self,

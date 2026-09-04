@@ -13,8 +13,10 @@ baseline (see below) — so the output carries whole words, not ``##`` fragments
 
 LIG is a *completion* method: for each class ``c`` the token attributions sum to
 ``logits(x)[c] - logits(baseline)[c]``. We therefore report ``base_values[c] = logits(baseline)[c]``
-so the additive ``base + Σ = total`` summary in ``plot_sentence_highlight`` stays consistent (values
-live in logit space, like the additive SHAP output).
+so the additive ``base + Σ = total`` summary in ``plot_sentence_highlight`` stays consistent. These
+values live in raw logit space — **not** the same space ``NlpShapBackend`` reports: SHAP explains
+the pipeline's softmax probability output, not ``model.logits``, so the two backends' numbers are on
+different scales and are not directly comparable (see ``docs/architecture/explanation-space.md``).
 
 Unlike the SHAP/LIME backends (which wrap a plain text callable), this backend needs the embedding
 module and a logits forward pass, so it consumes a :class:`~shapash.model.base.TextModel` that
@@ -212,6 +214,9 @@ class NlpCaptumLigBackend(NlpBackend):
     # 2017, "Axiomatic Attribution for Deep Networks"): attributions sum exactly to
     # logits(x) - logits(baseline).
     is_additive = True
+    # Attributes model.logits directly (see module docstring) — raw pre-softmax output, not the
+    # probability nlp_shap explains.
+    output_space = "logit"
     # Checked once by NlpBackend.__init__ instead of here — see its docstring.
     requires_model_capabilities = (SupportsCaptumIG,)
 

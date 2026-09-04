@@ -50,6 +50,7 @@ def _make_explanation(
         backend_name="nlp_shap" if is_additive else "nlp_lime",
         is_additive=is_additive,
         reference_kind="distribution" if with_base else "none",
+        output_space="probability",
     )
 
 
@@ -132,14 +133,14 @@ class TestPerInstancePlots(unittest.TestCase):
 
 
 class TestBatchPlots(unittest.TestCase):
-    def test_words_returns_a_figure_titled_with_the_class(self):
-        fig = _make_explanation().plot.words(label_idx=1, n_top=5)
+    def test_word_importance_returns_a_figure_titled_with_the_class(self):
+        fig = _make_explanation().plot.word_importance(label_idx=1, n_top=5)
         self.assertIsInstance(fig, go.Figure)
         self.assertIn("pos", fig.layout.title.text)
 
-    def test_words_forwards_kwargs_to_word_importance(self):
+    def test_word_importance_forwards_kwargs(self):
         explanation = _make_explanation()
-        fig = explanation.plot.words(label_idx=0, n_top=10, exclude_words={"hello"})
+        fig = explanation.plot.word_importance(label_idx=0, n_top=10, exclude_words={"hello"})
         self.assertNotIn("hello", set(fig.data[0].y))
 
     def test_confusion_returns_a_figure(self):
@@ -165,7 +166,7 @@ class TestGuards(unittest.TestCase):
     def test_the_other_plots_stay_available_on_a_non_additive_backend(self):
         explanation = _make_explanation(is_additive=False)
         self.assertIsInstance(explanation.plot.tokens(row=0, label_idx=0), go.Figure)
-        self.assertIsInstance(explanation.plot.words(label_idx=0), go.Figure)
+        self.assertIsInstance(explanation.plot.word_importance(label_idx=0), go.Figure)
 
 
 class TestArtifactIsNeverWritten(unittest.TestCase):
@@ -176,7 +177,7 @@ class TestArtifactIsNeverWritten(unittest.TestCase):
         explanation.plot.tokens(row=0, label_idx=1, max_tokens=1)
         explanation.plot.waterfall(row=1, label_idx=0)
         explanation.plot.sentence(row=0, label_idx=0)
-        explanation.plot.words(label_idx=1, n_top=3)
+        explanation.plot.word_importance(label_idx=1, n_top=3)
         explanation.plot.confusion(normalize="true")
 
         self.assertEqual(explanation.backend_name, before.backend_name)

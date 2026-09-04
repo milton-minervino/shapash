@@ -361,6 +361,7 @@ class NlpExplainer:
                     backend_name=backend_cls.name,
                     is_additive=backend_cls.is_additive,
                     reference_kind=backend_cls.reference_kind,
+                    output_space=backend_cls.output_space,
                 )
                 if cache_path is not None:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)

@@ -104,9 +104,7 @@ def test_st_embed_reproduces_encode_on_long_text(st_model):
 
 
 def test_st_declares_full_capability_surface(st_model):
-    assert has_capabilities(
-        st_model, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG
-    )
+    assert has_capabilities(st_model, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG)
 
 
 def test_st_predict_is_normalised(st_model):
@@ -153,9 +151,7 @@ def test_st_lig_backend_runs(st_model):
 
 
 def test_torch_declares_full_capability_surface(torch_model):
-    assert has_capabilities(
-        torch_model, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG
-    )
+    assert has_capabilities(torch_model, SupportsEmbeddings, SupportsGradients, SupportsCaptumIG)
 
 
 def test_torch_predict_and_embed(torch_model):

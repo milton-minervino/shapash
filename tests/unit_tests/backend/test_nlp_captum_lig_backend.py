@@ -38,6 +38,7 @@ class TestNlpCaptumLigBackend(unittest.TestCase):
     def test_backend_contract_attributes(self):
         self.assertEqual(NlpCaptumLigBackend.reference_kind, "point")
         self.assertTrue(NlpCaptumLigBackend.is_additive)
+        self.assertEqual(NlpCaptumLigBackend.output_space, "logit")
         self.assertEqual(NlpCaptumLigBackend.requires_model_capabilities, (SupportsCaptumIG,))
 
 
@@ -46,9 +47,7 @@ class TestAggregateSubwords(unittest.TestCase):
 
     def test_merges_subwords_and_drops_specials(self):
         tokens = ["[CLS]", "i", "am", "hap", "##py", "[SEP]"]
-        contribs = np.array(
-            [[1.0, 0.0], [2.0, 1.0], [3.0, 2.0], [4.0, 3.0], [5.0, 4.0], [6.0, 5.0]], dtype=float
-        )
+        contribs = np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0], [4.0, 3.0], [5.0, 4.0], [6.0, 5.0]], dtype=float)
         base = np.array([10.0, 20.0])
 
         words, word_contribs, new_base = _aggregate_subwords(tokens, contribs, base)
@@ -107,9 +106,7 @@ class TestAggregateSubwords(unittest.TestCase):
         # *looks* bracket-y ("<odd>") is content unless it's actually in the set.
         tokens = ["<s>", "hi", "<odd>"]
         contribs = np.array([[1.0], [2.0], [3.0]])
-        words, word_contribs, new_base = _aggregate_subwords(
-            tokens, contribs, np.zeros(1), special_tokens={"<s>"}
-        )
+        words, word_contribs, new_base = _aggregate_subwords(tokens, contribs, np.zeros(1), special_tokens={"<s>"})
         self.assertEqual(words, ["hi", "<odd>"])  # "<odd>" kept as content, only "<s>" folded
         np.testing.assert_allclose(new_base, [1.0])
 

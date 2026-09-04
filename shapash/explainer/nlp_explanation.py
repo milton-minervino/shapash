@@ -20,7 +20,7 @@ import zipfile
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
 import pandas as pd
@@ -57,6 +57,132 @@ def select_label_column(values: np.ndarray, label_idx: int) -> np.ndarray:
     ``if values.ndim == 2`` check.
     """
     return values[:, label_idx] if values.ndim == 2 else values
+
+
+# How a word's occurrences collapse into one number per class. Keys are the wire values used by the
+# webapp control and by ``NlpPlotter.word``; the values are (label, uses_absolute, reducer) — the
+# label is UI text, kept beside the definition so a new operation is one entry here rather than an
+# entry here plus a hard-coded option list in the app.
+WORD_AGGREGATIONS: dict[str, tuple[str, bool, str]] = {
+    "mean": ("Mean", False, "mean"),
+    "sum": ("Sum", False, "sum"),
+    "mean_abs": ("Mean |·|", True, "mean"),
+    "sum_abs": ("Sum |·|", True, "sum"),
+}
+
+
+def aggregate_word_contributions(occurrences: pd.DataFrame, agg: str = "mean") -> pd.Series:
+    """Collapse one word's occurrences into a single number per class.
+
+    The four operations answer different questions and are not interchangeable:
+
+    - ``"mean"`` — how the word pushes *on average* wherever it appears. Comparable across words
+      of wildly different frequency; this is what :meth:`NlpExplanation.word_importance` uses.
+    - ``"sum"`` — the word's total pull on the corpus. Frequency counts: a mild word appearing 200
+      times outranks a strong one appearing twice, which is the right ranking for "what is moving
+      this dataset" and the wrong one for "what does this word mean to the model".
+
+      Worth knowing before reaching for it: **a sum tells you nothing a mean does not, for a single
+      word.** Every occurrence contributes to every class, so the occurrence count is identical
+      across classes and ``sum_c == N * mean_c`` for all ``c`` — the per-class profile under
+      ``"sum"`` is the ``"mean"`` profile rescaled by a constant, with the same shape and the same
+      ranking. Frequency only carries information when *different* words with *different* ``N`` are
+      compared, which is :meth:`NlpExplanation.word_importance`'s ``rank_by="sum"``, not this
+      function's per-word use. The webapp's single-word panel therefore offers only the two mean
+      forms; the sums stay here because this is a general aggregator and a caller comparing across
+      words has a legitimate use for them.
+    - ``"mean_abs"`` / ``"sum_abs"`` — *magnitude* regardless of direction. A word that pushes hard
+      toward the class in half its occurrences and hard away in the other half averages to ~0 under
+      ``"mean"`` while being anything but unimportant; the absolute forms surface exactly that word.
+      Their cost is that the sign is gone, so they say "this word matters here" and never "which
+      way" — read them against the signed pair rather than instead of it.
+
+    Parameters
+    ----------
+    occurrences : pd.DataFrame
+        Output of :meth:`NlpExplanation.word_occurrences`.
+    agg : {"mean", "sum", "mean_abs", "sum_abs"}
+        Which operation to apply. See :data:`WORD_AGGREGATIONS`.
+
+    Returns
+    -------
+    pd.Series
+        ``class_idx`` → aggregated contribution, ordered by class index. Empty when the word has
+        no occurrences.
+
+    Raises
+    ------
+    ValueError
+        If ``agg`` is not one of :data:`WORD_AGGREGATIONS`.
+    """
+    if agg not in WORD_AGGREGATIONS:
+        raise ValueError(f"agg={agg!r} is not one of {sorted(WORD_AGGREGATIONS)}.")
+    _, use_abs, reducer = WORD_AGGREGATIONS[agg]
+    if occurrences.empty:
+        return pd.Series(dtype="float64", name=agg, index=pd.Index([], dtype="int64", name="class_idx"))
+
+    values = occurrences["contribution"].abs() if use_abs else occurrences["contribution"]
+    out = values.groupby(occurrences["class_idx"]).agg(reducer).sort_index()
+    out.name = agg
+    out.index.name = "class_idx"
+    return out
+
+
+def rank_word_samples(
+    occurrences: pd.DataFrame,
+    class_idx: int,
+    order: str = "most",
+    n_top: int = 10,
+) -> pd.DataFrame:
+    """Rank the samples containing a word by how much it contributed in each of them.
+
+    Occurrences are summed *within* a sample first, so a text using the word three times is ranked
+    on the word's total pull in that text rather than appearing three times in the list.
+
+    Parameters
+    ----------
+    occurrences : pd.DataFrame
+        Output of :meth:`NlpExplanation.word_occurrences`.
+    class_idx : int
+        Which class's contribution to rank on.
+    order : {"most", "least", "strongest"}
+        ``"most"`` ranks by the most positive contribution, ``"least"`` by the most negative, and
+        ``"strongest"`` by the largest magnitude in either direction.
+    n_top : int
+        How many samples to return.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``sample`` (positional index), ``contribution`` (summed within the sample) and
+        ``n_occurrences``, already ordered and truncated to ``n_top``.
+
+    Raises
+    ------
+    ValueError
+        If ``order`` is not one of the three accepted values.
+    """
+    if order not in {"most", "least", "strongest"}:
+        raise ValueError(f"order={order!r} must be one of 'most', 'least', 'strongest'.")
+    columns = ["sample", "contribution", "n_occurrences"]
+    if occurrences.empty:
+        return pd.DataFrame(columns=columns).astype(
+            {"sample": "int64", "contribution": "float64", "n_occurrences": "int64"}
+        )
+
+    per_class = occurrences[occurrences["class_idx"] == int(class_idx)]
+    if per_class.empty:
+        return pd.DataFrame(columns=columns).astype(
+            {"sample": "int64", "contribution": "float64", "n_occurrences": "int64"}
+        )
+
+    grouped = per_class.groupby("sample")["contribution"].agg(contribution="sum", n_occurrences="size")
+    ranked = grouped.reset_index()
+    if order == "strongest":
+        ranked = ranked.reindex(ranked["contribution"].abs().sort_values(ascending=False).index)
+    else:
+        ranked = ranked.sort_values("contribution", ascending=(order == "least"))
+    return ranked.head(n_top).reset_index(drop=True)
 
 
 @dataclass(frozen=True, eq=False, slots=True)
@@ -139,6 +265,12 @@ class NlpExplanation:
     reference_kind : {"distribution", "statistics", "point", "none"}
         What kind of reference, if any, the contributions are measured against — read
         off the backend at ``explain()`` time. See ``NlpBackend.reference_kind``.
+    output_space : {"probability", "logit"}
+        Which model output the contributions explain — read off the backend at
+        ``explain()`` time. See ``NlpBackend.output_space``. Two backends reporting
+        different spaces are not directly comparable: notably, only ``"probability"``
+        forces the per-token cross-class cancellation that :meth:`word_importance`'s
+        ``label_idx=None`` collapse relies on (see its Notes section).
     """
 
     texts: pd.Series
@@ -153,6 +285,7 @@ class NlpExplanation:
     backend_name: str
     is_additive: bool
     reference_kind: Literal["distribution", "statistics", "point", "none"]
+    output_space: Literal["probability", "logit"]
 
     # ClassVar, not a field: it is a shared constant, not per-explanation data, so it stays out
     # of ``fields()`` — and therefore out of ``__init__``, ``replace()`` and ``save()``.
@@ -221,6 +354,7 @@ class NlpExplanation:
             "backend_name",
             "is_additive",
             "reference_kind",
+            "output_space",
         }
     )
 
@@ -365,7 +499,7 @@ class NlpExplanation:
 
     def word_importance(
         self,
-        label_idx: int,
+        label_idx: int | None,
         n_top: int = 20,
         filter_special: bool = True,
         filter_punctuation: bool = True,
@@ -373,16 +507,23 @@ class NlpExplanation:
         filter_sign: str = "all",
         exclude_words: set[str] | None = None,
         sample_indices: list[int] | None = None,
+        rank_by: str = "mean",
+        min_occurrences: int = 1,
     ) -> pd.Series:
         """Aggregate token contributions by word across all samples for one class.
 
         For each unique (stripped, by default lowercased) token string that appears in
-        the batch, computes the mean contribution across all its occurrences.
+        the batch, computes the mean (or total) contribution across all its occurrences.
+
+        ``rank_by`` chooses the statistic; the ranking is always by its *absolute* value while
+        the returned numbers keep their sign, so a caller's positive/negative filter and a
+        renderer's sign colouring keep working unchanged in either mode.
 
         Parameters
         ----------
-        label_idx : int
-            Index of the class to compute importance for.
+        label_idx : int or None
+            Index of the class to compute importance for. ``None`` aggregates *across* classes:
+            see the "Notes" section, which also explains why the aggregate is a magnitude.
         n_top : int
             Maximum number of words to return, sorted by ``|mean contribution|``.
         filter_special : bool
@@ -414,28 +555,90 @@ class NlpExplanation:
         sample_indices : list[int], optional
             Positional indices of the samples to include in the aggregation.
             When ``None`` (default) all samples are used.
+        rank_by : {"mean", "sum"}
+            Which statistic to compute and rank on.
+
+            ``"mean"`` is the average pull wherever the word appears — "what does this word mean
+            to the model", comparable across words of different frequency. ``"sum"`` is the
+            word's total pull on the corpus, so frequency counts: a mild word appearing 674 times
+            outranks a strong one appearing five times. The two answer different questions and
+            routinely disagree — on a 1000-sample emotion corpus their top-20 lists overlap by
+            about 13 of 20 entries — so neither is a substitute for the other.
+        min_occurrences : int
+            Drop words occurring fewer than this many times *within the aggregated samples*.
+
+            Not cosmetic: a mean over one observation is not a mean, and on real corpora most of
+            the vocabulary is hapax (58% of 3185 words on the emotion demo), so an unfiltered
+            ``"mean"`` ranking is dominated by single high-variance attributions rather than by
+            stable model behaviour. Counted after ``sample_indices`` scoping, so a threshold means
+            the same thing on a selection as on the whole batch — which also means a small
+            selection plus a high threshold legitimately returns nothing.
 
         Returns
         -------
         pd.Series
-            Word → mean contribution, sorted by absolute value descending.
+            Word → signed contribution (mean or total, per ``rank_by``), sorted by absolute value
+            descending. ``.name`` carries the ``rank_by`` that produced it, suffixed with
+            ``"_across_classes"`` when ``label_idx`` is ``None``.
+
+        Raises
+        ------
+        ValueError
+            If ``rank_by`` is neither ``"mean"`` nor ``"sum"``.
+
+        Notes
+        -----
+        **Aggregating across classes** (``label_idx=None``). The per-class statistics are computed
+        exactly as above, then collapsed to ``max_c |stat_c(word)|`` — the strongest pull the word
+        exerts on *any* single class.
+
+        The collapse has to discard sign, because a signed average across classes is identically
+        zero: an explainer of a normalised multiclass output distributes each token's attribution
+        so that the classes cancel (measured on the 1000-sample emotion demo, the largest per-token
+        sum across its six classes is 1.3e-7). A "mean over classes" chart would be a chart of
+        zeros.
+
+        ``max`` rather than ``mean`` of the magnitudes, for two reasons. It keeps the number
+        comparable with the single-class view — a word reading ``0.909`` here reads ``+0.909``
+        under the class that drives it, rather than ``0.303`` under an averaging that divides by
+        six. And under the same cancellation, ``mean_c`` is just ``max_c`` scaled by roughly
+        ``2 / n_classes`` whenever one class dominates, so it carries no information the max does
+        not (identical top-20 on the emotion demo) while being harder to read.
+
+        Every returned value is therefore ``>= 0``, and ``filter_sign="negative"`` legitimately
+        returns nothing. Which class the magnitude came from is not reported here: reach it by
+        selecting the word in :meth:`word_occurrences` /
+        :meth:`~shapash.explainer.nlp_plotter.NlpPlotter.word_profile`, which shows the full
+        per-class profile.
         """
+        if rank_by not in ("mean", "sum"):
+            raise ValueError(f"rank_by={rank_by!r} must be 'mean' or 'sum'.")
 
         fold = self.resolve_lowercase(lowercase)
 
         def _key(token: str) -> str:
             return token.lower() if fold else token
 
+        across_classes = label_idx is None
         _exclude: set[str] = {_key(w) for w in exclude_words} if exclude_words else set()
-        word_contribs: dict[str, list[float]] = {}
+        # One float per occurrence for a single class; one row of per-class floats when collapsing
+        # across classes, since the collapse has to happen after the per-class statistic.
+        word_contribs: dict[str, list[Any]] = {}
         iter_data = (
             ((self.token_strings[i], self.values[i]) for i in sample_indices)
             if sample_indices is not None
             else zip(self.token_strings, self.values, strict=True)
         )
         for tokens, vals in iter_data:
-            vals_1d: np.ndarray = select_label_column(vals, label_idx)
-            for tok, val in zip(tokens, vals_1d, strict=True):
+            per_token: np.ndarray
+            if label_idx is None:
+                arr = np.asarray(vals, dtype=float)
+                # A single-output backend already gives one column; give it an explicit class axis
+                # so the collapse below is the same code either way.
+                per_token = arr if arr.ndim == 2 else arr[:, None]
+            else:
+                per_token = select_label_column(vals, label_idx)
+            for tok, val in zip(tokens, per_token, strict=True):
                 tok_clean = tok.strip()
                 if filter_special and self._SPECIAL_RE.match(tok_clean):
                     continue
@@ -446,9 +649,18 @@ class NlpExplanation:
                     continue
                 if key not in word_contribs:
                     word_contribs[key] = []
-                word_contribs[key].append(float(val))
+                word_contribs[key].append(val if across_classes else float(val))
 
-        importance = pd.Series({w: float(np.mean(vs)) for w, vs in word_contribs.items()})
+        reduce = np.mean if rank_by == "mean" else np.sum
+        kept = {w: vs for w, vs in word_contribs.items() if len(vs) >= min_occurrences}
+        if across_classes:
+            # Per-class statistic first, then the magnitude of its strongest class — see Notes.
+            stat = {w: float(np.abs(reduce(np.stack(vs), axis=0)).max()) for w, vs in kept.items()}
+            name = f"{rank_by}_across_classes"
+        else:
+            stat = {w: float(reduce(vs)) for w, vs in kept.items()}
+            name = rank_by
+        importance = pd.Series(stat, dtype="float64", name=name)
         importance = importance.reindex(importance.abs().sort_values(ascending=False).index)
 
         if filter_sign == "positive":
@@ -457,6 +669,204 @@ class NlpExplanation:
             importance = importance[importance < 0]
 
         return importance.head(n_top)
+
+    def word_counts(
+        self,
+        lowercase: bool | None = None,
+        filter_special: bool = True,
+        filter_punctuation: bool = True,
+        sample_indices: list[int] | None = None,
+    ) -> pd.DataFrame:
+        """How often each word unit occurs, and in how many samples.
+
+        The frequency half of every word-level view: it orders the word picker, labels its
+        options, and is the count :meth:`word_importance`'s ``min_occurrences`` threshold is
+        applied to. Keyed exactly as :meth:`word_importance` aggregates, so a count shown beside
+        a word is the count that word's aggregate was computed over.
+
+        Parameters
+        ----------
+        lowercase : bool, optional
+            Case-fold the units. ``None`` (default) defers to :meth:`resolve_lowercase`.
+        filter_special : bool
+            Drop empty strings, ``[CLS]``/``[SEP]``-style bracket tokens and ``##subword`` prefixes.
+        filter_punctuation : bool
+            Drop units made entirely of punctuation.
+        sample_indices : list[int], optional
+            Count within these samples only. ``None`` (default) counts the whole batch.
+
+        Returns
+        -------
+        pd.DataFrame
+            Indexed by word (index name ``"word"``), with columns ``n_occurrences`` and
+            ``n_samples``, sorted by ``n_occurrences`` descending then alphabetically.
+
+        Notes
+        -----
+        The two columns differ only for words used more than once in a single text, which is why
+        both are reported: ``n_occurrences`` is the aggregation's denominator, while ``n_samples``
+        counts *independent* observations and is the more honest measure of how much evidence sits
+        behind a mean. They track each other closely in practice (883 vs 859 words clear a
+        threshold of 3 on the emotion demo), so the picker uses occurrences.
+        """
+        fold = self.resolve_lowercase(lowercase)
+        positions = range(len(self.token_strings)) if sample_indices is None else sample_indices
+
+        occurrences: dict[str, int] = {}
+        samples: dict[str, int] = {}
+        for i in positions:
+            seen: set[str] = set()
+            for tok in self.token_strings[i]:
+                tok_clean = tok.strip()
+                if not tok_clean:
+                    continue
+                if filter_special and self._SPECIAL_RE.match(tok_clean):
+                    continue
+                if filter_punctuation and is_punctuation(tok_clean):
+                    continue
+                key = tok_clean.lower() if fold else tok_clean
+                occurrences[key] = occurrences.get(key, 0) + 1
+                seen.add(key)
+            for key in seen:
+                samples[key] = samples.get(key, 0) + 1
+
+        frame = pd.DataFrame(
+            {
+                "n_occurrences": pd.Series(occurrences, dtype="int64"),
+                "n_samples": pd.Series(samples, dtype="int64"),
+            }
+        )
+        frame.index.name = "word"
+        if frame.empty:
+            return frame
+        # Alphabetical within a frequency tier, so the order is total and stable rather than
+        # dict-insertion order among the (many) words sharing a count.
+        return frame.sort_values(["n_occurrences", "word"], ascending=[False, True])
+
+    def vocabulary(
+        self,
+        lowercase: bool | None = None,
+        filter_special: bool = True,
+        filter_punctuation: bool = True,
+        sample_indices: list[int] | None = None,
+    ) -> list[str]:
+        """The batch's unique word units, keyed exactly as :meth:`word_importance` aggregates them.
+
+        One source of truth for "which words can be talked about": every UI that lets a user *pick*
+        a word (the exclusion multi-select, the scatter's word colouring, the single-word profile)
+        must offer the same strings :meth:`word_importance` and :meth:`word_occurrences` match on,
+        or a pick silently finds nothing.
+
+        Parameters
+        ----------
+        lowercase : bool, optional
+            Case-fold the units. ``None`` (default) defers to :meth:`resolve_lowercase`.
+        filter_special : bool
+            Drop empty strings, ``[CLS]``/``[SEP]``-style bracket tokens and ``##subword`` prefixes.
+        filter_punctuation : bool
+            Drop units made entirely of punctuation.
+        sample_indices : list[int], optional
+            Restrict to these samples. ``None`` (default) uses the whole batch.
+
+        Returns
+        -------
+        list[str]
+            Alphabetically sorted unique units. For frequency order, or for the counts
+            themselves, use :meth:`word_counts` — this is its index.
+        """
+        counts = self.word_counts(
+            lowercase=lowercase,
+            filter_special=filter_special,
+            filter_punctuation=filter_punctuation,
+            sample_indices=sample_indices,
+        )
+        return sorted(counts.index)
+
+    def word_occurrences(
+        self,
+        word: str,
+        lowercase: bool | None = None,
+        sample_indices: list[int] | None = None,
+    ) -> pd.DataFrame:
+        """Every occurrence of one word in the batch, with its contribution to every class.
+
+        The raw material behind the single-word profile: :meth:`word_importance` ranks the whole
+        vocabulary but collapses each word to one number for one class, which answers "which words
+        matter" and not "what does *this* word do". This returns the un-aggregated occurrences so a
+        caller can pick the aggregation (see :func:`aggregate_word_contributions`) and drill from the
+        aggregate back to the samples it came from (see :func:`rank_word_samples`) without
+        re-scanning the batch.
+
+        Parameters
+        ----------
+        word : str
+            The word to look for. Matched against the same normalised key
+            :meth:`word_importance` aggregates on, so a label read off a word-importance bar always
+            finds its occurrences here.
+        lowercase : bool, optional
+            Case-fold both the query and the tokens before matching. ``None`` (default) derives the
+            answer from the model's own tokenizer via :meth:`resolve_lowercase`.
+        sample_indices : list[int], optional
+            Positional indices of the samples to search. ``None`` (default) searches all of them.
+
+        Returns
+        -------
+        pd.DataFrame
+            Tidy, one row per (occurrence, class), with columns:
+
+            ``sample``
+                Positional index of the sample the occurrence is in.
+            ``token_pos``
+                Index of the token within that sample.
+            ``token``
+                The token as it appears in the text (original casing, stripped), so a folded
+                match still shows which spelling occurred.
+            ``class_idx``
+                Output-column index, in :attr:`label_names` order.
+            ``contribution``
+                That token's contribution to that class.
+
+            Empty (but correctly typed and columned) when the word never occurs.
+
+        Examples
+        --------
+        >>> occ = explanation.word_occurrences("terrible")
+        >>> aggregate_word_contributions(occ, agg="mean")
+        class_idx
+        0   -0.184
+        1    0.211
+        Name: mean, dtype: float64
+        """
+        fold = self.resolve_lowercase(lowercase)
+        target = word.strip().lower() if fold else word.strip()
+        n_classes = self.n_classes
+        positions = range(len(self.token_strings)) if sample_indices is None else sample_indices
+
+        records: list[tuple[int, int, str, int, float]] = []
+        for i in positions:
+            tokens = self.token_strings[i]
+            vals = self.values[i]
+            for pos, tok in enumerate(tokens):
+                tok_clean = tok.strip()
+                if (tok_clean.lower() if fold else tok_clean) != target:
+                    continue
+                row_vals = vals[pos] if vals.ndim == 2 else [vals[pos]]
+                for class_idx in range(n_classes):
+                    records.append((int(i), pos, tok_clean, class_idx, float(row_vals[class_idx])))
+
+        frame = pd.DataFrame(records, columns=["sample", "token_pos", "token", "class_idx", "contribution"])
+        # Build the dtypes explicitly: an empty frame from an empty record list comes back all-object,
+        # which would make a downstream ``.abs()`` or a numeric groupby raise instead of returning an
+        # empty result — and "this word never occurs" is a normal state in the webapp, not an error.
+        return frame.astype(
+            {
+                "sample": "int64",
+                "token_pos": "int64",
+                "token": "object",
+                "class_idx": "int64",
+                "contribution": "float64",
+            }
+        )
 
     def confusion_matrix(self) -> np.ndarray:
         """Counts of ground truth against predictions, in :attr:`label_to_idx` order.
@@ -523,6 +933,7 @@ class NlpExplanation:
             "backend_name": self.backend_name,
             "is_additive": self.is_additive,
             "reference_kind": self.reference_kind,
+            "output_space": self.output_space,
             "label_names": self.label_names,
             "folds_case": self.folds_case,
             # Authoritative counts, not re-derived from the tidy tables on load: a sample with
@@ -605,6 +1016,10 @@ class NlpExplanation:
             backend_name=meta["backend_name"],
             is_additive=meta["is_additive"],
             reference_kind=meta["reference_kind"],
+            # Absent on a file saved before this field existed. "nlp_captum_lig" has always
+            # explained raw logits, everything else probabilities.
+            output_space=meta.get("output_space")
+            or ("logit" if meta["backend_name"] == "nlp_captum_lig" else "probability"),
         )
         return explanation, scatter_xy
 

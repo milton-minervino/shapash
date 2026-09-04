@@ -37,16 +37,18 @@ class TestIsPunctuation(unittest.TestCase):
 
 
 class TestBackendContractAttributes(unittest.TestCase):
-    """``reference_kind`` / ``is_additive`` / `requires_model_capabilities`` (A9 / A11)."""
+    """``reference_kind`` / ``is_additive`` / ``output_space`` / `requires_model_capabilities`` (A9 / A11)."""
 
     def test_nlp_shap_backend(self):
         self.assertEqual(NlpShapBackend.reference_kind, "none")
         self.assertTrue(NlpShapBackend.is_additive)
+        self.assertEqual(NlpShapBackend.output_space, "probability")
         self.assertEqual(NlpShapBackend.requires_model_capabilities, ())
 
     def test_nlp_lime_backend(self):
         self.assertEqual(NlpLimeBackend.reference_kind, "none")
         self.assertFalse(NlpLimeBackend.is_additive)
+        self.assertEqual(NlpLimeBackend.output_space, "probability")
         self.assertEqual(NlpLimeBackend.requires_model_capabilities, ())
 
 

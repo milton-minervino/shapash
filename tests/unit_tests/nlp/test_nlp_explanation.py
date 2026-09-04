@@ -56,6 +56,7 @@ def _make_explanation(values_ndim: int, with_base: bool, with_true: bool, with_p
         backend_name="nlp_shap",
         is_additive=True,
         reference_kind="none",
+        output_space="probability",
     )
 
 
@@ -98,6 +99,7 @@ class TestNlpExplanationRoundTrip(unittest.TestCase):
         self.assertEqual(loaded.backend_name, expl.backend_name)
         self.assertEqual(loaded.is_additive, expl.is_additive)
         self.assertEqual(loaded.reference_kind, expl.reference_kind)
+        self.assertEqual(loaded.output_space, expl.output_space)
         self.assertEqual(loaded.label_names, expl.label_names)
         self.assertEqual(loaded.folds_case, expl.folds_case)
 
@@ -132,6 +134,7 @@ class TestNlpExplanationRoundTrip(unittest.TestCase):
         self.assertEqual(meta["backend_name"], "nlp_shap")
         self.assertTrue(meta["is_additive"])
         self.assertEqual(meta["reference_kind"], "none")
+        self.assertEqual(meta["output_space"], "probability")
         self.assertEqual(meta["label_names"], ["neg", "pos"])
         self.assertEqual(meta["n_samples"], 3)
         self.assertIn("shapash_version", meta)
@@ -157,6 +160,33 @@ class TestNlpExplanationRoundTrip(unittest.TestCase):
             NlpExplanation.load(bad_path)
         self.assertIn("format_version", str(ctx.exception))
         self.assertIn("999", str(ctx.exception))
+
+    def _resave_without_output_space(self, expl: NlpExplanation) -> Path:
+        """A file as an earlier shapash (pre-``output_space``) would have written it."""
+        path = self.tmp_path / "legacy.zip"
+        expl.save(path)
+        with zipfile.ZipFile(path) as zin:
+            meta = json.loads(zin.read("meta.json"))
+            del meta["output_space"]
+            members = {item.filename: zin.read(item.filename) for item in zin.infolist()}
+        members["meta.json"] = json.dumps(meta).encode()
+        legacy_path = self.tmp_path / "legacy_no_output_space.zip"
+        with zipfile.ZipFile(legacy_path, "w") as zout:
+            for name, data in members.items():
+                zout.writestr(name, data)
+        return legacy_path
+
+    def test_legacy_file_without_output_space_defaults_by_backend(self):
+        # nlp_captum_lig has always explained raw logits, everything else probabilities — a single
+        # global default would mislabel one of the two. See docs/architecture/explanation-space.md §5.3.
+        shap_expl = _make_explanation(values_ndim=2, with_base=True, with_true=True, with_prob=True)
+        lig_expl = replace(shap_expl, backend_name="nlp_captum_lig")
+
+        loaded_shap, _ = NlpExplanation.load(self._resave_without_output_space(shap_expl))
+        loaded_lig, _ = NlpExplanation.load(self._resave_without_output_space(lig_expl))
+
+        self.assertEqual(loaded_shap.output_space, "probability")
+        self.assertEqual(loaded_lig.output_space, "logit")
 
 
 if __name__ == "__main__":

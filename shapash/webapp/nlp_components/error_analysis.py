@@ -19,12 +19,11 @@ from __future__ import annotations
 
 import dash_bootstrap_components as dbc
 import numpy as np
-import plotly.graph_objs as go
 from dash import Input, Output, callback_context, dcc, html
 from dash.exceptions import PreventUpdate
 
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
-from shapash.plots.plot_word_importance import plot_word_importance
+from shapash.plots.plot_word_importance import empty_word_figure, plot_word_importance
 from shapash.webapp.nlp_components.base import CAP_GROUND_TRUTH, WebappComponent
 
 _NORMALIZE_OPTIONS: list[dcc.RadioItems.Options] = [
@@ -49,19 +48,6 @@ def _cell_from_click(click_data: dict | None, name_to_idx: dict[str, int]) -> tu
     if point.get("x") in name_to_idx and point.get("y") in name_to_idx:
         return name_to_idx[point["x"]], name_to_idx[point["y"]]
     return None
-
-
-def _empty_word_fig(message: str) -> go.Figure:
-    """Placeholder figure with a centred hint, for the per-cell word charts before a cell is picked."""
-    fig = go.Figure()
-    fig.add_annotation(text=message, showarrow=False, font=dict(color="#888888"), xref="paper", yref="paper")
-    fig.update_layout(
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        plot_bgcolor="white",
-        margin=dict(l=20, r=20, t=20, b=20),
-    )
-    return fig
 
 
 class ErrorAnalysisComponent(WebappComponent):
@@ -225,19 +211,37 @@ class ErrorAnalysisComponent(WebappComponent):
         )
         def update_error_word_charts(error_cell):
             if not error_cell:
-                empty = _empty_word_fig("Click a confusion-matrix cell to see the words behind those errors.")
+                empty = empty_word_figure("Click a confusion-matrix cell to see the words behind those errors.")
                 return empty, empty, "Click a cell to see the words behind those errors."
             pred_i, true_i, indices = error_cell["pred"], error_cell["true"], error_cell["indices"]
             pred_name, true_name = label_names[pred_i], label_names[true_i]
             if not indices:
-                empty = _empty_word_fig("No samples for this (predicted, true) pair.")
+                empty = empty_word_figure("No samples for this (predicted, true) pair.")
                 return empty, empty, f"predicted {pred_name} · true {true_name}: 0 samples"
             wi_pred = explanation.word_importance(label_idx=pred_i, n_top=15, sample_indices=indices)
             wi_true = explanation.word_importance(label_idx=true_i, n_top=15, sample_indices=indices)
+            # Counts within the clicked cell, not the corpus — the number that matters here is how
+            # much evidence sits behind a word *in this error group*, which is often very little.
+            counts = explanation.word_counts(sample_indices=indices)["n_occurrences"]
+            # show_values=False: these two sit side by side in half a column each, where outside
+            # value labels would cost horizontal room the word labels need more. The magnitudes
+            # move to the hover instead, alongside the counts.
             fig_pred = plot_word_importance(
-                wi_pred, title=f"Words toward predicted: {pred_name}", width=None, height=None
+                wi_pred,
+                title=f"Words toward predicted: {pred_name}",
+                width=None,
+                height=None,
+                show_values=False,
+                counts=counts,
             )
-            fig_true = plot_word_importance(wi_true, title=f"Words toward true: {true_name}", width=None, height=None)
+            fig_true = plot_word_importance(
+                wi_true,
+                title=f"Words toward true: {true_name}",
+                width=None,
+                height=None,
+                show_values=False,
+                counts=counts,
+            )
             fig_pred.layout.height = None
             fig_true.layout.height = None
             caption = f"predicted {pred_name} · true {true_name}: {len(indices)} sample(s)"

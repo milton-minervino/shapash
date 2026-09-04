@@ -23,7 +23,12 @@ from shapash.backend.nlp_shap_backend import NlpShapBackend
 from shapash.compute.generators import AblationFlipGenerator, HotFlipGenerator
 from shapash.compute.retrieval import Neighbor
 from shapash.explainer.nlp_explainer import NlpExplainer
-from shapash.explainer.nlp_explanation import NlpExplanation
+from shapash.explainer.nlp_explanation import (
+    WORD_AGGREGATIONS,
+    NlpExplanation,
+    aggregate_word_contributions,
+    rank_word_samples,
+)
 from shapash.model.base import SupportsEmbeddings, SupportsGradients, SupportsTokenization, TextModel
 from shapash.plots.plot_confusion_matrix import plot_confusion_matrix
 from shapash.plots.plot_noise_matrix import plot_noise_matrix
@@ -31,7 +36,10 @@ from shapash.plots.plot_sentence_highlight import plot_sentence_highlight
 from shapash.plots.plot_token_highlight import plot_token_highlight
 from shapash.plots.plot_waterfall import plot_waterfall
 from shapash.plots.plot_word_importance import plot_word_importance
-from shapash.webapp.nlp_app import NlpWebApp, _compose_selection
+from shapash.plots.plot_word_profile import plot_word_profile
+from shapash.webapp.nlp_app import NlpWebApp
+from shapash.webapp.nlp_components import compose_selection as _compose_selection
+from shapash.webapp.nlp_components import error_positions
 from shapash.webapp.nlp_components.error_analysis import ErrorAnalysisComponent, _cell_from_click
 
 LABEL_NAMES = ["sadness", "joy", "love", "anger", "fear", "surprise"]
@@ -71,6 +79,7 @@ def _make_explanation(
     backend_name: str = "nlp_shap",
     is_additive: bool = True,
     reference_kind: str = "none",
+    output_space: str = "probability",
 ) -> NlpExplanation:
     """Synthetic ``NlpExplanation`` for 3 samples, 6 classes — the ``explain()`` return value."""
     texts = _make_texts() if texts is None else texts
@@ -80,7 +89,9 @@ def _make_explanation(
         token_strings=token_strings,
         values=values,
         base_values=base_values,
-        y_pred=(pd.Series(["joy", "sadness", "joy"], index=texts.index, name="prediction") if y_pred is None else y_pred),
+        y_pred=(
+            pd.Series(["joy", "sadness", "joy"], index=texts.index, name="prediction") if y_pred is None else y_pred
+        ),
         y_prob=y_prob,
         y_true=y_true,
         label_names=label_names,
@@ -88,6 +99,7 @@ def _make_explanation(
         backend_name=backend_name,
         is_additive=is_additive,
         reference_kind=reference_kind,
+        output_space=output_space,
     )
 
 
@@ -113,6 +125,7 @@ def _minimal_explanation(
         backend_name="nlp_shap",
         is_additive=True,
         reference_kind="none",
+        output_space="probability",
     )
 
 
@@ -703,6 +716,7 @@ def _projection_explanation(texts: pd.Series) -> NlpExplanation:
         backend_name="test",
         is_additive=True,
         reference_kind="none",
+        output_space="probability",
     )
 
 
@@ -954,12 +968,19 @@ class TestNlpWebApp(unittest.TestCase):
     def test_class_selector_options(self):
         # Class selector is now two independent dropdowns: "local-class-selector" (Sentence
         # Highlight / Waterfall) and "global-class-selector" (Word Importance / Embeddings).
-        for dropdown_id in ("local-class-selector", "global-class-selector"):
-            dropdown = self._find_component(self.webapp.app.layout, dropdown_id)
-            self.assertIsNotNone(dropdown, f"{dropdown_id} dropdown not found in layout")
-            self.assertEqual(len(dropdown.options), N_CLASSES)
-            labels = [opt["label"] for opt in dropdown.options]
-            self.assertEqual(labels, LABEL_NAMES)
+        # Only the global one offers the cross-class overview — a single sample's highlight has no
+        # such aggregate.
+        local = self._find_component(self.webapp.app.layout, "local-class-selector")
+        self.assertIsNotNone(local, "local-class-selector dropdown not found in layout")
+        self.assertEqual([opt["label"] for opt in local.options], LABEL_NAMES)
+
+        glob = self._find_component(self.webapp.app.layout, "global-class-selector")
+        self.assertIsNotNone(glob, "global-class-selector dropdown not found in layout")
+        self.assertEqual(len(glob.options), N_CLASSES + 1)
+        self.assertEqual([opt["label"] for opt in glob.options], ["All classes", *LABEL_NAMES])
+        # Its value must never collide with a real class index.
+        self.assertEqual(glob.options[0]["value"], "all")
+        self.assertEqual([opt["value"] for opt in glob.options[1:]], list(range(N_CLASSES)))
 
     def test_local_class_selector_defaults_to_predicted_class(self):
         # Defaults to the predicted class of the initially selected row (row 0).
@@ -985,7 +1006,7 @@ class TestNlpWebApp(unittest.TestCase):
 
     def test_control_ids_present(self):
         ids = self._collect_ids(self.webapp.app.layout)
-        self.assertIn("topk-slider", ids)
+        self.assertIn("topk-input", ids)
         self.assertIn("sign-filter", ids)
         self.assertIn("word-filter", ids)
 
@@ -1158,6 +1179,599 @@ class TestComposeSelection(unittest.TestCase):
 
     def test_empty_intersection_is_empty_list(self):
         self.assertEqual(_compose_selection([1, 2], None, {8, 9}), [])
+
+
+class TestErrorPositions(unittest.TestCase):
+    """The shared definition of "a model error" every errors-scoped panel filters on."""
+
+    def test_none_without_ground_truth(self):
+        self.assertIsNone(error_positions(_make_explanation()))
+
+    def test_compares_as_strings(self):
+        texts = _make_texts()
+        explanation = _make_explanation(y_true=pd.Series(["joy", "joy", "joy"], index=texts.index))
+        # y_pred is ["joy", "sadness", "joy"], so only the middle row disagrees.
+        self.assertEqual(error_positions(explanation), {1})
+
+
+# ---------------------------------------------------------------------------
+# Single-word profile: word_occurrences / vocabulary / aggregators / plot / plotter
+# ---------------------------------------------------------------------------
+
+
+def _profile_explanation(folds_case=True):
+    """Three samples, two classes, with 'happy' appearing in three of them (twice in one)."""
+    token_strings = [
+        ["[CLS]", "so", "happy", "today", "!"],
+        ["Happy", "and", "happy", "again"],
+        ["not", "happy", "at", "all"],
+        ["nothing", "here"],
+    ]
+    values = [
+        np.array([[0.0, 0.0], [0.1, -0.1], [0.4, -0.4], [0.05, -0.05], [0.0, 0.0]]),
+        np.array([[0.2, -0.2], [0.0, 0.0], [0.1, -0.1], [0.0, 0.0]]),
+        np.array([[-0.1, 0.1], [-0.6, 0.6], [0.0, 0.0], [0.0, 0.0]]),
+        np.array([[0.0, 0.0], [0.0, 0.0]]),
+    ]
+    texts = pd.Series(["so happy today !", "Happy and happy again", "not happy at all", "nothing here"])
+    return NlpExplanation(
+        texts=texts,
+        token_strings=token_strings,
+        values=values,
+        base_values=None,
+        y_pred=pd.Series(["pos", "pos", "neg", "neg"], index=texts.index, name="prediction"),
+        y_prob=None,
+        y_true=pd.Series(["pos", "neg", "neg", "neg"], index=texts.index, name="ground_truth"),
+        label_names=["pos", "neg"],
+        folds_case=folds_case,
+        backend_name="nlp_shap",
+        is_additive=True,
+        reference_kind="none",
+        output_space="probability",
+    )
+
+
+class TestVocabulary(unittest.TestCase):
+    def test_filters_special_and_punctuation_and_folds(self):
+        vocab = _profile_explanation().vocabulary()
+        self.assertNotIn("[CLS]", vocab)
+        self.assertNotIn("!", vocab)
+        # Folded: "Happy" and "happy" collapse to one entry.
+        self.assertIn("happy", vocab)
+        self.assertNotIn("Happy", vocab)
+
+    def test_keeps_case_when_model_does_not_fold(self):
+        vocab = _profile_explanation(folds_case=False).vocabulary()
+        self.assertIn("Happy", vocab)
+        self.assertIn("happy", vocab)
+
+    def test_sorted_and_unique(self):
+        vocab = _profile_explanation().vocabulary()
+        self.assertEqual(vocab, sorted(set(vocab)))
+
+    def test_offers_exactly_what_word_importance_ranks(self):
+        # The contract the pickers rely on: every unit offered has occurrences to show.
+        explanation = _profile_explanation()
+        for word in explanation.vocabulary():
+            self.assertFalse(explanation.word_occurrences(word).empty, word)
+
+    def test_can_keep_punctuation_and_special(self):
+        vocab = _profile_explanation().vocabulary(filter_special=False, filter_punctuation=False)
+        self.assertIn("[cls]", vocab)
+        self.assertIn("!", vocab)
+
+
+class TestWordImportanceRanking(unittest.TestCase):
+    """``rank_by`` + ``min_occurrences``: ordering criteria that never touch the reported sign."""
+
+    def setUp(self):
+        # "rare" appears once with a large pull; "common" appears four times with a small one.
+        # Under |mean| rare wins; under |sum| common wins (4 x 0.3 = 1.2 > 0.9).
+        token_strings = [
+            ["rare", "common"],
+            ["common"],
+            ["common", "common"],
+            ["mild"],
+        ]
+        values = [
+            np.array([[0.9], [0.3]]),
+            np.array([[0.3]]),
+            np.array([[0.3], [0.3]]),
+            np.array([[-0.5]]),
+        ]
+        self.explanation = _minimal_explanation(token_strings, values, None)
+
+    def test_mean_is_the_default_and_unchanged(self):
+        imp = self.explanation.word_importance(label_idx=0)
+        self.assertEqual(imp.index[0], "rare")
+        self.assertAlmostEqual(imp["common"], 0.3)
+
+    def test_sum_reranks_by_total_mass(self):
+        imp = self.explanation.word_importance(label_idx=0, rank_by="sum")
+        self.assertEqual(imp.index[0], "common")
+        self.assertAlmostEqual(imp["common"], 1.2)
+
+    def test_series_name_records_the_statistic(self):
+        self.assertEqual(self.explanation.word_importance(label_idx=0).name, "mean")
+        self.assertEqual(self.explanation.word_importance(label_idx=0, rank_by="sum").name, "sum")
+
+    def test_ranking_is_absolute_but_values_stay_signed(self):
+        # "mild" is negative and must survive ranking, keeping its sign for the sign filter and
+        # for the renderer's red/blue colouring.
+        for rank_by in ("mean", "sum"):
+            imp = self.explanation.word_importance(label_idx=0, rank_by=rank_by)
+            self.assertLess(imp["mild"], 0)
+
+    def test_sign_filter_works_in_both_modes(self):
+        for rank_by in ("mean", "sum"):
+            pos = self.explanation.word_importance(label_idx=0, rank_by=rank_by, filter_sign="positive")
+            neg = self.explanation.word_importance(label_idx=0, rank_by=rank_by, filter_sign="negative")
+            self.assertNotIn("mild", pos.index)
+            self.assertEqual(list(neg.index), ["mild"])
+
+    def test_min_occurrences_drops_rare_words(self):
+        imp = self.explanation.word_importance(label_idx=0, min_occurrences=2)
+        self.assertEqual(list(imp.index), ["common"])
+
+    def test_min_occurrences_of_one_is_no_filter(self):
+        self.assertEqual(
+            set(self.explanation.word_importance(label_idx=0, min_occurrences=1).index),
+            {"rare", "common", "mild"},
+        )
+
+    def test_min_occurrences_counts_within_the_selection(self):
+        # "common" occurs 4x across the batch but only once in sample 1, so a floor of 2 must
+        # exclude it there — otherwise a threshold would mean something different per scope.
+        imp = self.explanation.word_importance(label_idx=0, sample_indices=[1], min_occurrences=2)
+        self.assertTrue(imp.empty)
+        self.assertEqual(
+            list(self.explanation.word_importance(label_idx=0, sample_indices=[2], min_occurrences=2).index),
+            ["common"],
+        )
+
+    def test_impossible_floor_returns_an_empty_series_not_an_error(self):
+        imp = self.explanation.word_importance(label_idx=0, min_occurrences=999)
+        self.assertTrue(imp.empty)
+        self.assertEqual(imp.dtype, np.float64)
+
+    def test_unknown_rank_by_raises(self):
+        with self.assertRaisesRegex(ValueError, "must be 'mean' or 'sum'"):
+            self.explanation.word_importance(label_idx=0, rank_by="median")
+
+    def test_plotter_labels_the_axis_for_the_statistic(self):
+        self.assertEqual(
+            self.explanation.plot.word_importance(label_idx=0, rank_by="sum").layout.xaxis.title.text,
+            "Total SHAP contribution",
+        )
+        self.assertEqual(
+            self.explanation.plot.word_importance(label_idx=0).layout.xaxis.title.text,
+            "Mean SHAP contribution",
+        )
+
+    def test_plotter_hover_counts_match_the_scope_it_ranked(self):
+        # The plotter forwards only the keying arguments to word_counts, so a count on a bar must
+        # be the count over the *same* samples the aggregate was taken over.
+        fig = self.explanation.plot.word_importance(label_idx=0, sample_indices=[2])
+        counts = self.explanation.word_counts(sample_indices=[2])["n_occurrences"]
+        drawn = list(fig.data[0].y)
+        self.assertEqual([int(c[0]) for c in fig.data[0].customdata], [int(counts[w]) for w in drawn])
+
+
+class TestWordImportanceAcrossClasses(unittest.TestCase):
+    """``label_idx=None``: one ranking spanning every class, on magnitudes."""
+
+    @staticmethod
+    def _three_class():
+        # "alpha" is decisive for class c only; "beta" is mild and spread. Three classes so max
+        # and mean over classes are actually distinguishable (with two they coincide).
+        texts = pd.Series(["alpha beta", "alpha beta"])
+        rows = np.array([[-0.3, -0.3, 0.6], [0.1, -0.2, 0.1]])
+        return NlpExplanation(
+            texts=texts,
+            token_strings=[["alpha", "beta"], ["alpha", "beta"]],
+            values=[rows, rows],
+            base_values=None,
+            y_pred=pd.Series(["a", "a"], index=texts.index, name="prediction"),
+            y_prob=None,
+            y_true=None,
+            label_names=["a", "b", "c"],
+            folds_case=True,
+            backend_name="nlp_shap",
+            is_additive=True,
+            reference_kind="none",
+            output_space="probability",
+        )
+
+    def test_value_is_the_strongest_classs_magnitude(self):
+        # Not the mean over classes, which would read 0.4 and 0.133 — smaller than any real
+        # contribution and matching nothing the single-class views show.
+        self.assertEqual(self._three_class().word_importance(label_idx=None).to_dict(), {"alpha": 0.6, "beta": 0.2})
+
+    def test_it_matches_what_the_driving_class_shows(self):
+        exp = self._three_class()
+        self.assertEqual(exp.word_importance(label_idx=None)["alpha"], abs(exp.word_importance(label_idx=2)["alpha"]))
+
+    def test_signed_averaging_across_classes_would_be_zero(self):
+        # The reason the collapse discards sign: an explainer of a normalised output cancels
+        # across classes, so a signed cross-class mean is a chart of zeros.
+        exp = self._three_class()
+        per_class = np.array([exp.word_importance(label_idx=i)["alpha"] for i in range(3)])
+        self.assertAlmostEqual(float(per_class.mean()), 0.0)
+        self.assertGreater(exp.word_importance(label_idx=None)["alpha"], 0.5)
+
+    def test_single_output_model_collapses_to_the_absolute_value(self):
+        # A 1-D contribution array has no class axis to reduce over; it still must not raise.
+        texts = pd.Series(["alpha beta"])
+        exp = NlpExplanation(
+            texts=texts,
+            token_strings=[["alpha", "beta"]],
+            values=[np.array([0.5, -0.2])],
+            base_values=None,
+            y_pred=pd.Series(["a"], index=texts.index, name="prediction"),
+            y_prob=None,
+            y_true=None,
+            label_names=None,
+            folds_case=True,
+            backend_name="nlp_shap",
+            is_additive=True,
+            reference_kind="none",
+            output_space="probability",
+        )
+        self.assertEqual(exp.word_importance(label_idx=None).to_dict(), {"alpha": 0.5, "beta": 0.2})
+
+    def test_every_value_is_a_magnitude(self):
+        self.assertTrue((_profile_explanation().word_importance(label_idx=None) >= 0).all())
+
+    def test_name_records_the_statistic(self):
+        exp = _profile_explanation()
+        self.assertEqual(exp.word_importance(label_idx=None).name, "mean_across_classes")
+        self.assertEqual(exp.word_importance(label_idx=None, rank_by="sum").name, "sum_across_classes")
+
+    def test_a_negative_sign_filter_has_nothing_to_select(self):
+        self.assertTrue(_profile_explanation().word_importance(label_idx=None, filter_sign="negative").empty)
+
+    def test_the_frequency_floor_still_applies(self):
+        exp = _profile_explanation()
+        self.assertIn("happy", exp.word_importance(label_idx=None, min_occurrences=4).index)
+        self.assertNotIn("today", exp.word_importance(label_idx=None, min_occurrences=2).index)
+
+    def test_plotter_titles_and_labels_the_cross_class_view(self):
+        fig = _profile_explanation().plot.word_importance(label_idx=None)
+        self.assertEqual(fig.layout.title.text, "Word importance — all classes")
+        self.assertEqual(fig.layout.xaxis.title.text, "Largest |mean SHAP| across classes")
+
+
+class TestWordImportanceReadability(unittest.TestCase):
+    """The chart must name every bar it draws, whatever K is."""
+
+    @staticmethod
+    def _imp(n):
+        return pd.Series(
+            [(-1) ** i * (n - i) / n for i in range(n)],
+            index=[f"word{i}" for i in range(n)],
+        )
+
+    def test_every_word_gets_a_tick(self):
+        # dtick=1 on a categorical axis is what stops plotly thinning labels on a long ranking.
+        fig = plot_word_importance(self._imp(50))
+        self.assertEqual(fig.layout.yaxis.dtick, 1)
+        self.assertEqual(len(set(fig.data[0].y)), 50)
+
+    def test_height_grows_with_the_word_count(self):
+        heights = [plot_word_importance(self._imp(n)).layout.height for n in (5, 20, 50)]
+        self.assertEqual(heights, sorted(heights))
+        # Every word keeps room to render, rather than the chart being squeezed to a fixed panel.
+        for n, h in zip((5, 20, 50), heights):
+            self.assertGreaterEqual(h / n, 24)
+
+    def test_explicit_height_still_wins(self):
+        self.assertEqual(plot_word_importance(self._imp(50), height=300).layout.height, 300)
+
+    def test_value_labels_are_signed_and_on_by_default(self):
+        fig = plot_word_importance(pd.Series([0.9, -0.5], index=["a", "b"]))
+        self.assertEqual(list(fig.data[0].text), ["-0.500", "+0.900"])  # reversed for drawing
+        self.assertEqual(fig.data[0].textposition, "outside")
+        # Outside text sits past the bar end and would be cut off at the plot edge without this.
+        self.assertFalse(fig.data[0].cliponaxis)
+
+    def test_value_labels_get_headroom(self):
+        fig = plot_word_importance(pd.Series([1.0, -0.5], index=["a", "b"]))
+        lo, hi = fig.layout.xaxis.range
+        self.assertLess(lo, -0.5)
+        self.assertGreater(hi, 1.0)
+
+    def test_value_labels_can_be_turned_off(self):
+        fig = plot_word_importance(pd.Series([0.9], index=["a"]), show_values=False)
+        self.assertIsNone(fig.data[0].text)
+        # No outside text means no need to reserve headroom; plotly autoscales.
+        self.assertIsNone(fig.layout.xaxis.range)
+
+    def test_degenerate_inputs_autoscale_rather_than_collapse(self):
+        # An all-zero (or empty) series has no span to pad, and a [0, 0] range would be invalid.
+        self.assertIsNone(plot_word_importance(pd.Series(dtype=float)).layout.xaxis.range)
+        self.assertIsNone(plot_word_importance(pd.Series([0.0, 0.0], index=["a", "b"])).layout.xaxis.range)
+
+    def test_tick_font_is_set(self):
+        self.assertEqual(plot_word_importance(self._imp(3)).layout.yaxis.tickfont.size, 12)
+
+
+class TestWordImportanceHover(unittest.TestCase):
+    """The hover names the statistic and, when supplied, how many occurrences it aggregated."""
+
+    imp = pd.Series([0.9, -0.5], index=["a", "b"])
+
+    def test_hover_names_the_statistic_on_the_axis(self):
+        # The axis title scrolls off a long chart; the hover is where the reader can still check
+        # whether they are looking at a mean or a total.
+        fig = plot_word_importance(self.imp, x_title="Total SHAP contribution")
+        self.assertIn("Total SHAP contribution: %{x:.4f}", fig.data[0].hovertemplate)
+
+    def test_counts_are_reversed_with_the_bars(self):
+        fig = plot_word_importance(self.imp, counts={"a": 12, "b": 3})
+        self.assertEqual([int(c[0]) for c in fig.data[0].customdata], [3, 12])
+        self.assertIn("Occurrences:", fig.data[0].hovertemplate)
+
+    def test_counts_accept_a_series(self):
+        fig = plot_word_importance(self.imp, counts=pd.Series({"a": 12, "b": 3}))
+        self.assertEqual([int(c[0]) for c in fig.data[0].customdata], [3, 12])
+
+    def test_without_counts_the_hover_is_unchanged(self):
+        fig = plot_word_importance(self.imp)
+        self.assertIsNone(fig.data[0].customdata)
+        self.assertNotIn("Occurrences", fig.data[0].hovertemplate)
+
+    def test_a_partial_mapping_is_dropped_rather_than_shown_as_zero(self):
+        # A missing word can only mean the caller counted under different filters, which would
+        # misreport every bar — not just the uncovered one.
+        fig = plot_word_importance(self.imp, counts={"a": 12})
+        self.assertIsNone(fig.data[0].customdata)
+        self.assertNotIn("Occurrences", fig.data[0].hovertemplate)
+
+
+class TestWordCounts(unittest.TestCase):
+    """The frequency table behind the word picker's order, labels and threshold."""
+
+    def setUp(self):
+        self.explanation = _profile_explanation()
+
+    def test_occurrences_and_samples_differ_for_a_repeated_word(self):
+        counts = self.explanation.word_counts()
+        # "happy" occurs 4x (twice in one sample) across 3 samples.
+        self.assertEqual(counts.loc["happy", "n_occurrences"], 4)
+        self.assertEqual(counts.loc["happy", "n_samples"], 3)
+
+    def test_sorted_by_frequency_then_alphabetically(self):
+        counts = self.explanation.word_counts()
+        self.assertEqual(counts.index[0], "happy")
+        ties = counts[counts["n_occurrences"] == 1].index.tolist()
+        self.assertEqual(ties, sorted(ties))
+
+    def test_applies_the_same_filters_as_word_importance(self):
+        counts = self.explanation.word_counts()
+        self.assertNotIn("[CLS]", counts.index)
+        self.assertNotIn("!", counts.index)
+        self.assertNotIn("Happy", counts.index)  # folded into "happy"
+
+    def test_index_is_exactly_the_vocabulary(self):
+        self.assertEqual(sorted(self.explanation.word_counts().index), self.explanation.vocabulary())
+
+    def test_scoped_to_sample_indices(self):
+        counts = self.explanation.word_counts(sample_indices=[1])
+        self.assertEqual(counts.loc["happy", "n_occurrences"], 2)
+        self.assertEqual(counts.loc["happy", "n_samples"], 1)
+
+    def test_counts_are_the_denominator_word_importance_filters_on(self):
+        # The contract the min-occurrence control depends on: the count shown beside a word is the
+        # count its aggregate was computed over.
+        counts = self.explanation.word_counts()
+        for word, n in counts["n_occurrences"].items():
+            kept = self.explanation.word_importance(label_idx=0, n_top=999, min_occurrences=int(n))
+            self.assertIn(word, kept.index, word)
+            dropped = self.explanation.word_importance(label_idx=0, n_top=999, min_occurrences=int(n) + 1)
+            self.assertNotIn(word, dropped.index, word)
+
+    def test_empty_batch_returns_an_empty_frame(self):
+        empty = _minimal_explanation([[]], [np.zeros((0, 2))], None)
+        self.assertTrue(empty.word_counts().empty)
+        self.assertEqual(empty.vocabulary(), [])
+
+
+class TestWordOccurrences(unittest.TestCase):
+    def setUp(self):
+        self.explanation = _profile_explanation()
+
+    def test_one_row_per_occurrence_and_class(self):
+        occ = self.explanation.word_occurrences("happy")
+        # 4 occurrences (one in sample 0, two in sample 1, one in sample 2) x 2 classes.
+        self.assertEqual(len(occ), 8)
+        self.assertEqual(list(occ.columns), ["sample", "token_pos", "token", "class_idx", "contribution"])
+
+    def test_case_folding_follows_the_model(self):
+        self.assertEqual(len(self.explanation.word_occurrences("HAPPY")), 8)
+        cased = _profile_explanation(folds_case=False)
+        self.assertEqual(len(cased.word_occurrences("happy")), 6)
+        self.assertEqual(len(cased.word_occurrences("Happy")), 2)
+
+    def test_explicit_lowercase_overrides(self):
+        cased = _profile_explanation(folds_case=False)
+        self.assertEqual(len(cased.word_occurrences("happy", lowercase=True)), 8)
+
+    def test_token_keeps_original_casing(self):
+        occ = self.explanation.word_occurrences("happy")
+        self.assertIn("Happy", set(occ["token"]))
+
+    def test_sample_indices_scope(self):
+        occ = self.explanation.word_occurrences("happy", sample_indices=[2])
+        self.assertEqual(set(occ["sample"]), {2})
+        self.assertEqual(len(occ), 2)
+
+    def test_missing_word_returns_typed_empty_frame(self):
+        occ = self.explanation.word_occurrences("absent")
+        self.assertTrue(occ.empty)
+        self.assertEqual(occ["contribution"].dtype, np.float64)
+        # An empty frame must still support the numeric work the callers do on it.
+        self.assertTrue(aggregate_word_contributions(occ, "mean_abs").empty)
+        self.assertTrue(rank_word_samples(occ, class_idx=0).empty)
+
+    def test_binary_1d_values(self):
+        explanation = _minimal_explanation(
+            [["good", "day"], ["good"]],
+            [np.array([0.5, 0.1]), np.array([-0.3])],
+            None,
+        )
+        occ = explanation.word_occurrences("good")
+        self.assertEqual(set(occ["class_idx"]), {0})
+        self.assertEqual(sorted(occ["contribution"].round(3)), [-0.3, 0.5])
+
+
+class TestAggregateWordContributions(unittest.TestCase):
+    def setUp(self):
+        self.occ = _profile_explanation().word_occurrences("happy")
+
+    def test_mean_is_signed(self):
+        stats = aggregate_word_contributions(self.occ, "mean")
+        # class 0: (0.4 + 0.2 + 0.1 - 0.6) / 4
+        self.assertAlmostEqual(stats[0], 0.025)
+        self.assertAlmostEqual(stats[1], -0.025)
+
+    def test_sum_scales_with_frequency(self):
+        stats = aggregate_word_contributions(self.occ, "sum")
+        self.assertAlmostEqual(stats[0], 0.1)
+
+    def test_abs_forms_expose_the_two_way_word(self):
+        signed = aggregate_word_contributions(self.occ, "mean")
+        magnitude = aggregate_word_contributions(self.occ, "mean_abs")
+        # The whole point of the abs forms: a word averaging to ~0 is not a weak word.
+        self.assertLess(abs(signed[0]), 0.05)
+        self.assertAlmostEqual(magnitude[0], 0.325)
+        self.assertAlmostEqual(aggregate_word_contributions(self.occ, "sum_abs")[0], 1.3)
+
+    def test_index_is_every_class_in_order(self):
+        self.assertEqual(list(aggregate_word_contributions(self.occ, "sum").index), [0, 1])
+
+    def test_unknown_agg_raises(self):
+        with self.assertRaisesRegex(ValueError, "not one of"):
+            aggregate_word_contributions(self.occ, "median")
+
+    def test_all_documented_ops_run(self):
+        for agg in WORD_AGGREGATIONS:
+            self.assertEqual(len(aggregate_word_contributions(self.occ, agg)), 2)
+
+
+class TestRankWordSamples(unittest.TestCase):
+    def setUp(self):
+        self.occ = _profile_explanation().word_occurrences("happy")
+
+    def test_occurrences_are_summed_within_a_sample(self):
+        ranked = rank_word_samples(self.occ, class_idx=0, order="most")
+        row = ranked[ranked["sample"] == 1].iloc[0]
+        self.assertAlmostEqual(row["contribution"], 0.3)  # 0.2 + 0.1
+        self.assertEqual(row["n_occurrences"], 2)
+        # One row per sample, never one per occurrence.
+        self.assertEqual(len(ranked), ranked["sample"].nunique())
+
+    def test_most_ranks_positive_first(self):
+        ranked = rank_word_samples(self.occ, class_idx=0, order="most")
+        self.assertEqual(ranked["sample"].tolist(), [0, 1, 2])
+
+    def test_least_ranks_negative_first(self):
+        ranked = rank_word_samples(self.occ, class_idx=0, order="least")
+        self.assertEqual(ranked["sample"].iloc[0], 2)
+
+    def test_strongest_ignores_sign(self):
+        ranked = rank_word_samples(self.occ, class_idx=0, order="strongest")
+        self.assertEqual(ranked["sample"].iloc[0], 2)  # |-0.6| is the largest
+
+    def test_class_idx_selects_the_column(self):
+        pos = rank_word_samples(self.occ, class_idx=0, order="most")["contribution"].tolist()
+        neg = rank_word_samples(self.occ, class_idx=1, order="most")["contribution"].tolist()
+        self.assertNotEqual(pos, neg)
+
+    def test_n_top_truncates(self):
+        self.assertEqual(len(rank_word_samples(self.occ, class_idx=0, n_top=1)), 1)
+
+    def test_unknown_order_raises(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            rank_word_samples(self.occ, class_idx=0, order="alphabetical")
+
+    def test_absent_class_returns_typed_empty(self):
+        ranked = rank_word_samples(self.occ, class_idx=99)
+        self.assertTrue(ranked.empty)
+        self.assertEqual(list(ranked.columns), ["sample", "contribution", "n_occurrences"])
+
+
+class TestPlotWordProfile(unittest.TestCase):
+    def setUp(self):
+        self.stats = pd.Series([0.2, -0.3], index=pd.Index([0, 1], name="class_idx"))
+
+    def test_returns_figure_with_one_bar_per_class(self):
+        fig = plot_word_profile(self.stats, label_names=["pos", "neg"])
+        self.assertIsInstance(fig, go.Figure)
+        self.assertEqual(len(fig.data[0].x), 2)
+
+    def test_class_zero_is_drawn_at_the_top(self):
+        # Plotly draws the y-axis bottom-to-top, so the first class must be last in the array.
+        fig = plot_word_profile(self.stats, label_names=["pos", "neg"])
+        self.assertEqual(fig.data[0].y[-1], "pos")
+
+    def test_sign_drives_colour(self):
+        fig = plot_word_profile(self.stats, label_names=["pos", "neg"])
+        # Reversed alongside the values, so the last colour belongs to the positive class 0.
+        self.assertEqual(fig.data[0].marker.color[-1], "#1f77b4")
+        self.assertEqual(fig.data[0].marker.color[0], "#d62728")
+
+    def test_falls_back_to_class_indices_without_names(self):
+        fig = plot_word_profile(self.stats)
+        self.assertEqual(set(fig.data[0].y), {"0", "1"})
+
+    def test_spread_is_reversed_with_the_bars(self):
+        spread = pd.Series([0.1, 0.9], index=pd.Index([0, 1], name="class_idx"))
+        fig = plot_word_profile(self.stats, label_names=["pos", "neg"], spread=spread)
+        # Class 1's spread must sit on class 1's bar, which is drawn first.
+        self.assertAlmostEqual(fig.data[0].error_x.array[0], 0.9)
+
+    def test_misaligned_spread_does_not_shift_error_bars(self):
+        # A spread indexed on classes the stats do not carry must not silently slide onto them.
+        spread = pd.Series([0.1], index=pd.Index([5], name="class_idx"))
+        fig = plot_word_profile(self.stats, label_names=["pos", "neg"], spread=spread)
+        self.assertEqual(list(fig.data[0].error_x.array), [0.0, 0.0])
+
+    def test_no_error_bars_without_spread(self):
+        fig = plot_word_profile(self.stats)
+        self.assertIsNone(fig.data[0].error_x.array)
+
+
+class TestPlotterWordProfile(unittest.TestCase):
+    def setUp(self):
+        self.explanation = _profile_explanation()
+
+    def test_returns_figure_titled_with_counts(self):
+        fig = self.explanation.plot.word_profile("happy")
+        self.assertIsInstance(fig, go.Figure)
+        self.assertIn("4 occurrence(s) in 3 sample(s)", fig.layout.title.text)
+
+    def test_mean_draws_error_bars_and_sum_does_not(self):
+        self.assertIsNotNone(self.explanation.plot.word_profile("happy", agg="mean").data[0].error_x.array)
+        self.assertIsNone(self.explanation.plot.word_profile("happy", agg="sum").data[0].error_x.array)
+
+    def test_single_occurrence_spread_is_zero_not_nan(self):
+        fig = self.explanation.plot.word_profile("today", agg="mean")
+        self.assertEqual(list(fig.data[0].error_x.array), [0.0, 0.0])
+
+    def test_sample_indices_scope(self):
+        fig = self.explanation.plot.word_profile("happy", sample_indices=[1])
+        self.assertIn("2 occurrence(s) in 1 sample(s)", fig.layout.title.text)
+
+    def test_title_override(self):
+        self.assertEqual(self.explanation.plot.word_profile("happy", title="X").layout.title.text, "X")
+
+    def test_absent_word_raises_rather_than_drawing_an_empty_chart(self):
+        with self.assertRaisesRegex(ValueError, "does not occur"):
+            self.explanation.plot.word_profile("absent")
+
+    def test_absent_in_scope_names_the_scope(self):
+        with self.assertRaisesRegex(ValueError, "in the selected samples"):
+            self.explanation.plot.word_profile("happy", sample_indices=[3])
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +2008,7 @@ class _MarkerBackend(NlpBackend):
     name = "marker_backend"
     reference_kind = "none"
     is_additive = True
+    output_space = "probability"
 
     def __init__(self, marker=1.0, **kwargs):
         super().__init__(model=None, label_names=LABEL_NAMES, **kwargs)
@@ -1685,9 +2300,7 @@ class TestDetectLabelNoise(unittest.TestCase):
     def test_different_arguments_recompute(self):
         xpl = _make_explainer()
         explanation = self._with_labels()
-        self.assertIsNot(
-            xpl.detect_label_noise(explanation, top_n=5), xpl.detect_label_noise(explanation, top_n=4)
-        )
+        self.assertIsNot(xpl.detect_label_noise(explanation, top_n=5), xpl.detect_label_noise(explanation, top_n=4))
 
     # ── independent probe ──────────────────────────────────────────────
     def _probe_corpus(self):

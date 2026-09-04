@@ -90,6 +90,15 @@ class NlpBackend(Backend):
         ``logits(x) - logits(baseline)`` for Integrated Gradients). Licenses feature
         grouping and waterfall/force-style charts; ``False`` for LIME, whose local
         surrogate coefficients carry no such guarantee.
+    output_space : {"probability", "logit"}
+        Which model output the contributions explain — read off the backend at
+        ``explain()`` time and recorded on :class:`~shapash.explainer.nlp_explanation.NlpExplanation`
+        so a saved artifact says which. ``"probability"``: the explained quantity is a
+        (softmax) probability, which forces per-token cross-class cancellation — see
+        ``docs/architecture/explanation-space.md``. ``"logit"``: the explained quantity is
+        the model's raw pre-softmax output, which does not cancel. Not an affine rescaling
+        of one another; a caller comparing two backends is comparing numbers on different
+        scales unless both report the same space.
     requires_model_capabilities : tuple[type, ...]
         Capability ABCs (from :mod:`shapash.model.base`) the bound model must satisfy,
         checked once here so a new backend declares its needs instead of failing at
@@ -117,6 +126,7 @@ class NlpBackend(Backend):
 
     reference_kind: ClassVar[Literal["distribution", "statistics", "point", "none"]]
     is_additive: ClassVar[bool]
+    output_space: ClassVar[Literal["probability", "logit"]]
     requires_model_capabilities: ClassVar[tuple[type, ...]] = ()
 
     def __init__(

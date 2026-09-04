@@ -13,7 +13,12 @@ contract.
 
 from __future__ import annotations
 
-from shapash.webapp.nlp_components.base import WebappComponent, available_capabilities
+from shapash.webapp.nlp_components.base import (
+    WebappComponent,
+    available_capabilities,
+    compose_selection,
+    error_positions,
+)
 from shapash.webapp.nlp_components.counterfactual import CounterfactualComponent
 from shapash.webapp.nlp_components.data_editor import DataEditorComponent
 from shapash.webapp.nlp_components.datapoint import (
@@ -26,10 +31,13 @@ from shapash.webapp.nlp_components.label_noise import LabelNoiseComponent
 from shapash.webapp.nlp_components.sentence_highlight import SentenceHighlightComponent
 from shapash.webapp.nlp_components.similar_examples import SimilarExamplesComponent
 from shapash.webapp.nlp_components.waterfall import WaterfallComponent
+from shapash.webapp.nlp_components.word_profile import WordProfileComponent
 
 __all__ = [
     "WebappComponent",
     "available_capabilities",
+    "compose_selection",
+    "error_positions",
     "DataEditorComponent",
     "CounterfactualComponent",
     "ErrorAnalysisComponent",
@@ -37,6 +45,7 @@ __all__ = [
     "SentenceHighlightComponent",
     "SimilarExamplesComponent",
     "WaterfallComponent",
+    "WordProfileComponent",
     "pack_datapoint",
     "unpack_datapoint",
     "datapoint_from_contributions",

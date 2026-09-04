@@ -93,6 +93,10 @@ class NlpLimeBackend(NlpBackend):
     # sum to f(x) - f(baseline). Matches tabular LimeBackend.support_groups=False, for
     # the same algorithmic reason (not because tabular already decided it).
     is_additive = False
+    # ``model`` returns class probabilities (see its docstring above) and the surrogate is fit
+    # against that output directly, so this is a probability-space explanation like nlp_shap's —
+    # not the raw-logit space nlp_captum_lig reports.
+    output_space = "probability"
     requires_model_capabilities = ()  # a plain scoring callable is enough
 
     def __init__(

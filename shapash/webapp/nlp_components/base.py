@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+import numpy as np
+
 from shapash.compute.diagnostics.label_noise import has_usable_probabilities
 from shapash.explainer.interactive import InteractiveEngine
 from shapash.explainer.nlp_explanation import NlpExplanation
@@ -65,6 +67,44 @@ def available_capabilities(explanation: NlpExplanation, engine: InteractiveEngin
             if has_capabilities(getattr(generator, "model", None), SupportsGradients):
                 caps.add(CAP_GRADIENTS)
     return frozenset(caps)
+
+
+def error_positions(explanation: NlpExplanation) -> set[int] | None:
+    """Positional indices of the samples the model got wrong, or ``None`` without ground truth.
+
+    Compared as strings, the same way the dataset table's "Model Errors" filter does, so every
+    panel that scopes itself to errors scopes to exactly the same rows.
+    """
+    y_true, y_pred = explanation.y_true, explanation.y_pred
+    if y_true is None or y_pred is None:
+        return None
+    mask = np.asarray(y_true).astype(str) != np.asarray(y_pred).astype(str)
+    return set(np.where(mask)[0].tolist())
+
+
+def compose_selection(
+    selected_indices: list[int] | None,
+    cell_indices: list[int] | None,
+    errors: set[int] | None,
+) -> list[int] | None:
+    """Intersect the app's active sample filters into one index list.
+
+    Each argument is an independent filter that may be inactive (``None``): the scatter box/lasso
+    selection, the confusion-matrix cell, and — when the errors-only switch is on — the set of
+    misclassified positions. Active filters intersect; returns ``None`` when none are active.
+
+    Lives here rather than in the app shell because every panel that honours the global selection
+    (the word-importance chart in the shell, the single-word profile component) has to compose it
+    identically — a panel with its own precedence rules would silently show a different subset than
+    the table beside it.
+    """
+    combined = selected_indices
+    if cell_indices is not None:
+        cell_set = set(cell_indices)
+        combined = list(cell_indices) if combined is None else [i for i in combined if i in cell_set]
+    if errors is not None:
+        combined = sorted(errors) if combined is None else [i for i in combined if i in errors]
+    return combined
 
 
 class WebappComponent(ABC):

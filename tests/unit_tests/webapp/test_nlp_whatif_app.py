@@ -30,8 +30,16 @@ LABEL_NAMES = ["neg", "pos"]
 # A tiny lexically separable corpus for the independent label probe. "bad"/"awful" sit in "neg",
 # so a row labelled "neg" gets backed and a row labelled "pos" gets rejected.
 _PROBE_CORPUS = (
-    ["i am happy", "happy and glad", "so glad today", "a happy glad day",
-     "this is bad", "bad and awful", "so awful today", "a bad awful day"],
+    [
+        "i am happy",
+        "happy and glad",
+        "so glad today",
+        "a happy glad day",
+        "this is bad",
+        "bad and awful",
+        "so awful today",
+        "a bad awful day",
+    ],
     ["pos"] * 4 + ["neg"] * 4,
 )
 
@@ -97,6 +105,7 @@ class FakeEngine:
             backend_name="fake",
             is_additive=True,
             reference_kind="none",
+            output_space="probability",
         )
 
     def can_detect_label_noise(self, explanation=None):
@@ -324,7 +333,8 @@ class TestThreePanelLayout(unittest.TestCase):
             app._tab_groups,
             {
                 "left-tabs": ["table", "scatter", "editor"],
-                "upper-right-tabs": ["importance", "counterfactual"],
+                # Word Profile is data-only, so it mounts unconditionally beside Word Importance.
+                "upper-right-tabs": ["importance", "word-profile", "counterfactual"],
                 "lower-right-tabs": ["highlight", "waterfall"],
             },
         )
@@ -343,7 +353,7 @@ class TestThreePanelLayout(unittest.TestCase):
     def test_tabs_degrade_without_scatter_or_whatif(self):
         app, ids = self._ids(FakeEngine(can_edit=False, can_cf=False))
         self.assertEqual(app._tab_groups["left-tabs"], ["table"])
-        self.assertEqual(app._tab_groups["upper-right-tabs"], ["importance"])
+        self.assertEqual(app._tab_groups["upper-right-tabs"], ["importance", "word-profile"])
         self.assertEqual(app._tab_groups["lower-right-tabs"], ["highlight", "waterfall"])
         self.assertNotIn("left-tabs-body-scatter", ids)
         self.assertNotIn("left-tabs-body-editor", ids)
@@ -430,7 +440,9 @@ class TestSimilarComponent(unittest.TestCase):
         explanation = engine.to_explanation()
         app = dash.Dash(__name__)
         comp = SimilarExamplesComponent()
-        comp.register_callbacks(app, explanation, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
+        comp.register_callbacks(
+            app, explanation, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"}
+        )
         return app, engine
 
     @staticmethod
@@ -631,7 +643,9 @@ class TestLabelNoiseComponent(unittest.TestCase):
         explanation = engine.to_explanation()
         app = dash.Dash(__name__)
         comp = LabelNoiseComponent()
-        comp.register_callbacks(app, explanation, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"})
+        comp.register_callbacks(
+            app, explanation, engine, {"apply": "whatif-apply-store", "current": "current-datapoint"}
+        )
         return app, engine
 
     @staticmethod
@@ -867,3 +881,579 @@ class TestSubpathMounting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWordProfileComponent(unittest.TestCase):
+    """The single-word profile panel: word × aggregation × global selection, then drill-down."""
+
+    STORES = {
+        "current": "current-datapoint",
+        "selection": "scatter-selected-indices",
+        "error_cell": "error-cell",
+        "errors_only": "errors-only-switch",
+        "word_click": "word-click-filter",
+    }
+
+    @staticmethod
+    def _explanation():
+        """Four samples, two classes. 'happy' pulls +0.4/+0.3 in two, -0.6 in a third."""
+        token_strings = [
+            ["so", "happy", "today"],
+            ["happy", "and", "happy"],
+            ["not", "happy", "at", "all"],
+            ["nothing", "here"],
+        ]
+        values = [
+            np.array([[0.1, -0.1], [0.4, -0.4], [0.05, -0.05]]),
+            np.array([[0.2, -0.2], [0.0, 0.0], [0.1, -0.1]]),
+            np.array([[-0.1, 0.1], [-0.6, 0.6], [0.0, 0.0], [0.0, 0.0]]),
+            np.array([[0.0, 0.0], [0.0, 0.0]]),
+        ]
+        texts = pd.Series(["so happy today", "happy and happy", "not happy at all", "nothing here"])
+        return NlpExplanation(
+            texts=texts,
+            token_strings=token_strings,
+            values=values,
+            base_values=np.zeros((4, 2)),
+            y_pred=pd.Series(["pos", "pos", "neg", "neg"], index=texts.index, name="prediction"),
+            y_prob=None,
+            # Sample 1 is the only model error, so errors-only scopes to exactly that row.
+            y_true=pd.Series(["pos", "neg", "neg", "neg"], index=texts.index, name="ground_truth"),
+            label_names=LABEL_NAMES,
+            folds_case=True,
+            backend_name="nlp_shap",
+            is_additive=True,
+            reference_kind="point",
+            output_space="probability",
+        )
+
+    def _app(self):
+        import dash
+
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        explanation = self._explanation()
+        app = dash.Dash(__name__)
+        comp = WordProfileComponent()
+        comp.register_callbacks(app, explanation, None, self.STORES)
+        return app, explanation
+
+    @staticmethod
+    def _callback(app, out_substr):
+        for key, spec in app.callback_map.items():
+            if out_substr in key:
+                fn = spec["callback"]
+                return getattr(fn, "__wrapped__", fn)
+        raise KeyError(out_substr)
+
+    # ── mounting / layout ───────────────────────────────────────────────
+    def test_mounts_without_an_engine(self):
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        # Data-only panel: it must survive a loaded snapshot with no live model.
+        self.assertTrue(WordProfileComponent.is_available(self._explanation(), None))
+
+    def test_layout_declares_every_id_its_callbacks_bind(self):
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        found = set()
+        _collect_ids(WordProfileComponent().layout(self._explanation(), None), found)
+        for suffix in ("select", "agg", "class", "order", "limit", "graph", "caption", "results", "store"):
+            self.assertIn(f"word-profile-{suffix}", found)
+
+    def test_word_dropdown_is_seeded_with_the_top_word(self):
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        explanation = self._explanation()
+        layout = WordProfileComponent().layout(explanation, None)
+        found = {}
+
+        def walk(node):
+            cid = getattr(node, "id", None)
+            if isinstance(cid, str):
+                found[cid] = node
+            children = getattr(node, "children", None)
+            for ch in children if isinstance(children, (list, tuple)) else [children]:
+                if ch is not None and not isinstance(ch, str):
+                    walk(ch)
+
+        walk(layout)
+        # Not empty on open, and the seed is a real corpus word.
+        self.assertIn(found["word-profile-select"].value, explanation.vocabulary())
+
+    def test_class_picker_hidden_for_a_single_output_column(self):
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        explanation = self._explanation()
+        binary = replace(
+            explanation,
+            values=[v[:, 0] for v in explanation.values],
+            base_values=np.zeros(4),
+            label_names=["score"],
+        )
+        layout = WordProfileComponent().layout(binary, None)
+        found = set()
+        _collect_ids(layout, found)
+        # Still present (callbacks bind it), just not shown.
+        self.assertIn("word-profile-class", found)
+
+    # ── the profile callback ────────────────────────────────────────────
+    def test_profile_reports_counts_and_one_bar_per_class(self):
+        app, _ = self._app()
+        fig, caption, table, store = self._callback(app, "word-profile-graph")(
+            "happy", "mean", 0, "strongest", 10, None, None, False
+        )
+        self.assertEqual(len(fig.data[0].x), 2)
+        self.assertIn("4 occurrence(s) in 3 of 4 sample(s)", caption)
+        self.assertIsNotNone(table)
+        self.assertEqual(store, [2, 0, 1])  # |-0.6| > 0.4 > 0.3
+
+    def test_mean_reports_its_error_bars_in_the_caption(self):
+        app, _ = self._app()
+        _, caption, _, _ = self._callback(app, "word-profile-graph")("happy", "mean", 0, "most", 10, None, None, False)
+        self.assertIn("std across occurrences", caption)
+
+    def test_sum_has_no_error_bars(self):
+        app, _ = self._app()
+        fig, caption, _, _ = self._callback(app, "word-profile-graph")("happy", "sum", 0, "most", 10, None, None, False)
+        self.assertIsNone(fig.data[0].error_x.array)
+        self.assertNotIn("std", caption)
+
+    def test_absolute_aggregation_surfaces_the_two_way_word(self):
+        app, _ = self._app()
+        graph = self._callback(app, "word-profile-graph")
+        signed = graph("happy", "mean", 0, "most", 10, None, None, False)[0].data[0].x
+        magnitude = graph("happy", "mean_abs", 0, "most", 10, None, None, False)[0].data[0].x
+        # The signed mean nearly cancels; the magnitude does not. This gap is the panel's point.
+        self.assertLess(abs(signed[-1]), 0.05)
+        self.assertGreater(magnitude[-1], 0.3)
+
+    def test_order_reorders_the_drill_down_only(self):
+        app, _ = self._app()
+        graph = self._callback(app, "word-profile-graph")
+        self.assertEqual(graph("happy", "mean", 0, "most", 10, None, None, False)[3], [0, 1, 2])
+        self.assertEqual(graph("happy", "mean", 0, "least", 10, None, None, False)[3][0], 2)
+
+    def test_limit_truncates_the_drill_down(self):
+        app, _ = self._app()
+        store = self._callback(app, "word-profile-graph")("happy", "mean", 0, "most", 1, None, None, False)[3]
+        self.assertEqual(len(store), 1)
+
+    def test_scatter_selection_scopes_the_aggregate(self):
+        app, _ = self._app()
+        _, caption, _, store = self._callback(app, "word-profile-graph")(
+            "happy", "mean", 0, "most", 10, [0, 3], None, False
+        )
+        self.assertIn("scoped to 2 selected sample(s)", caption)
+        self.assertEqual(store, [0])
+
+    def test_errors_only_scopes_the_aggregate(self):
+        app, _ = self._app()
+        # Sample 1 is the only misclassified row, and it does contain the word.
+        _, caption, _, store = self._callback(app, "word-profile-graph")(
+            "happy", "mean", 0, "most", 10, None, None, True
+        )
+        self.assertIn("scoped to 1 selected sample(s)", caption)
+        self.assertEqual(store, [1])
+
+    def test_confusion_cell_scopes_the_aggregate(self):
+        app, _ = self._app()
+        _, caption, _, _ = self._callback(app, "word-profile-graph")(
+            "happy", "mean", 0, "most", 10, None, {"pred": 1, "true": 0, "indices": [2]}, False
+        )
+        self.assertIn("scoped to 1 selected sample(s)", caption)
+
+    def test_word_absent_from_the_scope_says_so(self):
+        app, _ = self._app()
+        fig, caption, table, store = self._callback(app, "word-profile-graph")(
+            "happy", "mean", 0, "most", 10, [3], None, False
+        )
+        self.assertIn("no occurrences", caption)
+        self.assertIn("does not occur", fig.layout.annotations[0].text)
+        self.assertIsNone(table)
+        self.assertEqual(store, [])
+
+    def test_no_word_selected_shows_a_prompt(self):
+        app, _ = self._app()
+        fig, caption, table, store = self._callback(app, "word-profile-graph")(
+            None, "mean", 0, "most", 10, None, None, False
+        )
+        self.assertIn("Pick a word", fig.layout.annotations[0].text)
+        self.assertEqual((caption, table, store), ("", None, []))
+
+    def test_falls_back_to_defaults_on_cleared_controls(self):
+        app, _ = self._app()
+        _, caption, _, store = self._callback(app, "word-profile-graph")(
+            "happy", None, None, None, None, None, None, None
+        )
+        self.assertIn("Mean", caption)
+        self.assertEqual(len(store), 3)
+
+    # ── cross-panel wiring ──────────────────────────────────────────────
+    def test_follows_a_word_bar_clicked_in_the_importance_panel(self):
+        app, _ = self._app()
+        follow = self._callback(app, "word-profile-select.value")
+        self.assertEqual(follow("today"), "today")
+        # With a scatter the store holds the multi-select list; the newest word wins.
+        self.assertEqual(follow(["today", "happy"]), "happy")
+
+    def test_cleared_word_filter_leaves_the_selection_alone(self):
+        from dash.exceptions import PreventUpdate
+
+        app, _ = self._app()
+        follow = self._callback(app, "word-profile-select.value")
+        for cleared in (None, []):
+            with self.assertRaises(PreventUpdate):
+                follow(cleared)
+
+    def test_inspect_packs_the_sample_into_the_current_datapoint(self):
+        from unittest import mock
+
+        from shapash.webapp.nlp_components import word_profile as mod
+
+        app, _ = self._app()
+        inspect = self._callback(app, "current-datapoint")
+        with mock.patch.object(mod, "callback_context") as cc:
+            cc.triggered_id = {"type": "word-profile-inspect", "index": 1}
+            # The store holds the displayed rows' positions, so row 1 is sample 0.
+            datapoint = inspect([None, 1], [2, 0])
+        self.assertEqual(datapoint["orig_idx"], 0)
+        self.assertEqual(datapoint["text"], "so happy today")
+        self.assertEqual(datapoint["label"], "pos")
+
+    def test_inspect_ignores_clicks_it_cannot_resolve(self):
+        from unittest import mock
+
+        from dash.exceptions import PreventUpdate
+
+        from shapash.webapp.nlp_components import word_profile as mod
+
+        app, _ = self._app()
+        inspect = self._callback(app, "current-datapoint")
+        with self.assertRaises(PreventUpdate):
+            inspect([None, None], [0, 1])  # no button actually clicked
+        with mock.patch.object(mod, "callback_context") as cc:
+            cc.triggered_id = None
+            with self.assertRaises(PreventUpdate):
+                inspect([1], [0])
+        with mock.patch.object(mod, "callback_context") as cc:
+            cc.triggered_id = {"type": "word-profile-inspect", "index": 5}
+            with self.assertRaises(PreventUpdate):
+                inspect([1], [0])  # index past the end of the displayed rows
+
+
+class TestGlobalWordImportancePanel(unittest.TestCase):
+    """The shell's Word Importance chart: rank-by, frequency floor, and its empty states."""
+
+    @staticmethod
+    def _explanation():
+        # "rare" pulls hard once; "common" pulls mildly four times. The two rank-by modes must
+        # disagree, which is the whole reason the control exists.
+        token_strings = [["rare", "common"], ["common"], ["common", "common"], ["mild"]]
+        values = [
+            np.array([[0.9, -0.9], [0.3, -0.3]]),
+            np.array([[0.3, -0.3]]),
+            np.array([[0.3, -0.3], [0.3, -0.3]]),
+            np.array([[-0.5, 0.5]]),
+        ]
+        texts = pd.Series(["rare common", "common", "common common", "mild"])
+        explanation = NlpExplanation(
+            texts=texts,
+            token_strings=token_strings,
+            values=values,
+            base_values=np.zeros((4, 2)),
+            y_pred=pd.Series(["neg"] * 4, index=texts.index, name="prediction"),
+            y_prob=None,
+            y_true=None,
+            label_names=LABEL_NAMES,
+            folds_case=True,
+            backend_name="nlp_shap",
+            is_additive=True,
+            reference_kind="point",
+            output_space="probability",
+        )
+        return explanation
+
+    @classmethod
+    def _app(cls):
+        app = NlpWebApp(cls._explanation(), engine=None)
+        for key, spec in app.app.callback_map.items():
+            if "global-importance-graph.figure" in key:
+                fn = spec["callback"]
+                return getattr(fn, "__wrapped__", fn)
+        raise KeyError("global-importance-graph")
+
+    @staticmethod
+    def _words(fig):
+        # Bars are drawn bottom-to-top, so reverse back into rank order.
+        return list(fig.data[0].y)[::-1]
+
+    def setUp(self):
+        self.graph = self._app()
+
+    def _call(self, rank_by="mean", floor=1, sign="all", topk=10, indices=None, cell=None, errors=False, label=0):
+        return self.graph(label, topk, sign, [], rank_by, floor, indices, cell, errors)
+
+    @staticmethod
+    def _values(fig):
+        return list(fig.data[0].x)[::-1]
+
+    def test_mean_and_sum_produce_different_rankings(self):
+        self.assertEqual(self._words(self._call(rank_by="mean"))[0], "rare")
+        self.assertEqual(self._words(self._call(rank_by="sum"))[0], "common")
+
+    def test_axis_names_the_statistic_drawn(self):
+        self.assertEqual(self._call(rank_by="mean").layout.xaxis.title.text, "Mean SHAP contribution")
+        self.assertEqual(self._call(rank_by="sum").layout.xaxis.title.text, "Total SHAP contribution")
+
+    def test_frequency_floor_removes_rare_words(self):
+        self.assertIn("rare", self._words(self._call(floor=1)))
+        self.assertNotIn("rare", self._words(self._call(floor=2)))
+
+    def test_panel_has_no_title(self):
+        # The tab is already labelled "Word Importance" and the floor/class are visible in the
+        # filter row above the chart, so the figure itself carries no title band — reclaiming that
+        # vertical space for word rows instead.
+        self.assertIsNone(self._call(floor=2).layout.title.text)
+        self.assertIsNone(self._call(floor=1).layout.title.text)
+
+    def test_sign_filter_still_works_in_both_modes(self):
+        for rank_by in ("mean", "sum"):
+            self.assertEqual(self._words(self._call(rank_by=rank_by, sign="negative")), ["mild"])
+            self.assertNotIn("mild", self._words(self._call(rank_by=rank_by, sign="positive")))
+
+    def test_default_floor_is_two(self):
+        from shapash.webapp.nlp_app import _DEFAULT_MIN_OCCURRENCES
+
+        # A mean over a single observation is not a mean; the panel must not open on one.
+        self.assertEqual(_DEFAULT_MIN_OCCURRENCES, 2)
+
+    def test_cleared_floor_input_means_no_filter(self):
+        # An emptied number box arrives as None and must not silently restore the default.
+        self.assertIn("rare", self._words(self._call(floor=None)))
+
+    def test_floor_below_one_is_clamped(self):
+        self.assertIn("rare", self._words(self._call(floor=0)))
+
+    def test_impossible_floor_explains_itself(self):
+        fig = self._call(floor=99)
+        self.assertEqual(len(fig.data), 0)
+        self.assertIn("at least 99 time(s) in these 4 sample(s)", fig.layout.annotations[0].text)
+
+    def test_empty_sign_filter_explains_itself_differently(self):
+        # Only "mild" is negative; excluding it by scope leaves the sign filter with nothing, and
+        # the message must point at the filter rather than at the frequency floor.
+        fig = self._call(sign="negative", indices=[0, 1])
+        self.assertEqual(len(fig.data), 0)
+        self.assertIn("negative", fig.layout.annotations[0].text)
+
+    def test_floor_counts_within_the_selection(self):
+        # "common" occurs 4x overall but once in sample 1, so a floor of 2 must exclude it there.
+        fig = self._call(floor=2, indices=[1])
+        self.assertEqual(len(fig.data), 0)
+        self.assertIn("in these 1 sample(s)", fig.layout.annotations[0].text)
+
+    def test_hover_carries_the_occurrence_count(self):
+        fig = self._call(floor=1)
+        drawn = dict(zip(self._words(fig), [int(c[0]) for c in fig.data[0].customdata][::-1]))
+        self.assertEqual(drawn, {"rare": 1, "common": 4, "mild": 1})
+        self.assertIn("Occurrences:", fig.data[0].hovertemplate)
+
+    def test_hover_counts_follow_the_selection(self):
+        # A count that ignored the scope would contradict the floor applied right beside it:
+        # "common" occurs 4x in the corpus but twice in samples 0-1.
+        fig = self._call(floor=1, indices=[0, 1])
+        drawn = dict(zip(self._words(fig), [int(c[0]) for c in fig.data[0].customdata][::-1]))
+        self.assertEqual(drawn["common"], 2)
+
+    def test_all_classes_ranks_on_the_strongest_class_magnitude(self):
+        # "mild" pulls -0.5 on class 0 and +0.5 on class 1: across classes it is a magnitude of
+        # 0.5, not the -0.5 the single-class view shows.
+        fig = self._call(label="all")
+        drawn = dict(zip(self._words(fig), self._values(fig)))
+        self.assertEqual(drawn, {"rare": 0.9, "mild": 0.5, "common": 0.3})
+        self.assertEqual(dict(zip(self._words(self._call()), self._values(self._call())))["mild"], -0.5)
+
+    def test_all_classes_names_its_statistic_on_the_axis(self):
+        self.assertEqual(self._call(label="all").layout.xaxis.title.text, "Largest |mean SHAP| across classes")
+        self.assertEqual(
+            self._call(label="all", rank_by="sum").layout.xaxis.title.text,
+            "Largest |total SHAP| across classes",
+        )
+
+    def test_all_classes_ignores_a_stale_sign_filter(self):
+        # Every value is a magnitude, so honouring "negative" would blank the chart on a control
+        # the user cannot even see is active.
+        self.assertEqual(self._words(self._call(label="all", sign="negative")), ["rare", "mild", "common"])
+
+    def test_all_classes_still_honours_the_frequency_floor(self):
+        self.assertNotIn("rare", self._words(self._call(label="all", floor=2)))
+
+    def test_sign_filter_is_greyed_out_under_all_classes(self):
+        app = NlpWebApp(self._explanation(), engine=None)
+        fn = None
+        for key, spec in app.app.callback_map.items():
+            if "sign-filter.options" in key:
+                fn = getattr(spec["callback"], "__wrapped__", spec["callback"])
+        self.assertIsNotNone(fn, "sign-filter gating callback not registered")
+        options, value = fn("all")
+        self.assertEqual([o["value"] for o in options if o.get("disabled")], ["positive", "negative"])
+        self.assertEqual(value, "all")
+        options, _ = fn(0)
+        self.assertFalse(any(o.get("disabled") for o in options))
+
+    def test_scatter_colouring_survives_all_classes(self):
+        # The scatter reads the same dropdown, where int("all") would raise.
+        app = NlpWebApp(self._explanation(), engine=None, scatter_xy=np.zeros((4, 2)))
+        fn = None
+        for key, spec in app.app.callback_map.items():
+            if "scatter-plot.figure" in key:
+                fn = getattr(spec["callback"], "__wrapped__", spec["callback"])
+        self.assertIsNotNone(fn, "scatter callback not registered")
+        self.assertIsNotNone(fn("word_contribution", ["common"], "all", False))
+
+    def test_number_boxes_commit_without_needing_a_blur(self):
+        # debounce=True commits only on Enter or blur, which leaves the spinner arrows looking
+        # dead: clicking one keeps focus in the box, so the chart never updates. A numeric
+        # (seconds) debounce commits after a pause instead.
+        layout = NlpWebApp(self._explanation(), engine=None).app.layout
+        for box_id in ("min-occurrences", "topk-input"):
+            debounce = layout[box_id].debounce
+            self.assertNotIsInstance(debounce, bool, f"{box_id} commits only on blur")
+            self.assertGreater(debounce, 0)
+
+    def test_topk_input_replaces_the_slider(self):
+        found = set()
+        _collect_ids(NlpWebApp(self._explanation(), engine=None).app.layout, found)
+        self.assertIn("topk-input", found)
+        self.assertNotIn("topk-slider", found)
+
+    def test_topk_controls_the_bar_count(self):
+        self.assertEqual(len(self._words(self._call(topk=2))), 2)
+
+    def test_typed_topk_is_clamped_to_the_boxs_range(self):
+        from shapash.webapp.nlp_app import _MAX_TOPK, _MIN_TOPK
+
+        # The browser enforces min/max on the spinner but not on typed input.
+        self.assertEqual(len(self._words(self._call(topk=999))), 3)  # only 3 words exist
+        self.assertEqual(len(self._words(self._call(topk=0))), _MIN_TOPK)
+        self.assertEqual(len(self._words(self._call(topk=-5))), _MIN_TOPK)
+        self.assertLessEqual(_MAX_TOPK, 50)
+
+    def test_cleared_topk_box_falls_back_to_the_default(self):
+        from shapash.webapp.nlp_app import _DEFAULT_TOPK
+
+        self.assertEqual(_DEFAULT_TOPK, 20)
+        # Only None (an emptied box) restores the default — a typed 0 clamps instead.
+        self.assertEqual(len(self._words(self._call(topk=None))), 3)  # all 3 words, under the cap
+
+    def test_chart_keeps_its_computed_height_so_labels_survive(self):
+        # The panel scrolls; squeezing 50 words into it is what made plotly drop word labels.
+        fig = self._call(topk=50)
+        self.assertIsNotNone(fig.layout.height)
+
+    def test_missing_class_prevents_update(self):
+        from dash.exceptions import PreventUpdate
+
+        with self.assertRaises(PreventUpdate):
+            self.graph(None, 10, "all", [], "mean", 1, None, None, False)
+
+
+class TestWordProfileControls(unittest.TestCase):
+    """The picker's sort/labels, the restricted aggregation list, and bar-click class ranking."""
+
+    def _layout(self):
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        comp = WordProfileComponent()
+        layout = comp.layout(TestWordProfileComponent._explanation(), None)
+        found = {}
+
+        def walk(node):
+            cid = getattr(node, "id", None)
+            if isinstance(cid, str):
+                found[cid] = node
+            children = getattr(node, "children", None)
+            for ch in children if isinstance(children, (list, tuple)) else [children]:
+                if ch is not None and not isinstance(ch, str):
+                    walk(ch)
+
+        walk(layout)
+        return comp, found
+
+    def _app(self):
+        import dash
+
+        from shapash.webapp.nlp_components import WordProfileComponent
+
+        comp = WordProfileComponent()
+        explanation = TestWordProfileComponent._explanation()
+        comp.layout(explanation, None)  # builds the option lists the sort callback serves
+        app = dash.Dash(__name__)
+        comp.register_callbacks(app, explanation, None, TestWordProfileComponent.STORES)
+        return app
+
+    @staticmethod
+    def _callback(app, out_substr):
+        for key, spec in app.callback_map.items():
+            if out_substr in key:
+                fn = spec["callback"]
+                return getattr(fn, "__wrapped__", fn)
+        raise KeyError(out_substr)
+
+    def test_sum_aggregations_are_not_offered(self):
+        # Per word, a sum is the mean rescaled by the occurrence count — same bars, no information.
+        _, found = self._layout()
+        self.assertEqual([o["value"] for o in found["word-profile-agg"].options], ["mean", "mean_abs"])
+
+    def test_options_carry_the_occurrence_count(self):
+        _, found = self._layout()
+        labels = {o["value"]: o["label"] for o in found["word-profile-select"].options}
+        self.assertEqual(labels["happy"], "happy (4)")
+
+    def test_option_values_stay_bare_words(self):
+        # The label carries the count; the value must not, or every consumer of it breaks.
+        _, found = self._layout()
+        self.assertIn("happy", [o["value"] for o in found["word-profile-select"].options])
+
+    def test_sort_toggle_reorders_without_changing_values(self):
+        app = self._app()
+        reorder = self._callback(app, "word-profile-select.options")
+        alpha = [o["value"] for o in reorder("alpha")]
+        freq = [o["value"] for o in reorder("frequency")]
+        self.assertEqual(alpha, sorted(alpha))
+        self.assertEqual(freq[0], "happy")  # the most frequent word
+        self.assertEqual(set(alpha), set(freq))
+
+    def test_unknown_sort_falls_back_to_alphabetical(self):
+        app = self._app()
+        reorder = self._callback(app, "word-profile-select.options")
+        self.assertEqual(reorder(None), reorder("alpha"))
+
+    def test_bar_click_sets_the_drill_down_class(self):
+        app = self._app()
+        click = self._callback(app, "word-profile-class.value")
+        value, reset = click({"points": [{"customdata": [1], "y": "pos"}]})
+        self.assertEqual(value, 1)
+        # clickData is reset so clicking the same bar twice re-fires.
+        self.assertIsNone(reset)
+
+    def test_bar_click_reads_the_index_not_the_label(self):
+        app = self._app()
+        click = self._callback(app, "word-profile-class.value")
+        # Duplicate display names must not be able to mis-resolve the class.
+        self.assertEqual(click({"points": [{"customdata": [0], "y": "neg"}]})[0], 0)
+
+    def test_graph_carries_the_class_index_on_every_bar(self):
+        app = self._app()
+        fig = self._callback(app, "word-profile-graph")("happy", "mean", 0, "most", 5, None, None, False)[0]
+        self.assertEqual([c[0] for c in fig.data[0].customdata], [1, 0])  # reversed for drawing
+
+    def test_empty_clicks_are_ignored(self):
+        from dash.exceptions import PreventUpdate
+
+        app = self._app()
+        click = self._callback(app, "word-profile-class.value")
+        for bad in (None, {}, {"points": []}, {"points": [{}]}):
+            with self.assertRaises(PreventUpdate):
+                click(bad)
